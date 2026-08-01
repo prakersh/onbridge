@@ -14,7 +14,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         ref: z.number().optional().describe('Element ref — available as "element" in the script'),
       }),
     },
-    async ({ script, ref }) => {
+    async ({ script, ref }: { script: string; ref?: number }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('evaluate', { script, ref })) as { result: unknown };
@@ -38,7 +38,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         timeout: z.number().optional().describe('Max wait time in milliseconds (default 10000)'),
       }),
     },
-    async ({ text: waitText, textGone, selector, timeout }) => {
+    async ({ text: waitText, textGone, selector, timeout }: { text?: string; textGone?: string; selector?: string; timeout?: number }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('wait', {
@@ -62,7 +62,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         domain: z.string().optional().describe('Filter cookies by domain'),
       }),
     },
-    async ({ domain }) => {
+    async ({ domain }: { domain?: string }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('get_cookies', { domain })) as Array<{
