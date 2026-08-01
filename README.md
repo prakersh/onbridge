@@ -22,9 +22,35 @@ AI Agent ↔ stdio/MCP ↔ MCP Server ↔ WebSocket (localhost:9876) ↔ Extensi
 
 ---
 
-## Getting Started
+### Quick Install (One Command)
 
-### Prerequisites
+```bash
+curl -fsSL https://raw.githubusercontent.com/prakersh/onbridge/main/install.sh | bash
+```
+
+This downloads the latest release, installs to `~/.onbridge/`, and prints the MCP config to add to your AI agent (Claude Desktop, Cursor, Windsurf, etc.).
+
+**Or add directly to your MCP config** (no install step - uses npx):
+
+```json
+{
+  "mcpServers": {
+    "onbridge": {
+      "command": "npx",
+      "args": ["-y", "onbridge"],
+      "type": "stdio"
+    }
+  }
+}
+```
+
+> **Note:** You also need the [Chrome extension](https://github.com/prakersh/onbridge/releases) - download the `.zip` from the latest release and load it unpacked in `chrome://extensions/`.
+
+---
+
+### Developer Setup
+
+#### Prerequisites
 
 - **Node.js** ≥ 20
 - **pnpm** (recommended: `corepack enable && corepack prepare pnpm@latest --activate`)
