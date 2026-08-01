@@ -1,0 +1,26 @@
+{
+  "name": "onbridge",
+  "version": "0.1.0",
+  "description": "MCP server for browser control via Chrome extension",
+  "type": "module",
+  "bin": {
+    "onbridge": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx --watch src/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.0.0",
+    "ws": "^8.18.0",
+    "zod": "^3.25.0",
+    "@onbridge/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

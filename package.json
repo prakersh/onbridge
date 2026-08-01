@@ -1,0 +1,14 @@
+{
+  "name": "onbridge",
+  "private": true,
+  "description": "Browser control execution layer via MCP + Chrome Extension",
+  "scripts": {
+    "dev": "pnpm --parallel -r run dev",
+    "build": "pnpm -r run build",
+    "lint": "eslint packages/*/src",
+    "typecheck": "tsc -b"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
