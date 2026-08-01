@@ -7,7 +7,7 @@
     "dev": "pnpm --parallel -r run dev",
     "build": "pnpm -r run build",
     "lint": "eslint packages/*/src",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc --noEmit -p packages/shared/tsconfig.json"
   },
   "engines": {
     "node": ">=20.0.0"

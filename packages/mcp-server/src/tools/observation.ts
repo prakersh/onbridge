@@ -1,5 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/server';
-import * as z from 'zod/v4';
+import { z } from 'zod';
 import { serializeSnapshot, serializeFindResults } from '@onbridge/shared';
 import type { PageSnapshot, FindResult } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';

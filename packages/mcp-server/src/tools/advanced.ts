@@ -1,5 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/server';
-import * as z from 'zod/v4';
+import { z } from 'zod';
 import { serializeSnapshot } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';
 
@@ -14,7 +14,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         ref: z.number().optional().describe('Element ref — available as "element" in the script'),
       }),
     },
-    async ({ script, ref }: { script: string; ref?: number }) => {
+    async ({ script, ref }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('evaluate', { script, ref })) as { result: unknown };
@@ -38,7 +38,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         timeout: z.number().optional().describe('Max wait time in milliseconds (default 10000)'),
       }),
     },
-    async ({ text: waitText, textGone, selector, timeout }: { text?: string; textGone?: string; selector?: string; timeout?: number }) => {
+    async ({ text: waitText, textGone, selector, timeout }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('wait', {
@@ -62,7 +62,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         domain: z.string().optional().describe('Filter cookies by domain'),
       }),
     },
-    async ({ domain }: { domain?: string }) => {
+    async ({ domain }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('get_cookies', { domain })) as Array<{
