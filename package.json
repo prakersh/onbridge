@@ -1,6 +1,7 @@
 {
   "name": "onbridge",
   "private": true,
+  "license": "GPL-3.0-only",
   "description": "Browser control execution layer via MCP + Chrome Extension",
   "scripts": {
     "dev": "pnpm --parallel -r run dev",

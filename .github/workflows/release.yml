@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "store=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.store }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag_version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::VERSION file ($VERSION) does not match tag (v$TAG_VERSION)"
+            exit 1
+          fi
+          echo "✓ Version: $VERSION"
+
+      - name: Build & Package
+        run: |
+          chmod +x app.sh
+          ./app.sh --package
+
+      - name: Upload MCP Server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onbridge-mcp-server-v${{ steps.version.outputs.version }}
+          path: artifacts/onbridge-mcp-server-v${{ steps.version.outputs.version }}.tar.gz
+          retention-days: 90
+
+      - name: Upload Extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onbridge-extension-v${{ steps.version.outputs.version }}
+          path: artifacts/onbridge-extension-v${{ steps.version.outputs.version }}.zip
+          retention-days: 90
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OnBridge v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            artifacts/onbridge-mcp-server-v${{ steps.version.outputs.version }}.tar.gz
+            artifacts/onbridge-extension-v${{ steps.version.outputs.version }}.zip
+          body: |
+            ## OnBridge v${{ steps.version.outputs.version }}
+
+            ### 📦 Artifacts
+
+            | Artifact | Description |
+            |---|---|
+            | `onbridge-mcp-server-v${{ steps.version.outputs.version }}.tar.gz` | MCP server — install via `npx onbridge` or extract and run |
+            | `onbridge-extension-v${{ steps.version.outputs.version }}.zip` | Chrome extension (MV3) — load unpacked in `chrome://extensions/` |
+
+            ### 🚀 Quick Start
+
+            ```bash
+            # MCP Server (after npm publish)
+            npx onbridge
+
+            # Or download and run directly
+            tar -xzf onbridge-mcp-server-v${{ steps.version.outputs.version }}.tar.gz
+            node onbridge-mcp-server-v${{ steps.version.outputs.version }}/dist/index.js
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

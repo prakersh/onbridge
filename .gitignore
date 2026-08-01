@@ -1,7 +1,42 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
 .output/
 *.tsbuildinfo
+
+# WXT generated
+packages/extension/.wxt/
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# Environment
 .env
 .env.local
+.env.*.local
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# AI agent config (local paths)
+.mcp.json
+.claude/
+CLAUDE.md
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Build artifacts (app.sh --package output)
+artifacts/
+
+# Gemini
+.gemini/
