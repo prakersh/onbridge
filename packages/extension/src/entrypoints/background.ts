@@ -1,5 +1,5 @@
 import { defineBackground } from 'wxt/utils/define-background';
-import type { ServerMessage, ExtensionMessage } from '@onbridge/shared';
+import type { ServerMessage, ExtensionMessage, DomNode, PageSnapshot } from '@onbridge/shared';
 import { SecureClient, clearPairings, type ClientState } from '../core/secure-client.js';
 import { CdpUnavailable, detachAll, forgetRefusal } from '../core/cdp.js';
 import * as trusted from '../core/trusted-input.js';
@@ -314,7 +314,8 @@ export default defineBackground(() => {
   }
 
   async function handleCommand(msg: ServerMessage & { type: 'command' }): Promise<unknown> {
-    const { action, params, tabId } = msg;
+    const { action, params: rawParams, tabId } = msg;
+    let params = rawParams;
 
     // ask_user and bridge_status are meta-commands: they must work even while
     // automation is paused, since answering is exactly how a user unblocks it.
@@ -336,7 +337,19 @@ export default defineBackground(() => {
     lastCommandAt = Date.now();
     await enforcePolicy(action, params, tabId);
 
+    // Translate global refs down to per-frame refs before dispatch. Everything
+    // below this point works in the target frame's own ref space.
+    const targetTabId = tabId ?? (await getActiveTabId());
+    let frameId = 0;
+    if (targetTabId) {
+      const localised = localiseRefs(params, targetTabId);
+      params = localised.params;
+      frameId = localised.frameId;
+    }
+
     switch (action) {
+      case 'snapshot':
+        return handleSnapshot(params, tabId);
       case 'navigate':
         return handleNavigate(params as { url: string }, tabId);
       case 'back':
@@ -371,16 +384,127 @@ export default defineBackground(() => {
         return handleFileUpload(params as { ref: number; filePath: string }, tabId);
       case 'click':
       case 'click_by_text':
-        return handleClickWithNavDetection(action, params, tabId);
+        return handleClickWithNavDetection(action, params, tabId, frameId);
       case 'type':
       case 'hover':
       case 'press_key':
       case 'drag':
       case 'evaluate':
-        return handleTrustedAction(action, params, tabId);
+        return handleTrustedAction(action, params, tabId, frameId);
       default:
-        return routeToContentScript(action, params, tabId);
+        return routeToContentScript(action, params, tabId, frameId);
     }
+  }
+
+  /**
+   * Refs are per-frame, so two frames would both hand out ref 1. The background
+   * therefore issues globally unique refs and remembers which frame each one
+   * belongs to, translating on the way back in.
+   */
+  interface FrameRef {
+    frameId: number;
+    localRef: number;
+  }
+  const frameRefsByTab = new Map<number, Map<number, FrameRef>>();
+  let globalRefCounter = 0;
+
+  function resolveRef(tabId: number, ref: number): FrameRef {
+    return frameRefsByTab.get(tabId)?.get(ref) ?? { frameId: 0, localRef: ref };
+  }
+
+  /**
+   * Rewrites every ref in a command's params from the global namespace to the
+   * owning frame's, and reports which frame the command must be delivered to.
+   */
+  function localiseRefs(
+    params: Record<string, unknown>,
+    tabId: number,
+  ): { params: Record<string, unknown>; frameId: number } {
+    const out = { ...params };
+    const frames = new Set<number>();
+
+    for (const key of ['ref', 'fromRef', 'toRef', 'target'] as const) {
+      const val = out[key];
+      if (typeof val !== 'number') continue;
+      const { frameId, localRef } = resolveRef(tabId, val);
+      out[key] = localRef;
+      frames.add(frameId);
+    }
+
+    if (Array.isArray(out.fields)) {
+      out.fields = (out.fields as Array<{ ref: number; value: string }>).map((f) => {
+        const { frameId, localRef } = resolveRef(tabId, f.ref);
+        frames.add(frameId);
+        return { ...f, ref: localRef };
+      });
+    }
+
+    if (frames.size > 1) {
+      throw new Error(
+        'That command spans elements in different frames, which cannot be done in one call. Act on one frame at a time.',
+      );
+    }
+    return { params: out, frameId: frames.values().next().value ?? 0 };
+  }
+
+  /** Rewrites a captured subtree's refs into the global namespace. */
+  function remapTree(nodes: DomNode[], frameId: number, map: Map<number, FrameRef>): void {
+    for (const node of nodes) {
+      if (node.ref != null) {
+        globalRefCounter++;
+        map.set(globalRefCounter, { frameId, localRef: node.ref });
+        node.ref = globalRefCounter;
+      }
+      if (node.children) remapTree(node.children, frameId, map);
+    }
+  }
+
+  /**
+   * Captures the top frame plus every reachable child frame, presenting each
+   * child's tree beneath a labelled node so the agent can see it belongs to an
+   * embedded document.
+   */
+  async function handleSnapshot(
+    params: Record<string, unknown>,
+    tabId?: number,
+  ): Promise<PageSnapshot> {
+    const targetTabId = tabId ?? (await getActiveTabId());
+    if (!targetTabId) throw new Error('No active tab found');
+
+    const snap = (await routeToContentScript('snapshot', params, targetTabId, 0)) as PageSnapshot;
+    const map = new Map<number, FrameRef>();
+    globalRefCounter = 0;
+    remapTree(snap.tree, 0, map);
+
+    let frames: chrome.webNavigation.GetAllFrameResultDetails[] = [];
+    try {
+      frames = (await chrome.webNavigation.getAllFrames({ tabId: targetTabId })) ?? [];
+    } catch {
+      // webNavigation unavailable; top frame only.
+    }
+
+    for (const frame of frames) {
+      if (frame.frameId === 0) continue;
+      // about:blank and data: frames have no content script and no useful content.
+      if (!/^https?:/i.test(frame.url)) continue;
+      try {
+        const sub = (await routeToContentScript(
+          'snapshot',
+          params,
+          targetTabId,
+          frame.frameId,
+        )) as PageSnapshot;
+        if (!sub?.tree?.length) continue;
+        remapTree(sub.tree, frame.frameId, map);
+        snap.tree.push({ role: 'iframe', name: sub.title || frame.url, children: sub.tree });
+      } catch {
+        // A frame with no injected script (cross-origin restrictions, sandboxed)
+        // is skipped rather than failing the whole snapshot.
+      }
+    }
+
+    frameRefsByTab.set(targetTabId, map);
+    return snap;
   }
 
   /**
@@ -487,10 +611,16 @@ export default defineBackground(() => {
     action: string,
     params: Record<string, unknown>,
     tabId?: number,
+    frameId = 0,
   ): Promise<unknown> {
     const targetTabId = tabId ?? (await getActiveTabId());
     if (!targetTabId) throw new Error('No active tab found');
     await enforceScope(targetTabId);
+
+    // CDP's main-world evaluate cannot resolve a ref inside a child frame, so
+    // iframe interaction goes through that frame's content script. Those events
+    // are synthetic, which some embedded widgets will ignore.
+    if (frameId !== 0) return routeToContentScript(action, params, targetTabId, frameId);
 
     try {
       switch (action) {
@@ -543,7 +673,12 @@ export default defineBackground(() => {
     action: string,
     params: Record<string, unknown>,
     tabId: number,
+    frameId = 0,
   ): Promise<unknown> {
+    // A ref inside an iframe is not resolvable from the main world; that frame's
+    // content script handles it with synthetic events instead.
+    if (frameId !== 0) return routeToContentScript(action, params, tabId, frameId);
+
     try {
       let ref = params.ref as number | undefined;
 
@@ -568,7 +703,7 @@ export default defineBackground(() => {
     } catch (err) {
       if (!(err instanceof CdpUnavailable)) throw err;
       degraded = err.message;
-      return routeToContentScript(action, params, tabId);
+      return routeToContentScript(action, params, tabId, frameId);
     }
   }
 
@@ -576,6 +711,7 @@ export default defineBackground(() => {
     action: string,
     params: Record<string, unknown>,
     tabId?: number,
+    frameId = 0,
   ): Promise<unknown> {
     const targetTabId = tabId ?? (await getActiveTabId());
     if (!targetTabId) throw new Error('No active tab found');
@@ -584,7 +720,8 @@ export default defineBackground(() => {
     const tabBefore = await chrome.tabs.get(targetTabId);
     const urlBefore = tabBefore.url ?? '';
 
-    const result = await clickTrustedOrFallback(action, params, targetTabId);
+    const domBefore = await domSignature(targetTabId, frameId);
+    const result = await clickTrustedOrFallback(action, params, targetTabId, frameId);
 
     // Check if the tab URL changed (navigation happened)
     await new Promise((r) => setTimeout(r, 300));
@@ -592,24 +729,60 @@ export default defineBackground(() => {
     const urlAfter = tabAfter.url ?? '';
 
     if (urlAfter !== urlBefore) {
-      // Navigation happened — wait for it to finish, then re-snapshot from the NEW page
+      // Navigation happened — wait for it to finish, then re-snapshot the new page
       await waitForNavigation(targetTabId);
-      return routeToContentScript('snapshot', {}, targetTabId);
+      const fresh = await handleSnapshot({}, targetTabId);
+      return { ...fresh, changed: { navigated: true, from: urlBefore, to: urlAfter } };
     }
 
-    return result;
+    // Nothing navigated, so say whether the DOM moved at all. Without this the
+    // agent cannot tell "clicked and something happened" from "clicked into the
+    // void" — the usual cause of it confidently continuing down a dead path.
+    const domAfter = await domSignature(targetTabId, frameId);
+    const changed = domBefore != null && domAfter != null && domBefore !== domAfter;
+
+    return {
+      ...(result as Record<string, unknown>),
+      changed: {
+        navigated: false,
+        domChanged: changed,
+        ...(changed
+          ? {}
+          : { hint: 'The page did not visibly change. Verify the click landed on what you intended before continuing.' }),
+      },
+    };
+  }
+
+  /**
+   * A cheap fingerprint of the document, used only to detect that *something*
+   * changed. Deliberately coarse — a full diff would cost more than it is worth
+   * on every click.
+   */
+  async function domSignature(tabId: number, frameId = 0): Promise<string | null> {
+    try {
+      const res = (await routeToContentScript(
+        'evaluate',
+        { script: 'return document.body ? document.body.innerHTML.length + ":" + document.title : ""' },
+        tabId,
+        frameId,
+      )) as { result?: unknown };
+      return typeof res?.result === 'string' ? res.result : null;
+    } catch {
+      return null;
+    }
   }
 
   async function routeToContentScript(
     action: string,
     params: Record<string, unknown>,
     tabId?: number,
+    frameId = 0,
   ): Promise<unknown> {
     const targetTabId = tabId ?? (await getActiveTabId());
     if (!targetTabId) throw new Error('No active tab found');
 
     await enforceScope(targetTabId);
-    await ensureContentScript(targetTabId);
+    if (frameId === 0) await ensureContentScript(targetTabId);
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Content script timed out')), 25000);
@@ -617,6 +790,7 @@ export default defineBackground(() => {
       chrome.tabs.sendMessage(
         targetTabId,
         { type: 'command', id: `cs_${Date.now()}`, action, params },
+        { frameId },
         (response) => {
           clearTimeout(timeout);
           if (chrome.runtime.lastError) {

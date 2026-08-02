@@ -39,13 +39,33 @@ export interface Point {
 }
 
 /**
+ * Injected into the page to resolve a ref. A flat querySelector stops at shadow
+ * boundaries, so anything inside a web component would be unreachable — the
+ * element is visible in the snapshot but unclickable.
+ */
+function deepResolve(ref: number): string {
+  return `
+    (function findRef(root) {
+      const hit = root.querySelector('[data-onbridge-ref="${ref}"]');
+      if (hit) return hit;
+      for (const el of root.querySelectorAll('*')) {
+        if (el.shadowRoot) {
+          const inner = findRef(el.shadowRoot);
+          if (inner) return inner;
+        }
+      }
+      return null;
+    })(document)`;
+}
+
+/**
  * Scrolls the element into view and returns its viewport-centre coordinates.
  * Runs in the main world, so it sees the page exactly as the user's browser does.
  */
 export async function centreOf(tabId: number, ref: number): Promise<Point> {
   const expression = `
     (() => {
-      const el = document.querySelector('[data-onbridge-ref="${ref}"]');
+      const el = ${deepResolve(ref)};
       if (!el) return null;
       el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
       const r = el.getBoundingClientRect();
@@ -190,7 +210,7 @@ export async function evaluate(
   // __NEXT_DATA__, anything the app defines — were invisible to it.
   const expression =
     ref != null
-      ? `(function(){ const element = document.querySelector('[data-onbridge-ref="${ref}"]'); return (function(){ ${script} }).call(element); })()`
+      ? `(function(){ const element = ${deepResolve(ref)}; return (function(){ ${script} }).call(element); })()`
       : `(function(){ ${script} })()`;
 
   const { result, exceptionDetails } = await send(tabId, 'Runtime.evaluate', {

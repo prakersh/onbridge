@@ -4,6 +4,11 @@ import { CommandExecutor } from '../core/command-executor.js';
 export default defineContentScript({
   matches: ['<all_urls>'],
   runAt: 'document_idle',
+  // Without this the script only runs in the top frame, so everything inside an
+  // iframe — embedded checkouts, editors, auth widgets — was invisible and
+  // unreachable. Each frame gets its own instance and its own ref space; the
+  // background namespaces them.
+  allFrames: true,
 
   main() {
     const executor = new CommandExecutor();

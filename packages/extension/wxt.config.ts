@@ -16,6 +16,8 @@ export default defineConfig({
       'cookies',
       'sidePanel',
       'notifications',
+      // Enumerating frames is how a snapshot reaches inside iframes.
+      'webNavigation',
     ],
     host_permissions: ['<all_urls>'],
     side_panel: { default_path: 'sidepanel.html' },

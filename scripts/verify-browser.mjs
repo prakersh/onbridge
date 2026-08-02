@@ -16,11 +16,36 @@ import { fileURLToPath } from 'node:url';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const EXT = join(ROOT, 'packages/extension/.output/chrome-mv3');
 
+const FRAME = `<!doctype html><html><body>
+<button id="fbtn">Inside the iframe</button>
+<script>
+  window.__frameLog = [];
+  fbtn.addEventListener('click', () => __frameLog.push('clicked'));
+</script></body></html>`;
+
 const PAGE = `<!doctype html><html><body>
 <h1>onbridge trusted input test</h1>
 <button id="btn">Click me</button>
 <button id="danger">Place order &middot; $249</button>
 <input id="inp" placeholder="type here">
+
+<my-widget></my-widget>
+<iframe id="frame" src="/frame" width="300" height="120"></iframe>
+
+<script>
+  // A web component with an OPEN shadow root: its content is invisible to a
+  // flat querySelectorAll, which is exactly the gap being tested.
+  customElements.define('my-widget', class extends HTMLElement {
+    constructor() {
+      super();
+      const root = this.attachShadow({ mode: 'open' });
+      root.innerHTML = '<button id="shadowBtn">Shadow button</button>';
+      root.getElementById('shadowBtn').addEventListener('click', e => {
+        window.__log.push({t:'shadow', trusted:e.isTrusted});
+      });
+    }
+  });
+</script>
 <script>
   window.__pageSecret = 'main-world-visible';
   window.__log = [];
@@ -41,9 +66,9 @@ async function main() {
   }
 
   // ── static test page ────────────────────────────────────────────────
-  const http = createServer((_, res) => {
+  const http = createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/html' });
-    res.end(PAGE);
+    res.end(req.url === '/frame' ? FRAME : PAGE);
   });
   await new Promise((r) => http.listen(8931, '127.0.0.1', r));
   const PAGE_URL = 'http://127.0.0.1:8931/';
@@ -168,6 +193,35 @@ async function main() {
       typed.length && typed.every((e) => e.trusted)
         ? ok('input events are trusted')
         : bad('input events trusted', JSON.stringify(typed.slice(0, 3)));
+    }
+
+    // ── shadow DOM ───────────────────────────────────────────────────
+    const shadowRef = /\[button:(\d+)\][^\n]*Shadow button/.exec(snapText)?.[1];
+    if (!shadowRef) {
+      bad('shadow DOM content appears in the snapshot');
+    } else {
+      ok('shadow DOM content appears in the snapshot');
+      await call('click', { ref: Number(shadowRef) });
+      await page.waitForTimeout(300);
+      const shadowClicks = (await page.evaluate(() => window.__log)).filter((e) => e.t === 'shadow');
+      shadowClicks.length && shadowClicks[0].trusted
+        ? ok('element inside a shadow root is clickable with trusted input')
+        : bad('shadow element clickable', JSON.stringify(shadowClicks));
+    }
+
+    // ── iframes ──────────────────────────────────────────────────────
+    const frameRef = /\[button:(\d+)\][^\n]*Inside the iframe/.exec(snapText)?.[1];
+    if (!frameRef) {
+      bad('iframe content appears in the snapshot');
+    } else {
+      ok('iframe content appears in the snapshot');
+      await call('click', { ref: Number(frameRef) });
+      await page.waitForTimeout(400);
+      const frameEl = page.frames().find((f) => f.url().endsWith('/frame'));
+      const frameClicks = frameEl ? await frameEl.evaluate(() => window.__frameLog) : [];
+      frameClicks.length
+        ? ok('element inside an iframe is clickable')
+        : bad('iframe element clickable', 'no click registered in the frame');
     }
 
     // ── approval gate: a destructive click must block ────────────────

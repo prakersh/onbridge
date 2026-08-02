@@ -216,6 +216,15 @@ function buildNode(el: Element, maxDepth: number, currentDepth: number, compact 
 
   const children: DomNode[] = [];
   if (currentDepth < maxDepth) {
+    // Open shadow roots first: a web component's real content lives there, and
+    // walking only el.children made every such element look empty. Whole design
+    // systems (Lightning, Polymer, most `<*-*>` components) were invisible.
+    if (el.shadowRoot) {
+      for (const child of el.shadowRoot.children) {
+        const shadowChild = buildNode(child, maxDepth, currentDepth + 1, compact);
+        if (shadowChild) children.push(shadowChild);
+      }
+    }
     for (const child of el.children) {
       const childNode = buildNode(child, maxDepth, currentDepth + 1, compact);
       if (childNode) children.push(childNode);
@@ -245,11 +254,13 @@ function buildNode(el: Element, maxDepth: number, currentDepth: number, compact 
       const ref = parseInt(existingRef, 10);
       node.ref = ref;
       refMap.set(ref, el);
+      recordLocator(ref, el);
     } else {
       refCounter++;
       node.ref = refCounter;
       refMap.set(refCounter, el);
       el.setAttribute(ATTR, String(refCounter));
+      recordLocator(refCounter, el);
     }
   }
 
@@ -331,16 +342,33 @@ function getScrollState(): ScrollState {
   return { percent, pagesAbove, pagesBelow };
 }
 
+/**
+ * querySelectorAll stops at shadow boundaries, so a flat query silently misses
+ * every ref inside a web component. This descends through open shadow roots.
+ */
+export function deepQueryAll(selector: string, root: ParentNode = document): Element[] {
+  const found: Element[] = [...root.querySelectorAll(selector)];
+  const walk = (node: ParentNode) => {
+    for (const el of node.querySelectorAll('*')) {
+      if (!el.shadowRoot) continue;
+      found.push(...el.shadowRoot.querySelectorAll(selector));
+      walk(el.shadowRoot);
+    }
+  };
+  walk(root);
+  return found;
+}
+
 export function captureSnapshot(targetRef?: number, maxDepth = 20, compact = false): PageSnapshot {
-  // Reuse existing refs for elements still in DOM
+  // Reuse existing refs for elements still in the DOM, including shadow roots.
   refMap = new Map();
-  document.querySelectorAll(`[${ATTR}]`).forEach((el) => {
+  for (const el of deepQueryAll(`[${ATTR}]`)) {
     const existing = parseInt(el.getAttribute(ATTR)!, 10);
     if (!isNaN(existing)) {
       refMap.set(existing, el);
       if (existing > refCounter) refCounter = existing;
     }
-  });
+  }
 
   let root: Element = document.body;
   if (targetRef != null) {
@@ -416,6 +444,59 @@ export function getRefMap(): Map<number, Element> {
   return refMap;
 }
 
+/**
+ * A durable description of an element, recorded when its ref is handed out.
+ *
+ * `data-onbridge-ref` survives an element being moved, but not being replaced —
+ * and SPA re-renders replace nodes constantly. Previously that surfaced to the
+ * agent as a bare "Element ref N not found", forcing a full re-snapshot. With a
+ * locator we can usually find the same element again.
+ */
+interface Locator {
+  role: string;
+  name: string;
+  tag: string;
+  /** Index among same-role, same-name candidates, for genuine duplicates. */
+  nth: number;
+}
+
+const locators = new Map<number, Locator>();
+
+function recordLocator(ref: number, el: Element): void {
+  const role = getRole(el) ?? 'generic';
+  const name = getAccessibleName(el);
+  const peers = Array.from(deepQueryAll(el.tagName.toLowerCase())).filter(
+    (c) => (getRole(c) ?? 'generic') === role && getAccessibleName(c) === name,
+  );
+  locators.set(ref, { role, name, tag: el.tagName.toLowerCase(), nth: Math.max(0, peers.indexOf(el)) });
+}
+
+/**
+ * Re-finds an element whose ref went stale, by matching the recorded locator.
+ * Returns undefined rather than guessing when nothing matches convincingly —
+ * clicking the wrong element is far worse than reporting a miss.
+ */
+export function recoverRef(ref: number): Element | undefined {
+  const loc = locators.get(ref);
+  if (!loc) return undefined;
+
+  const candidates = deepQueryAll(loc.tag).filter(
+    (el) => (getRole(el) ?? 'generic') === loc.role && getAccessibleName(el) === loc.name,
+  );
+  if (candidates.length === 0) return undefined;
+
+  const found = candidates[Math.min(loc.nth, candidates.length - 1)];
+  if (!found) return undefined;
+
+  // Re-bind the ref so subsequent commands hit it directly.
+  found.setAttribute(ATTR, String(ref));
+  refMap.set(ref, found);
+  return found;
+}
+
 export function getElementByRef(ref: number): Element | undefined {
-  return refMap.get(ref);
+  const direct = refMap.get(ref);
+  if (direct?.isConnected) return direct;
+  // Detached or never seen: try the locator before giving up.
+  return recoverRef(ref);
 }
