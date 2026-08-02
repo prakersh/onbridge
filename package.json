@@ -8,12 +8,14 @@
     "build": "pnpm -r run build",
     "lint": "eslint packages/*/src",
     "typecheck": "pnpm -r run typecheck",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:browser": "node scripts/verify-browser.mjs"
   },
   "engines": {
     "node": ">=20.0.0"
   },
   "devDependencies": {
+    "playwright-core": "1.62.1",
     "vitest": "^3.0.0"
   }
 }

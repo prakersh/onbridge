@@ -1,6 +1,8 @@
 import { defineBackground } from 'wxt/utils/define-background';
 import type { ServerMessage, ExtensionMessage } from '@onbridge/shared';
 import { SecureClient, clearPairings, type ClientState } from '../core/secure-client.js';
+import { CdpUnavailable, detachAll, forgetRefusal } from '../core/cdp.js';
+import * as trusted from '../core/trusted-input.js';
 
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000];
 
@@ -53,6 +55,13 @@ export default defineBackground(() => {
 
   /** User-initiated pause. Commands are refused while set, but stay connected. */
   let paused = false;
+
+  /**
+   * Set when CDP could not attach and we fell back to synthetic events. Surfaced
+   * in the panel and via bridge_status, because the fallback silently fails on
+   * sites that check isTrusted — the user deserves to know why.
+   */
+  let degraded = '';
 
   type AccessScope = 'current_tab' | 'current_window' | 'all_tabs';
   let accessScope: AccessScope = 'current_tab';
@@ -211,6 +220,10 @@ export default defineBackground(() => {
     client?.disconnect();
     client = null;
     clientState = 'idle';
+    // Release the debugger so Chrome drops the "onbridge is debugging this
+    // browser" banner the moment control mode ends.
+    detachAll();
+    degraded = '';
     updateBadge('disabled');
   }
 
@@ -283,7 +296,7 @@ export default defineBackground(() => {
     }
 
     if (action === 'bridge_status') {
-      return { accessScope, paused, commandCount, controlMode };
+      return { accessScope, paused, commandCount, controlMode, degraded: degraded || undefined };
     }
 
     if (paused) {
@@ -310,7 +323,7 @@ export default defineBackground(() => {
       case 'close_tab':
         return handleCloseTab(params as { tabId?: number });
       case 'screenshot':
-        return handleScreenshot();
+        return handleScreenshot(params as { fullPage?: boolean; quality?: number }, tabId);
       case 'get_cookies':
         return handleGetCookies(params as { domain?: string });
       case 'set_cookie':
@@ -328,8 +341,109 @@ export default defineBackground(() => {
       case 'click':
       case 'click_by_text':
         return handleClickWithNavDetection(action, params, tabId);
+      case 'type':
+      case 'hover':
+      case 'press_key':
+      case 'drag':
+      case 'evaluate':
+        return handleTrustedAction(action, params, tabId);
       default:
         return routeToContentScript(action, params, tabId);
+    }
+  }
+
+  /**
+   * Runs an action as real, trusted input via CDP, falling back to the old
+   * synthetic-event path when the debugger cannot attach (DevTools already open
+   * on the tab, restricted pages). The fallback is degraded — untrusted events
+   * are rejected by some sites — so it is recorded in the activity feed.
+   */
+  async function handleTrustedAction(
+    action: string,
+    params: Record<string, unknown>,
+    tabId?: number,
+  ): Promise<unknown> {
+    const targetTabId = tabId ?? (await getActiveTabId());
+    if (!targetTabId) throw new Error('No active tab found');
+    await enforceScope(targetTabId);
+
+    try {
+      switch (action) {
+        case 'type':
+          await trusted.typeText(targetTabId, params.ref as number, String(params.text ?? ''), {
+            clear: Boolean(params.clear),
+            submit: Boolean(params.submit),
+          });
+          return { success: true, trusted: true };
+
+        case 'hover':
+          await trusted.hover(targetTabId, params.ref as number);
+          return { success: true, trusted: true };
+
+        case 'press_key':
+          await trusted.pressKey(
+            targetTabId,
+            String(params.key ?? ''),
+            (params.modifiers as string[]) ?? [],
+          );
+          return { success: true, trusted: true };
+
+        case 'drag':
+          await trusted.dragAndDrop(targetTabId, params.fromRef as number, params.toRef as number);
+          return { success: true, trusted: true };
+
+        case 'evaluate':
+          return {
+            result: await trusted.evaluate(
+              targetTabId,
+              String(params.script ?? ''),
+              params.ref as number | undefined,
+            ),
+          };
+      }
+    } catch (err) {
+      if (!(err instanceof CdpUnavailable)) throw err;
+      degraded = err.message;
+    }
+
+    return routeToContentScript(action, params, targetTabId);
+  }
+
+  /**
+   * Clicks with a real trusted pointer. `click_by_text` first resolves the text
+   * to a ref through the content script, then clicks that ref via CDP — so the
+   * convenience of text targeting keeps the fidelity of trusted input.
+   */
+  async function clickTrustedOrFallback(
+    action: string,
+    params: Record<string, unknown>,
+    tabId: number,
+  ): Promise<unknown> {
+    try {
+      let ref = params.ref as number | undefined;
+
+      if (action === 'click_by_text') {
+        const matches = (await routeToContentScript(
+          'find',
+          { text: params.text, role: params.role },
+          tabId,
+        )) as Array<{ ref: number }>;
+        if (!matches?.length) throw new Error(`No element found with text "${params.text}"`);
+        ref = matches[Math.min((params.index as number) ?? 0, matches.length - 1)]?.ref;
+      }
+
+      if (ref == null) throw new Error('No element ref to click');
+
+      await trusted.click(tabId, ref, {
+        button: params.button as string | undefined,
+        doubleClick: Boolean(params.doubleClick),
+        modifiers: params.modifiers as string[] | undefined,
+      });
+      return { success: true, trusted: true };
+    } catch (err) {
+      if (!(err instanceof CdpUnavailable)) throw err;
+      degraded = err.message;
+      return routeToContentScript(action, params, tabId);
     }
   }
 
@@ -341,11 +455,11 @@ export default defineBackground(() => {
     const targetTabId = tabId ?? (await getActiveTabId());
     if (!targetTabId) throw new Error('No active tab found');
 
+    await enforceScope(targetTabId);
     const tabBefore = await chrome.tabs.get(targetTabId);
     const urlBefore = tabBefore.url ?? '';
 
-    // Execute the click in the content script
-    const result = await routeToContentScript(action, params, targetTabId);
+    const result = await clickTrustedOrFallback(action, params, targetTabId);
 
     // Check if the tab URL changed (navigation happened)
     await new Promise((r) => setTimeout(r, 300));
@@ -509,13 +623,32 @@ export default defineBackground(() => {
     return { success: true };
   }
 
-  async function handleScreenshot(): Promise<{ base64: string }> {
+  /**
+   * `fullPage` and `quality` were accepted by the tool schema but ignored here —
+   * every screenshot came back as a viewport-only JPEG at quality 60. CDP's
+   * captureScreenshot honours both; captureVisibleTab cannot do full-page at all.
+   */
+  async function handleScreenshot(
+    params: { fullPage?: boolean; quality?: number },
+    tabId?: number,
+  ): Promise<{ base64: string }> {
+    const targetTabId = tabId ?? (await getActiveTabId());
+    if (targetTabId) {
+      await enforceScope(targetTabId);
+      try {
+        return { base64: await trusted.screenshot(targetTabId, params) };
+      } catch (err) {
+        if (!(err instanceof CdpUnavailable)) throw err;
+        degraded = err.message;
+      }
+    }
+
+    // Fallback: viewport only, so a fullPage request is silently downgraded.
     const dataUrl = await chrome.tabs.captureVisibleTab(undefined as unknown as number, {
       format: 'jpeg',
-      quality: 60,
+      quality: params.quality ?? 60,
     });
-    const base64 = dataUrl.replace(/^data:image\/jpeg;base64,/, '');
-    return { base64 };
+    return { base64: dataUrl.replace(/^data:image\/jpeg;base64,/, '') };
   }
 
   async function handleGetCookies(params: { domain?: string }): Promise<Array<{ name: string; value: string; domain: string }>> {
@@ -705,6 +838,7 @@ export default defineBackground(() => {
         connectionState: clientState,
         stateDetail,
         paused,
+        degraded,
         pairRequest: pairRequest ? { agentName: pairRequest.agentName } : null,
         askRequest: askRequest
           ? { question: askRequest.question, options: askRequest.options, askedAt: askRequest.askedAt }
@@ -818,6 +952,16 @@ export default defineBackground(() => {
 
   chrome.notifications?.onClicked.addListener(() => {
     chrome.notifications.clear('');
+  });
+
+  // A completed navigation is a natural moment to retry CDP: whatever blocked
+  // attach (usually DevTools being open) may since have gone away, and without
+  // this the tab would stay stuck on the degraded synthetic-event path forever.
+  chrome.tabs.onUpdated.addListener((tabId, info) => {
+    if (info.status === 'complete') {
+      forgetRefusal(tabId);
+      degraded = '';
+    }
   });
 
   updateBadge('disabled');

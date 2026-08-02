@@ -17,6 +17,7 @@ interface Status {
   connectionState: string;
   stateDetail: string;
   paused: boolean;
+  degraded: string;
   pairRequest: { agentName: string } | null;
   askRequest: { question: string; options?: string[]; askedAt: number } | null;
   lastAction: string;
@@ -31,6 +32,7 @@ const EMPTY: Status = {
   connectionState: 'idle',
   stateDetail: '',
   paused: false,
+  degraded: '',
   pairRequest: null,
   askRequest: null,
   lastAction: '',
@@ -170,6 +172,23 @@ export default function App() {
               </div>
             )}
             <p className="text-xs text-neutral-400">Answer below — or type anything else.</p>
+          </div>
+        )}
+
+        {/* ── Degraded input warning ── */}
+        {status.degraded && status.connected && (
+          <div className="mx-3 mt-3 rounded-lg border border-orange-500/40 bg-orange-500/10 p-3">
+            <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-orange-300">
+              Reduced fidelity
+            </div>
+            <p className="text-xs text-neutral-300">
+              onbridge could not attach its debugger, so clicks and typing are being simulated
+              instead of sent as real input. Some sites will ignore them.
+            </p>
+            <p className="mt-1 text-[11px] text-neutral-500">
+              Usually because DevTools is open on this tab — only one debugger can attach at a
+              time. Close DevTools and reload.
+            </p>
           </div>
         )}
 
