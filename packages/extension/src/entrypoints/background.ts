@@ -3,6 +3,13 @@ import type { ServerMessage, ExtensionMessage } from '@onbridge/shared';
 import { SecureClient, clearPairings, type ClientState } from '../core/secure-client.js';
 import { CdpUnavailable, detachAll, forgetRefusal } from '../core/cdp.js';
 import * as trusted from '../core/trusted-input.js';
+import {
+  classify,
+  evaluatePolicy,
+  DEFAULT_POLICY,
+  type Policy,
+  type RiskClass,
+} from '../core/policy.js';
 
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000];
 
@@ -15,6 +22,9 @@ const PAIR_WINDOW_MS = 60_000;
 const PAIR_PROMPT_TTL_MS = 60_000;
 /** Slightly under the server's ask_user timeout so we resolve first, cleanly. */
 const ASK_TTL_MS = 105_000;
+/** Under the 30s command timeout, so an unanswered approval denies rather than
+ *  leaving the agent staring at an opaque timeout. */
+const APPROVAL_TTL_MS = 25_000;
 
 interface ActivityEntry {
   action: string;
@@ -63,13 +73,31 @@ export default defineBackground(() => {
    */
   let degraded = '';
 
+  let policy: Policy = { ...DEFAULT_POLICY };
+  let lastCommandAt = Date.now();
+
+  /** The agent is blocked on this until the user allows or denies. */
+  let approvalRequest:
+    | {
+        action: string;
+        risk: RiskClass;
+        reason: string;
+        detail: string;
+        url: string;
+        resolve: (ok: boolean) => void;
+        timer: ReturnType<typeof setTimeout>;
+        askedAt: number;
+      }
+    | null = null;
+
   type AccessScope = 'current_tab' | 'current_window' | 'all_tabs';
   let accessScope: AccessScope = 'current_tab';
   let scopeTabId: number | undefined;
   let scopeWindowId: number | undefined;
 
-  chrome.storage.local.get(['controlMode', 'accessScope'], (result) => {
+  chrome.storage.local.get(['controlMode', 'accessScope', 'policy'], (result) => {
     if (result.accessScope) accessScope = result.accessScope as AccessScope;
+    if (result.policy) policy = { ...DEFAULT_POLICY, ...(result.policy as Policy) };
     if (result.controlMode) {
       controlMode = true;
       captureScope().then(() => connect());
@@ -305,6 +333,9 @@ export default defineBackground(() => {
       );
     }
 
+    lastCommandAt = Date.now();
+    await enforcePolicy(action, params, tabId);
+
     switch (action) {
       case 'navigate':
         return handleNavigate(params as { url: string }, tabId);
@@ -350,6 +381,100 @@ export default defineBackground(() => {
       default:
         return routeToContentScript(action, params, tabId);
     }
+  }
+
+  /**
+   * Reads the visible label of the element a click will land on, so a "Place
+   * order · $249" button can be recognised as destructive before it is pressed.
+   * Best-effort: if it cannot be read, the action is classified without it.
+   */
+  async function labelForClick(
+    action: string,
+    params: Record<string, unknown>,
+    tabId: number,
+  ): Promise<string | undefined> {
+    if (action === 'click_by_text') return String(params.text ?? '');
+    if (params.ref == null) return undefined;
+    try {
+      const res = (await routeToContentScript('get_text', { ref: params.ref }, tabId)) as {
+        text?: string;
+      };
+      return res?.text?.slice(0, 200);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Classifies the command and blocks on the user when policy demands it.
+   * Throws for a denial so the refusal travels back to the agent as a tool
+   * error, with a reason it can act on rather than a bare failure.
+   */
+  async function enforcePolicy(
+    action: string,
+    params: Record<string, unknown>,
+    tabId?: number,
+  ): Promise<void> {
+    const targetTabId = tabId ?? (await getActiveTabId());
+    const url = targetTabId ? ((await chrome.tabs.get(targetTabId)).url ?? '') : '';
+
+    const label = targetTabId ? await labelForClick(action, params, targetTabId) : undefined;
+    const risk = classify(action, label);
+    const decision = evaluatePolicy(policy, risk, url, action);
+
+    if (decision.verdict === 'allow') return;
+    if (decision.verdict === 'deny') throw new Error(`Blocked by user policy: ${decision.reason}`);
+
+    const detail =
+      action === 'navigate'
+        ? String(params.url ?? '')
+        : label
+          ? `"${label.replace(/\s+/g, ' ').trim()}"`
+          : Object.keys(params).length
+            ? JSON.stringify(params).slice(0, 160)
+            : '';
+
+    const approved = await requestApproval(action, risk, decision.reason, detail, url);
+    if (!approved) {
+      throw new Error(
+        `The user declined this action (${action}). Do not retry it; ask them what they would like instead.`,
+      );
+    }
+  }
+
+  /** Fails closed: no answer means denied. */
+  function requestApproval(
+    action: string,
+    risk: RiskClass,
+    reason: string,
+    detail: string,
+    url: string,
+  ): Promise<boolean> {
+    if (approvalRequest) {
+      approvalRequest.resolve(false);
+      clearTimeout(approvalRequest.timer);
+    }
+    void openPanelHint();
+
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        if (approvalRequest?.resolve === resolve) approvalRequest = null;
+        updateBadge('on');
+        resolve(false);
+      }, APPROVAL_TTL_MS);
+
+      approvalRequest = { action, risk, reason, detail, url, resolve, timer, askedAt: Date.now() };
+      updateBadge('ask');
+    });
+  }
+
+  function resolveApproval(allow: boolean): void {
+    if (!approvalRequest) return;
+    clearTimeout(approvalRequest.timer);
+    const { resolve } = approvalRequest;
+    approvalRequest = null;
+    updateBadge('on');
+    resolve(allow);
   }
 
   /**
@@ -651,7 +776,17 @@ export default defineBackground(() => {
     return { base64: dataUrl.replace(/^data:image\/jpeg;base64,/, '') };
   }
 
-  async function handleGetCookies(params: { domain?: string }): Promise<Array<{ name: string; value: string; domain: string }>> {
+  /**
+   * Values are withheld unless explicitly asked for. A session cookie pasted
+   * into an agent transcript is a live credential that outlives the
+   * conversation — it gets logged, cached, and possibly summarised elsewhere.
+   * Names and domains answer almost every legitimate question ("am I logged
+   * in?") without handing over the key.
+   */
+  async function handleGetCookies(params: {
+    domain?: string;
+    includeValues?: boolean;
+  }): Promise<{ cookies: Array<Record<string, unknown>>; redacted: boolean; note?: string }> {
     const query: chrome.cookies.GetAllDetails = {};
     if (params.domain) query.domain = params.domain;
     else {
@@ -661,8 +796,24 @@ export default defineBackground(() => {
         if (tab.url) query.url = tab.url;
       }
     }
+
     const cookies = await chrome.cookies.getAll(query);
-    return cookies.map((c) => ({ name: c.name, value: c.value, domain: c.domain }));
+    const reveal = Boolean(params.includeValues);
+
+    return {
+      redacted: !reveal,
+      note: reveal
+        ? undefined
+        : 'Values withheld. They are live credentials; do not request them unless the task genuinely cannot proceed without them.',
+      cookies: cookies.map((c) => ({
+        name: c.name,
+        domain: c.domain,
+        secure: c.secure,
+        httpOnly: c.httpOnly,
+        session: c.session,
+        ...(reveal ? { value: c.value } : { valueLength: c.value.length }),
+      })),
+    };
   }
 
   async function handleSetCookie(params: { name: string; value: string; domain: string }): Promise<{ success: boolean }> {
@@ -839,6 +990,17 @@ export default defineBackground(() => {
         stateDetail,
         paused,
         degraded,
+        policy,
+        approvalRequest: approvalRequest
+          ? {
+              action: approvalRequest.action,
+              risk: approvalRequest.risk,
+              reason: approvalRequest.reason,
+              detail: approvalRequest.detail,
+              url: approvalRequest.url,
+              askedAt: approvalRequest.askedAt,
+            }
+          : null,
         pairRequest: pairRequest ? { agentName: pairRequest.agentName } : null,
         askRequest: askRequest
           ? { question: askRequest.question, options: askRequest.options, askedAt: askRequest.askedAt }
@@ -848,6 +1010,19 @@ export default defineBackground(() => {
         commandCount,
         accessScope,
       });
+      return true;
+    }
+
+    if (message?.type === 'resolve_approval') {
+      resolveApproval(Boolean(message.allow));
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message?.type === 'set_policy') {
+      policy = { ...policy, ...(message.policy as Partial<Policy>) };
+      chrome.storage.local.set({ policy });
+      sendResponse({ ok: true, policy });
       return true;
     }
 
@@ -953,6 +1128,30 @@ export default defineBackground(() => {
   chrome.notifications?.onClicked.addListener(() => {
     chrome.notifications.clear('');
   });
+
+  /**
+   * Control mode should not survive being forgotten about. If the agent has
+   * been idle past the configured window, revoke access rather than leaving the
+   * browser indefinitely drivable because someone left a tab open days ago.
+   */
+  setInterval(() => {
+    if (!controlMode || !policy.idleRevokeMinutes) return;
+    const idleMs = Date.now() - lastCommandAt;
+    if (idleMs < policy.idleRevokeMinutes * 60_000) return;
+
+    controlMode = false;
+    chrome.storage.local.set({ controlMode: false });
+    disconnect();
+    void chrome.notifications
+      ?.create({
+        type: 'basic',
+        iconUrl: chrome.runtime.getURL('icon.svg'),
+        title: 'onbridge — control mode turned off',
+        message: `No agent activity for ${policy.idleRevokeMinutes} minutes.`,
+        priority: 1,
+      })
+      .catch(() => {});
+  }, 60_000);
 
   // A completed navigation is a natural moment to retry CDP: whatever blocked
   // attach (usually DevTools being open) may since have gone away, and without

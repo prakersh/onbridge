@@ -58,22 +58,36 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
     'get_cookies',
     {
-      description: 'Get cookies for the current page or a specific domain.',
+      description:
+        'List cookies for the current page or a domain. Values are withheld by default — you get names, domains and flags, which is enough to tell whether a session exists. ' +
+        'Set includeValues only if the task genuinely cannot proceed without them: cookie values are live credentials, the user must approve releasing them, and they persist in this transcript afterwards.',
       inputSchema: z.object({
         domain: z.string().optional().describe('Filter cookies by domain'),
+        includeValues: z
+          .boolean()
+          .optional()
+          .describe('Request the actual values. Requires explicit user approval.'),
       }),
     },
-    async ({ domain }) => {
+    async ({ domain, includeValues }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
-        const data = (await bridge.sendCommand('get_cookies', { domain })) as Array<{
-          name: string;
-          value: string;
-          domain: string;
-        }>;
-        if (data.length === 0) return text(bridge, 'No cookies found.');
-        const lines = data.slice(0, 50).map((c) => `${c.name}=${c.value} (${c.domain})`);
-        if (data.length > 50) lines.push(`... and ${data.length - 50} more`);
+        const data = (await bridge.sendCommand('get_cookies', { domain, includeValues })) as {
+          cookies: Array<Record<string, unknown>>;
+          redacted: boolean;
+          note?: string;
+        };
+        if (!data.cookies?.length) return text(bridge, 'No cookies found.');
+
+        const lines = data.cookies.slice(0, 50).map((c) => {
+          const flags = [c.secure && 'secure', c.httpOnly && 'httpOnly', c.session && 'session']
+            .filter(Boolean)
+            .join(' ');
+          const val = data.redacted ? `<hidden, ${c.valueLength} chars>` : `=${c.value}`;
+          return `${c.name}${val} (${c.domain})${flags ? ` [${flags}]` : ''}`;
+        });
+        if (data.cookies.length > 50) lines.push(`... and ${data.cookies.length - 50} more`);
+        if (data.note) lines.push('', data.note);
         return text(bridge, lines.join('\n'));
       } catch (err) {
         return error(err);

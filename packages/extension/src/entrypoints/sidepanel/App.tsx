@@ -18,6 +18,20 @@ interface Status {
   stateDetail: string;
   paused: boolean;
   degraded: string;
+  policy: {
+    allowlist: string[];
+    denylist: string[];
+    requireApproval: string[];
+    idleRevokeMinutes: number;
+  };
+  approvalRequest: {
+    action: string;
+    risk: string;
+    reason: string;
+    detail: string;
+    url: string;
+    askedAt: number;
+  } | null;
   pairRequest: { agentName: string } | null;
   askRequest: { question: string; options?: string[]; askedAt: number } | null;
   lastAction: string;
@@ -33,6 +47,8 @@ const EMPTY: Status = {
   stateDetail: '',
   paused: false,
   degraded: '',
+  policy: { allowlist: [], denylist: [], requireApproval: [], idleRevokeMinutes: 30 },
+  approvalRequest: null,
   pairRequest: null,
   askRequest: null,
   lastAction: '',
@@ -49,6 +65,14 @@ const SCOPE_OPTIONS: { value: AccessScope; label: string; desc: string }[] = [
 
 const send = <T,>(msg: Record<string, unknown>): Promise<T> =>
   new Promise((resolve) => chrome.runtime.sendMessage(msg, resolve));
+
+const safeHost = (url: string): string => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url.slice(0, 60);
+  }
+};
 
 export default function App() {
   const [status, setStatus] = useState<Status>(EMPTY);
@@ -148,6 +172,48 @@ export default function App() {
                 Deny
               </button>
             </div>
+          </div>
+        )}
+
+        {/* ── Approval gate ── */}
+        {status.approvalRequest && (
+          <div className="m-3 rounded-lg border border-red-500/50 bg-red-500/10 p-3">
+            <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-red-300">
+              <span className="animate-pulse">●</span> Approval needed
+            </div>
+            <p className="mb-1 text-neutral-100">
+              The agent wants to{' '}
+              <span className="font-mono font-medium">{status.approvalRequest.action}</span>
+              {status.approvalRequest.detail && (
+                <>
+                  {' '}
+                  <span className="text-neutral-300">{status.approvalRequest.detail}</span>
+                </>
+              )}
+            </p>
+            {status.approvalRequest.url && (
+              <p className="mb-2 truncate text-xs text-neutral-500">
+                on {safeHost(status.approvalRequest.url)}
+              </p>
+            )}
+            <p className="mb-3 text-xs text-neutral-400">{status.approvalRequest.reason}.</p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => send({ type: 'resolve_approval', allow: true }).then(refresh)}
+                className="flex-1 rounded-md bg-red-500 py-2 font-medium text-white transition-colors hover:bg-red-400"
+              >
+                Allow once
+              </button>
+              <button
+                onClick={() => send({ type: 'resolve_approval', allow: false }).then(refresh)}
+                className="flex-1 rounded-md border border-neutral-700 bg-neutral-800 py-2 transition-colors hover:bg-neutral-700"
+              >
+                Deny
+              </button>
+            </div>
+            <p className="mt-2 text-center text-[10px] text-neutral-600">
+              Denied automatically if you don't respond.
+            </p>
           </div>
         )}
 
@@ -261,6 +327,38 @@ export default function App() {
                 Turn off Control Mode to change scope
               </p>
             )}
+          </div>
+
+          {/* ── Domain allowlist ── */}
+          <div>
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="text-xs font-medium uppercase tracking-wide text-neutral-400">
+                Allowed sites
+              </span>
+              <span className="text-[10px] text-neutral-600">
+                {status.policy.allowlist.length ? 'restricted' : 'any site'}
+              </span>
+            </div>
+            <input
+              defaultValue={status.policy.allowlist.join(', ')}
+              key={status.policy.allowlist.join(',')}
+              placeholder="e.g. github.com, mail.google.com"
+              onBlur={(e) =>
+                send({
+                  type: 'set_policy',
+                  policy: {
+                    allowlist: e.target.value
+                      .split(',')
+                      .map((s) => s.trim())
+                      .filter(Boolean),
+                  },
+                }).then(refresh)
+              }
+              className="w-full rounded-md border border-neutral-700 bg-neutral-800 px-2 py-1.5 text-xs text-neutral-100 placeholder-neutral-600 outline-none focus:border-emerald-500/50"
+            />
+            <p className="mt-1 text-[10px] text-neutral-600">
+              Leave empty to allow any site. Subdomains are included.
+            </p>
           </div>
         </div>
 

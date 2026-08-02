@@ -257,7 +257,12 @@ function buildNode(el: Element, maxDepth: number, currentDepth: number, compact 
 
   if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
     const val = (el as HTMLInputElement).value;
-    if (val) node.value = truncate(val);
+    // Never serialise a password. The agent needs to know the field is filled,
+    // never what it contains — snapshots end up in transcripts and logs.
+    if (val) {
+      node.value =
+        (el as HTMLInputElement).type === 'password' ? `[${val.length} chars hidden]` : truncate(val);
+    }
   }
 
   if (el.tagName === 'INPUT') {

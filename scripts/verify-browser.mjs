@@ -19,11 +19,13 @@ const EXT = join(ROOT, 'packages/extension/.output/chrome-mv3');
 const PAGE = `<!doctype html><html><body>
 <h1>onbridge trusted input test</h1>
 <button id="btn">Click me</button>
+<button id="danger">Place order &middot; $249</button>
 <input id="inp" placeholder="type here">
 <script>
   window.__pageSecret = 'main-world-visible';
   window.__log = [];
   btn.addEventListener('click', e => __log.push({t:'click', trusted:e.isTrusted}));
+  danger.addEventListener('click', e => __log.push({t:'danger', trusted:e.isTrusted}));
   inp.addEventListener('keydown', e => __log.push({t:'keydown', trusted:e.isTrusted, key:e.key}));
   inp.addEventListener('input', e => __log.push({t:'input', trusted:e.isTrusted, value:e.target.value}));
 </script></body></html>`;
@@ -168,8 +170,62 @@ async function main() {
         : bad('input events trusted', JSON.stringify(typed.slice(0, 3)));
     }
 
+    // ── approval gate: a destructive click must block ────────────────
+    const dangerRef = /\[button:(\d+)\][^\n]*Place order/.exec(snapText)?.[1];
+    if (!dangerRef) {
+      bad('destructive button present in snapshot');
+    } else {
+      // DENY path: the click must never reach the page.
+      const denied = call('click', { ref: Number(dangerRef) });
+      await page.waitForTimeout(700);
+      const st1 = await send({ type: 'get_status' });
+      if (st1?.approvalRequest?.action === 'click' && st1.approvalRequest.risk === 'destructive') {
+        ok('destructive click is held for approval');
+      } else {
+        bad('destructive click held for approval', JSON.stringify(st1?.approvalRequest));
+      }
+      await send({ type: 'resolve_approval', allow: false });
+      const deniedText = textOf(await denied);
+
+      const firedAfterDeny = (await page.evaluate(() => window.__log)).filter((e) => e.t === 'danger');
+      firedAfterDeny.length === 0
+        ? ok('denied action never reaches the page')
+        : bad('denied action blocked', 'the click went through anyway');
+
+      /declined/i.test(deniedText)
+        ? ok('denial is reported back to the agent')
+        : bad('denial reported to agent', deniedText.slice(0, 120));
+
+      // ALLOW path: the same click must then succeed.
+      const allowed = call('click', { ref: Number(dangerRef) });
+      await page.waitForTimeout(700);
+      await send({ type: 'resolve_approval', allow: true });
+      await allowed;
+      await page.waitForTimeout(300);
+      const firedAfterAllow = (await page.evaluate(() => window.__log)).filter((e) => e.t === 'danger');
+      firedAfterAllow.length === 1 && firedAfterAllow[0].trusted
+        ? ok('approved action proceeds as trusted input')
+        : bad('approved action proceeds', JSON.stringify(firedAfterAllow));
+    }
+
+    // ── cookie values are withheld by default ───────────────────────
+    const cookies = await call('get_cookies', {});
+    const cookieText = textOf(cookies);
+    !/=\w{6,}/.test(cookieText) || /hidden/.test(cookieText)
+      ? ok('cookie values are withheld by default')
+      : bad('cookie values withheld', cookieText.slice(0, 160));
+
     // ── main-world evaluate ─────────────────────────────────────────
-    const ev = await call('evaluate', { script: 'return window.__pageSecret' });
+    // evaluate is classified sensitive (it runs arbitrary code), so it is gated.
+    const evPromise = call('evaluate', { script: 'return window.__pageSecret' });
+    await page.waitForTimeout(700);
+    const evGate = await send({ type: 'get_status' });
+    evGate?.approvalRequest?.action === 'evaluate'
+      ? ok('evaluate is gated as a sensitive action')
+      : bad('evaluate is gated', JSON.stringify(evGate?.approvalRequest));
+    await send({ type: 'resolve_approval', allow: true });
+
+    const ev = await evPromise;
     textOf(ev).includes('main-world-visible')
       ? ok('evaluate runs in the MAIN world (sees page globals)')
       : bad('evaluate sees page globals', textOf(ev).slice(0, 120));
