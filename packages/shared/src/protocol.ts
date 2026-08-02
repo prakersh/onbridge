@@ -31,7 +31,10 @@ export type CommandAction =
   | 'console_logs'
   | 'download_file'
   | 'list_downloads'
-  | 'activity_log';
+  | 'activity_log'
+  /** Poses a question in the side panel and blocks until the user answers. */
+  | 'ask_user'
+  | 'bridge_status';
 
 // MCP Server → Extension
 export type ServerMessage =
@@ -44,7 +47,17 @@ export type ExtensionMessage =
   | { type: 'result'; id: string; success: boolean; data: unknown; error?: string; timing: number }
   | {
       type: 'event';
-      event: 'navigation' | 'tab_changed' | 'dialog' | 'control_mode_changed';
+      event:
+        | 'navigation'
+        | 'tab_changed'
+        | 'dialog'
+        | 'control_mode_changed'
+        /**
+         * An unsolicited note the user typed in the side panel. The server queues
+         * it and attaches it to the next tool result — MCP is agent-initiated, so
+         * there is no way to interrupt a turn that is already running.
+         */
+        | 'user_message';
       data: unknown;
     }
   | { type: 'pong' };
@@ -54,3 +67,10 @@ export const WS_PORT = 9876;
 export const WS_PORT_RANGE = [9876, 9877, 9878, 9879, 9880, 9881, 9882, 9883, 9884, 9885];
 export const HEARTBEAT_INTERVAL_MS = 15_000;
 export const COMMAND_TIMEOUT_MS = 30_000;
+/**
+ * `ask_user` blocks on a human, so it cannot share the normal command timeout.
+ * Kept below the two-minute mark that agent clients commonly enforce on a single
+ * tool call — on expiry the tool returns "no answer yet" for the agent to retry,
+ * rather than failing the turn.
+ */
+export const ASK_USER_TIMEOUT_MS = 110_000;

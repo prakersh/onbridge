@@ -11,6 +11,8 @@ const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000];
 const PAIR_WINDOW_MS = 60_000;
 /** How long the Allow/Deny prompt stays open before defaulting to deny. */
 const PAIR_PROMPT_TTL_MS = 60_000;
+/** Slightly under the server's ask_user timeout so we resolve first, cleanly. */
+const ASK_TTL_MS = 105_000;
 
 interface ActivityEntry {
   action: string;
@@ -37,6 +39,20 @@ export default defineBackground(() => {
   let pairRequest:
     | { agentName: string; resolve: (ok: boolean) => void; timer: ReturnType<typeof setTimeout> }
     | null = null;
+
+  /** The agent is blocked on this until the user answers in the side panel. */
+  let askRequest:
+    | {
+        question: string;
+        options?: string[];
+        resolve: (answer: string | null) => void;
+        timer: ReturnType<typeof setTimeout>;
+        askedAt: number;
+      }
+    | null = null;
+
+  /** User-initiated pause. Commands are refused while set, but stay connected. */
+  let paused = false;
 
   type AccessScope = 'current_tab' | 'current_window' | 'all_tabs';
   let accessScope: AccessScope = 'current_tab';
@@ -191,6 +207,7 @@ export default defineBackground(() => {
       reconnectTimer = null;
     }
     resolvePairing(false);
+    resolveAsk(null); // never leave the agent blocked on a dead channel
     client?.disconnect();
     client = null;
     clientState = 'idle';
@@ -204,8 +221,76 @@ export default defineBackground(() => {
     reconnectTimer = setTimeout(connect, delay);
   }
 
+  /**
+   * Poses a question in the side panel and blocks the agent until answered.
+   * Resolves null on timeout so the agent gets a retryable "no answer yet"
+   * rather than a hard failure.
+   */
+  function askUser(question: string, options?: string[]): Promise<string | null> {
+    if (askRequest) {
+      askRequest.resolve(null);
+      clearTimeout(askRequest.timer);
+    }
+    void openPanelHint();
+
+    return new Promise<string | null>((resolve) => {
+      const timer = setTimeout(() => {
+        if (askRequest?.resolve === resolve) askRequest = null;
+        updateBadge('on');
+        resolve(null);
+      }, ASK_TTL_MS);
+
+      askRequest = { question, options, resolve, timer, askedAt: Date.now() };
+      updateBadge('ask');
+    });
+  }
+
+  function resolveAsk(answer: string | null): void {
+    if (!askRequest) return;
+    clearTimeout(askRequest.timer);
+    const { resolve } = askRequest;
+    askRequest = null;
+    updateBadge('on');
+    resolve(answer);
+  }
+
+  /**
+   * chrome.sidePanel.open() requires a user gesture, so the agent cannot force
+   * the panel open. Fall back to a notification the user can click.
+   */
+  async function openPanelHint(): Promise<void> {
+    try {
+      await chrome.notifications.create({
+        type: 'basic',
+        iconUrl: chrome.runtime.getURL('icon.svg'),
+        title: 'onbridge — the agent needs you',
+        message: 'Open the onbridge side panel to answer.',
+        priority: 2,
+      });
+    } catch {
+      // Notifications may be blocked; the badge still signals it.
+    }
+  }
+
   async function handleCommand(msg: ServerMessage & { type: 'command' }): Promise<unknown> {
     const { action, params, tabId } = msg;
+
+    // ask_user and bridge_status are meta-commands: they must work even while
+    // automation is paused, since answering is exactly how a user unblocks it.
+    if (action === 'ask_user') {
+      const answer = await askUser(params.question as string, params.options as string[] | undefined);
+      return answer == null ? { timedOut: true } : { answer };
+    }
+
+    if (action === 'bridge_status') {
+      return { accessScope, paused, commandCount, controlMode };
+    }
+
+    if (paused) {
+      throw new Error(
+        'Automation is paused by the user in the onbridge side panel. Ask them to resume before retrying.',
+      );
+    }
 
     switch (action) {
       case 'navigate':
@@ -585,13 +670,19 @@ export default defineBackground(() => {
 
   const consoleLogs: Array<{ level: string; text: string; timestamp: number }> = [];
 
-  function updateBadge(state: 'disabled' | 'off' | 'on' | 'active' | 'pair') {
+  function updateBadge(state: 'disabled' | 'off' | 'on' | 'active' | 'pair' | 'ask' | 'paused') {
+    // A pending question outranks anything else — the agent is blocked on it.
+    if (askRequest && state !== 'ask') state = 'ask';
+    else if (paused && (state === 'on' || state === 'active')) state = 'paused';
+
     const colors: Record<string, string> = {
       disabled: '#666',
       off: '#666',
       on: '#00d4aa',
       active: '#3b82f6',
       pair: '#f59e0b',
+      ask: '#f59e0b',
+      paused: '#a855f7',
     };
     const labels: Record<string, string> = {
       disabled: '',
@@ -599,6 +690,8 @@ export default defineBackground(() => {
       on: 'ON',
       active: '...',
       pair: '?',
+      ask: '?',
+      paused: 'II',
     };
     chrome.action.setBadgeBackgroundColor({ color: colors[state] });
     chrome.action.setBadgeText({ text: labels[state] });
@@ -611,12 +704,51 @@ export default defineBackground(() => {
         connected: client?.isReady() ?? false,
         connectionState: clientState,
         stateDetail,
+        paused,
         pairRequest: pairRequest ? { agentName: pairRequest.agentName } : null,
+        askRequest: askRequest
+          ? { question: askRequest.question, options: askRequest.options, askedAt: askRequest.askedAt }
+          : null,
         lastAction,
-        activityLog: activityLog.slice(0, 15),
+        activityLog: activityLog.slice(0, 30),
         commandCount,
         accessScope,
       });
+      return true;
+    }
+
+    if (message?.type === 'answer_ask') {
+      resolveAsk(typeof message.answer === 'string' ? message.answer : null);
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message?.type === 'send_user_message') {
+      const text = String(message.text ?? '').trim();
+      if (!text) {
+        sendResponse({ ok: false, reason: 'empty' });
+        return true;
+      }
+      // If the agent is waiting on a question, this IS the answer — deliver it
+      // directly instead of queueing it for an unknown later moment.
+      if (askRequest) {
+        resolveAsk(text);
+        sendResponse({ ok: true, delivered: 'answered' });
+        return true;
+      }
+      if (!client?.isReady()) {
+        sendResponse({ ok: false, reason: 'not_connected' });
+        return true;
+      }
+      void client.send({ type: 'event', event: 'user_message', data: { text } });
+      sendResponse({ ok: true, delivered: 'queued' });
+      return true;
+    }
+
+    if (message?.type === 'set_paused') {
+      paused = Boolean(message.paused);
+      updateBadge(client?.isReady() ? 'on' : 'off');
+      sendResponse({ ok: true, paused });
       return true;
     }
 
@@ -667,6 +799,25 @@ export default defineBackground(() => {
     }
 
     return false;
+  });
+
+  // Clicking the toolbar icon opens the cockpit directly. This only works with
+  // no default_popup in the manifest — a popup takes precedence and would make
+  // the panel a second click. It also supplies the user gesture that
+  // chrome.sidePanel.open() demands, which is why a pending question can only
+  // *ask* to be opened (badge + notification), never force it.
+  if (chrome.sidePanel) {
+    chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+  } else {
+    // Chrome < 114: no side panel API. Fall back to a normal tab so the
+    // extension is never left with no reachable UI at all.
+    chrome.action.onClicked.addListener(() => {
+      void chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel.html') });
+    });
+  }
+
+  chrome.notifications?.onClicked.addListener(() => {
+    chrome.notifications.clear('');
   });
 
   updateBadge('disabled');

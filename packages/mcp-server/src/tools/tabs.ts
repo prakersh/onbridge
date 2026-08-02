@@ -1,6 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Bridge } from '../bridge.js';
+import { text, pageText, image, error, notConnected } from './reply.js';
 
 export function registerTabTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
@@ -21,7 +22,7 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
         const lines = data.map(
           (t) => `${t.active ? '→ ' : '  '}[${t.id}] ${t.title} (${t.url})`,
         );
-        return text(lines.join('\n'));
+        return text(bridge, lines.join('\n'));
       } catch (err) {
         return error(err);
       }
@@ -40,7 +41,7 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('switch_tab', { tabId })) as { url: string; title: string };
-        return text(`Switched to: ${data.title} (${data.url})`);
+        return text(bridge, `Switched to: ${data.title} (${data.url})`);
       } catch (err) {
         return error(err);
       }
@@ -59,7 +60,7 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('new_tab', { url })) as { tabId: number; url: string; title: string };
-        return text(`Opened tab [${data.tabId}]: ${data.title} (${data.url})`);
+        return text(bridge, `Opened tab [${data.tabId}]: ${data.title} (${data.url})`);
       } catch (err) {
         return error(err);
       }
@@ -78,7 +79,7 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
       if (!bridge.isConnected()) return notConnected();
       try {
         await bridge.sendCommand('close_tab', { tabId });
-        return text('Tab closed.');
+        return text(bridge, 'Tab closed.');
       } catch (err) {
         return error(err);
       }
@@ -86,18 +87,3 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
   );
 }
 
-function text(t: string) {
-  return { content: [{ type: 'text' as const, text: t }] };
-}
-
-function error(err: unknown) {
-  const msg = err instanceof Error ? err.message : String(err);
-  return { content: [{ type: 'text' as const, text: `Error: ${msg}` }], isError: true };
-}
-
-function notConnected() {
-  return {
-    content: [{ type: 'text' as const, text: 'Extension not connected. Enable control mode in the onbridge browser extension.' }],
-    isError: true,
-  };
-}

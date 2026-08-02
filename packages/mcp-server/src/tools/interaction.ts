@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { serializeSnapshot } from '@onbridge/shared';
 import type { PageSnapshot } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';
+import { text, pageText, image, error, notConnected } from './reply.js';
 
 export function registerInteractionTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
@@ -19,7 +20,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('click', { ref, button, doubleClick })) as PageSnapshot;
-        return text(serializeSnapshot(data));
+        return text(bridge, serializeSnapshot(data));
       } catch (err) {
         return error(err);
       }
@@ -41,7 +42,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         await bridge.sendCommand('type', { ref, text: inputText, clear, submit });
-        return text('Typed successfully.');
+        return text(bridge, 'Typed successfully.');
       } catch (err) {
         return error(err);
       }
@@ -64,7 +65,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('fill_form', { fields, submit })) as { filled: number };
-        return text(`Filled ${data.filled} field${data.filled === 1 ? '' : 's'}.`);
+        return text(bridge, `Filled ${data.filled} field${data.filled === 1 ? '' : 's'}.`);
       } catch (err) {
         return error(err);
       }
@@ -84,7 +85,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         await bridge.sendCommand('select', { ref, value });
-        return text('Selected successfully.');
+        return text(bridge, 'Selected successfully.');
       } catch (err) {
         return error(err);
       }
@@ -103,7 +104,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         await bridge.sendCommand('hover', { ref });
-        return text('Hovered successfully.');
+        return text(bridge, 'Hovered successfully.');
       } catch (err) {
         return error(err);
       }
@@ -124,7 +125,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('scroll', { direction, amount, ref })) as PageSnapshot;
-        return text(serializeSnapshot(data));
+        return text(bridge, serializeSnapshot(data));
       } catch (err) {
         return error(err);
       }
@@ -144,7 +145,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         await bridge.sendCommand('press_key', { key, modifiers });
-        return text(`Pressed ${modifiers?.length ? modifiers.join('+') + '+' : ''}${key}.`);
+        return text(bridge, `Pressed ${modifiers?.length ? modifiers.join('+') + '+' : ''}${key}.`);
       } catch (err) {
         return error(err);
       }
@@ -164,7 +165,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         await bridge.sendCommand('drag', { fromRef, toRef });
-        return text('Drag completed.');
+        return text(bridge, 'Drag completed.');
       } catch (err) {
         return error(err);
       }
@@ -184,7 +185,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         await bridge.sendCommand('upload', { ref, filePath });
-        return text('File uploaded.');
+        return text(bridge, 'File uploaded.');
       } catch (err) {
         return error(err);
       }
@@ -205,7 +206,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('click_by_text', { text: searchText, role, index })) as PageSnapshot;
-        return text(serializeSnapshot(data));
+        return text(bridge, serializeSnapshot(data));
       } catch (err) {
         return error(err);
       }
@@ -224,7 +225,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('dismiss_modal', { text: dismissText })) as PageSnapshot;
-        return text(serializeSnapshot(data));
+        return text(bridge, serializeSnapshot(data));
       } catch (err) {
         return error(err);
       }
@@ -232,18 +233,3 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
   );
 }
 
-function text(t: string) {
-  return { content: [{ type: 'text' as const, text: t }] };
-}
-
-function error(err: unknown) {
-  const msg = err instanceof Error ? err.message : String(err);
-  return { content: [{ type: 'text' as const, text: `Error: ${msg}` }], isError: true };
-}
-
-function notConnected() {
-  return {
-    content: [{ type: 'text' as const, text: 'Extension not connected. Enable control mode in the onbridge browser extension.' }],
-    isError: true,
-  };
-}

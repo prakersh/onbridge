@@ -5,6 +5,7 @@ import { registerObservationTools } from './tools/observation.js';
 import { registerInteractionTools } from './tools/interaction.js';
 import { registerTabTools } from './tools/tabs.js';
 import { registerAdvancedTools } from './tools/advanced.js';
+import { registerGovernanceTools } from './tools/governance.js';
 
 export function createServer(): McpServer {
   const server = new McpServer({
@@ -19,6 +20,7 @@ export function createServer(): McpServer {
   registerInteractionTools(server, bridge);
   registerTabTools(server, bridge);
   registerAdvancedTools(server, bridge);
+  registerGovernanceTools(server, bridge);
 
   return server;
 }

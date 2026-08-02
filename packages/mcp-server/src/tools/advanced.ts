@@ -2,6 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { serializeSnapshot } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';
+import { text, pageText, image, error, notConnected } from './reply.js';
 
 export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
@@ -19,7 +20,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       try {
         const data = (await bridge.sendCommand('evaluate', { script, ref })) as { result: unknown };
         const formatted = typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
-        return text(formatted);
+        return text(bridge, formatted);
       } catch (err) {
         return error(err);
       }
@@ -47,7 +48,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
           selector,
           timeout,
         })) as { success: boolean; elapsed: number };
-        return text(`Condition met after ${data.elapsed}ms.`);
+        return text(bridge, `Condition met after ${data.elapsed}ms.`);
       } catch (err) {
         return error(err);
       }
@@ -70,10 +71,10 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
           value: string;
           domain: string;
         }>;
-        if (data.length === 0) return text('No cookies found.');
+        if (data.length === 0) return text(bridge, 'No cookies found.');
         const lines = data.slice(0, 50).map((c) => `${c.name}=${c.value} (${c.domain})`);
         if (data.length > 50) lines.push(`... and ${data.length - 50} more`);
-        return text(lines.join('\n'));
+        return text(bridge, lines.join('\n'));
       } catch (err) {
         return error(err);
       }
@@ -94,7 +95,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       if (!bridge.isConnected()) return notConnected();
       try {
         await bridge.sendCommand('set_cookie', { name, value, domain });
-        return text(`Cookie "${name}" set for ${domain}.`);
+        return text(bridge, `Cookie "${name}" set for ${domain}.`);
       } catch (err) {
         return error(err);
       }
@@ -114,10 +115,10 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       try {
         const raw = (await bridge.sendCommand('console_logs', { level })) as { logs: Array<{ level: string; text: string; timestamp: number }> } | Array<{ level: string; text: string; timestamp: number }>;
         const data = Array.isArray(raw) ? raw : (raw.logs ?? []);
-        if (data.length === 0) return text('No console messages.');
+        if (data.length === 0) return text(bridge, 'No console messages.');
         const lines = data.slice(0, 50).map((m) => `[${m.level}] ${m.text}`);
         if (data.length > 50) lines.push(`... and ${data.length - 50} more`);
-        return text(lines.join('\n'));
+        return text(bridge, lines.join('\n'));
       } catch (err) {
         return error(err);
       }
@@ -139,17 +140,17 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       try {
         const data = await bridge.sendCommand('dom_query', { selector, action, index });
         if (action === 'click') {
-          return text(serializeSnapshot(data as any));
+          return text(bridge, serializeSnapshot(data as any));
         }
         if (action === 'text') {
-          return text((data as any).text ?? '');
+          return text(bridge, (data as any).text ?? '');
         }
         const result = data as { matches: number; results: Array<{ index: number; ref?: number; tag: string; text: string; id?: string }> };
         const lines = [`${result.matches} match${result.matches === 1 ? '' : 'es'}:`];
         for (const r of result.results) {
           lines.push(`  [${r.index}] <${r.tag}>${r.ref ? ` ref:${r.ref}` : ''}${r.id ? ` #${r.id}` : ''} "${r.text}"`);
         }
-        return text(lines.join('\n'));
+        return text(bridge, lines.join('\n'));
       } catch (err) {
         return error(err);
       }
@@ -169,7 +170,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('download_file', { url, ref })) as { filename: string; path: string };
-        return text(`Downloaded: ${data.filename}\nPath: ${data.path}`);
+        return text(bridge, `Downloaded: ${data.filename}\nPath: ${data.path}`);
       } catch (err) {
         return error(err);
       }
@@ -194,11 +195,11 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
           size: number;
           url: string;
         }>;
-        if (data.length === 0) return text('No downloads found.');
+        if (data.length === 0) return text(bridge, 'No downloads found.');
         const lines = data.map(
           (d) => `${d.state === 'complete' ? '✓' : '…'} ${d.filename} (${(d.size / 1024).toFixed(0)}KB) — ${d.path}`,
         );
-        return text(lines.join('\n'));
+        return text(bridge, lines.join('\n'));
       } catch (err) {
         return error(err);
       }
@@ -218,14 +219,14 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
           entries: Array<{ action: string; summary: string; success: boolean; error?: string; timing: number; timestamp: number }>;
           totalCommands: number;
         };
-        if (data.entries.length === 0) return text('No commands executed yet.');
+        if (data.entries.length === 0) return text(bridge, 'No commands executed yet.');
         const lines = [`Total commands: ${data.totalCommands}\n`];
         for (const e of data.entries) {
           const status = e.success ? '✓' : '✗';
           const err = e.error ? ` — ${e.error}` : '';
           lines.push(`${status} ${e.action} ${e.summary} (${e.timing}ms)${err}`);
         }
-        return text(lines.join('\n'));
+        return text(bridge, lines.join('\n'));
       } catch (err) {
         return error(err);
       }
@@ -233,18 +234,3 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
   );
 }
 
-function text(t: string) {
-  return { content: [{ type: 'text' as const, text: t }] };
-}
-
-function error(err: unknown) {
-  const msg = err instanceof Error ? err.message : String(err);
-  return { content: [{ type: 'text' as const, text: `Error: ${msg}` }], isError: true };
-}
-
-function notConnected() {
-  return {
-    content: [{ type: 'text' as const, text: 'Extension not connected. Enable control mode in the onbridge browser extension.' }],
-    isError: true,
-  };
-}

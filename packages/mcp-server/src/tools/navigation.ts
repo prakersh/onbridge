@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { serializeSnapshot } from '@onbridge/shared';
 import type { PageSnapshot } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';
+import { text, pageText, image, error, notConnected } from './reply.js';
 
 export function registerNavigationTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
@@ -17,7 +18,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('navigate', { url })) as PageSnapshot;
-        return text(serializeSnapshot(data));
+        return text(bridge, serializeSnapshot(data));
       } catch (err) {
         return error(err);
       }
@@ -34,7 +35,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('back')) as { url: string; title: string };
-        return text(`Navigated back to: ${data.title} (${data.url})`);
+        return text(bridge, `Navigated back to: ${data.title} (${data.url})`);
       } catch (err) {
         return error(err);
       }
@@ -51,7 +52,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('forward')) as { url: string; title: string };
-        return text(`Navigated forward to: ${data.title} (${data.url})`);
+        return text(bridge, `Navigated forward to: ${data.title} (${data.url})`);
       } catch (err) {
         return error(err);
       }
@@ -70,7 +71,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('reload', { hard })) as { url: string; title: string };
-        return text(`Reloaded: ${data.title} (${data.url})`);
+        return text(bridge, `Reloaded: ${data.title} (${data.url})`);
       } catch (err) {
         return error(err);
       }
@@ -78,18 +79,3 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
   );
 }
 
-function text(t: string) {
-  return { content: [{ type: 'text' as const, text: t }] };
-}
-
-function error(err: unknown) {
-  const msg = err instanceof Error ? err.message : String(err);
-  return { content: [{ type: 'text' as const, text: `Error: ${msg}` }], isError: true };
-}
-
-function notConnected() {
-  return {
-    content: [{ type: 'text' as const, text: 'Extension not connected. Enable control mode in the onbridge browser extension.' }],
-    isError: true,
-  };
-}

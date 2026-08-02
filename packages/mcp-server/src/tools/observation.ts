@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { serializeSnapshot, serializeFindResults } from '@onbridge/shared';
 import type { PageSnapshot, FindResult } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';
+import { text, pageText, image, error, notConnected } from './reply.js';
 
 export function registerObservationTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
@@ -20,7 +21,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('snapshot', { target, depth, compact })) as PageSnapshot;
-        return text(serializeSnapshot(data));
+        return pageText(bridge, serializeSnapshot(data));
       } catch (err) {
         return error(err);
       }
@@ -42,7 +43,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('find', { text: searchText, role, selector })) as FindResult[];
-        return text(serializeFindResults(data));
+        return pageText(bridge, serializeFindResults(data));
       } catch (err) {
         return error(err);
       }
@@ -62,7 +63,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('screenshot', { fullPage, quality })) as { base64: string };
-        return { content: [{ type: 'image' as const, data: data.base64, mimeType: 'image/jpeg' }] };
+        return image(bridge, data.base64);
       } catch (err) {
         return error(err);
       }
@@ -81,7 +82,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('get_text', { ref })) as { text: string };
-        return text(data.text);
+        return pageText(bridge, data.text);
       } catch (err) {
         return error(err);
       }
@@ -98,7 +99,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('get_url')) as { url: string; title: string };
-        return text(`${data.title}\n${data.url}`);
+        return text(bridge, `${data.title}\n${data.url}`);
       } catch (err) {
         return error(err);
       }
@@ -106,18 +107,3 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
   );
 }
 
-function text(t: string) {
-  return { content: [{ type: 'text' as const, text: t }] };
-}
-
-function error(err: unknown) {
-  const msg = err instanceof Error ? err.message : String(err);
-  return { content: [{ type: 'text' as const, text: `Error: ${msg}` }], isError: true };
-}
-
-function notConnected() {
-  return {
-    content: [{ type: 'text' as const, text: 'Extension not connected. Enable control mode in the onbridge browser extension.' }],
-    isError: true,
-  };
-}

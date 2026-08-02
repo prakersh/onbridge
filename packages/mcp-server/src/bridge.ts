@@ -69,6 +69,8 @@ export class Bridge {
   private cmdCounter = 0;
   private port = 0;
   private isOriginAllowed = makeOriginCheck((m) => this.log(m));
+  /** Notes typed in the side panel, awaiting delivery on the next tool result. */
+  private userMessages: string[] = [];
 
   constructor() {
     void this.listen();
@@ -370,10 +372,22 @@ export class Bridge {
     return this.port;
   }
 
+  /**
+   * Drains queued side-panel notes. Called when building a tool result: MCP has
+   * no server-initiated channel into a running turn, so piggybacking on the next
+   * result is the only way an unsolicited note reaches the agent.
+   */
+  takeUserMessages(): string[] {
+    const out = this.userMessages;
+    this.userMessages = [];
+    return out;
+  }
+
   async sendCommand(
     action: CommandAction,
     params: Record<string, unknown> = {},
     tabId?: number,
+    timeoutMs: number = COMMAND_TIMEOUT_MS,
   ): Promise<unknown> {
     if (!this.isConnected()) {
       throw new Error(
@@ -388,8 +402,8 @@ export class Bridge {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Command '${action}' timed out after ${COMMAND_TIMEOUT_MS}ms`));
-      }, COMMAND_TIMEOUT_MS);
+        reject(new Error(`Command '${action}' timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
 
       this.pending.set(id, { resolve, reject, timer });
       void this.sendSealed(this.session!.sessionKey!, msg);
@@ -413,6 +427,10 @@ export class Bridge {
       }
 
       case 'event':
+        if (msg.event === 'user_message') {
+          const { text } = (msg.data ?? {}) as { text?: string };
+          if (text?.trim()) this.userMessages.push(text.trim());
+        }
         this.log(`event: ${msg.event}`);
         break;
 

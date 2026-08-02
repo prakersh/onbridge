@@ -6,8 +6,23 @@ export default defineConfig({
   manifest: {
     name: 'onbridge',
     description: 'Browser control for AI agents via MCP',
-    permissions: ['activeTab', 'tabs', 'storage', 'scripting', 'downloads', 'debugger', 'cookies'],
+    permissions: [
+      'activeTab',
+      'tabs',
+      'storage',
+      'scripting',
+      'downloads',
+      'debugger',
+      'cookies',
+      'sidePanel',
+      'notifications',
+    ],
     host_permissions: ['<all_urls>'],
+    side_panel: { default_path: 'sidepanel.html' },
+    // Declared with no default_popup on purpose: the toolbar icon must open the
+    // side panel in one click. The key itself is still required — without it
+    // there is no toolbar button and chrome.action.setBadgeText does nothing.
+    action: {},
   },
   vite: () => ({
     plugins: [tailwindcss()],
