@@ -1,9 +1,10 @@
 {
-  "extends": "../../tsconfig.json",
+  // Extends WXT's generated config, which pulls in wxt.d.ts and with it the
+  // `chrome` extension-API types. Extending the root config instead left every
+  // `chrome.*` call unresolved (81 errors) — invisible until now because the
+  // Vite build does not typecheck.
+  "extends": "./.wxt/tsconfig.json",
   "compilerOptions": {
-    "jsx": "react-jsx",
-    "outDir": "./dist",
-    "rootDir": "./src"
-  },
-  "include": ["src"]
+    "jsx": "react-jsx"
+  }
 }

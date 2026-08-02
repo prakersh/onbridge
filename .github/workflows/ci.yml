@@ -50,6 +50,34 @@ jobs:
       - name: Build
         run: chmod +x app.sh && ./app.sh --build
 
+      # After the build: the handshake suite spawns the built server binary.
+      - name: Test
+        run: pnpm test
+
+      # The published bundle must be runnable by `npx onbridge`. A duplicated
+      # shebang and an unbundled workspace dep both silently broke this before,
+      # and neither typecheck nor build caught it.
+      - name: Verify server binary starts and registers tools
+        run: |
+          node - <<'EOF'
+          const { spawn } = require('node:child_process');
+          const p = spawn('node', ['packages/mcp-server/dist/index.js'], { stdio: ['pipe','pipe','inherit'] });
+          let out = '';
+          p.stdout.on('data', d => out += d);
+          const send = o => p.stdin.write(JSON.stringify(o) + '\n');
+          send({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'ci',version:'1'}}});
+          setTimeout(() => send({jsonrpc:'2.0',id:2,method:'tools/list',params:{}}), 500);
+          setTimeout(() => {
+            const msgs = out.trim().split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            const res = msgs.find(m => m.id === 2);
+            p.kill();
+            if (!res) { console.error('no tools/list response'); process.exit(1); }
+            if (res.error) { console.error('tools/list failed:', res.error.message); process.exit(1); }
+            console.log(`OK: ${res.result.tools.length} tools registered`);
+            process.exit(res.result.tools.length > 0 ? 0 : 1);
+          }, 2000);
+          EOF
+
       - name: Verify build artifacts
         run: |
           echo "── MCP Server ──"

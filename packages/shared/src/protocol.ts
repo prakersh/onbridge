@@ -50,5 +50,7 @@ export type ExtensionMessage =
   | { type: 'pong' };
 
 export const WS_PORT = 9876;
+/** Scanned in order so several agents can run concurrently, each on its own port. */
+export const WS_PORT_RANGE = [9876, 9877, 9878, 9879, 9880, 9881, 9882, 9883, 9884, 9885];
 export const HEARTBEAT_INTERVAL_MS = 15_000;
 export const COMMAND_TIMEOUT_MS = 30_000;

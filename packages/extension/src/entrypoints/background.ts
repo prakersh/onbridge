@@ -1,8 +1,16 @@
 import { defineBackground } from 'wxt/utils/define-background';
-import { WS_PORT } from '@onbridge/shared';
 import type { ServerMessage, ExtensionMessage } from '@onbridge/shared';
+import { SecureClient, clearPairings, type ClientState } from '../core/secure-client.js';
 
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000];
+
+/**
+ * A pairing prompt is only honoured shortly after the user enables control mode.
+ * Outside that window a local process cannot make us nag the user.
+ */
+const PAIR_WINDOW_MS = 60_000;
+/** How long the Allow/Deny prompt stays open before defaulting to deny. */
+const PAIR_PROMPT_TTL_MS = 60_000;
 
 interface ActivityEntry {
   action: string;
@@ -14,7 +22,9 @@ interface ActivityEntry {
 }
 
 export default defineBackground(() => {
-  let ws: WebSocket | null = null;
+  let client: SecureClient | null = null;
+  let clientState: ClientState = 'idle';
+  let stateDetail = '';
   let controlMode = false;
   let reconnectAttempt = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -22,13 +32,19 @@ export default defineBackground(() => {
   let activityLog: ActivityEntry[] = [];
   let commandCount = 0;
 
+  /** Set when the user flips control mode on — gates the pairing prompt. */
+  let controlEnabledAt = 0;
+  let pairRequest:
+    | { agentName: string; resolve: (ok: boolean) => void; timer: ReturnType<typeof setTimeout> }
+    | null = null;
+
   type AccessScope = 'current_tab' | 'current_window' | 'all_tabs';
   let accessScope: AccessScope = 'current_tab';
   let scopeTabId: number | undefined;
   let scopeWindowId: number | undefined;
 
   chrome.storage.local.get(['controlMode', 'accessScope'], (result) => {
-    if (result.accessScope) accessScope = result.accessScope;
+    if (result.accessScope) accessScope = result.accessScope as AccessScope;
     if (result.controlMode) {
       controlMode = true;
       captureScope().then(() => connect());
@@ -77,89 +93,96 @@ export default defineBackground(() => {
     }
   }
 
-  function connect() {
-    if (ws && ws.readyState <= WebSocket.OPEN) return;
+  /**
+   * Surfaces the Allow/Deny prompt. Resolves false unless the user actively
+   * allows — an unanswered prompt is a denial, never a default-yes.
+   */
+  function requestPairing(agentName: string): Promise<boolean> {
+    if (Date.now() - controlEnabledAt > PAIR_WINDOW_MS) {
+      return Promise.resolve(false);
+    }
+    if (pairRequest) pairRequest.resolve(false);
 
-    try {
-      ws = new WebSocket(`ws://localhost:${WS_PORT}`);
-    } catch {
-      scheduleReconnect();
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        if (pairRequest?.resolve === resolve) pairRequest = null;
+        resolve(false);
+      }, PAIR_PROMPT_TTL_MS);
+
+      pairRequest = { agentName, resolve, timer };
+      updateBadge('pair');
+    });
+  }
+
+  function resolvePairing(allow: boolean): void {
+    if (!pairRequest) return;
+    clearTimeout(pairRequest.timer);
+    const { resolve } = pairRequest;
+    pairRequest = null;
+    resolve(allow);
+  }
+
+  async function onServerMessage(msg: ServerMessage): Promise<void> {
+    if (msg.type === 'ping') {
+      await client?.send({ type: 'pong' });
       return;
     }
+    if (msg.type !== 'command') return;
 
-    ws.onopen = () => {
-      reconnectAttempt = 0;
-      updateBadge('on');
-      const ready: ExtensionMessage = {
-        type: 'ready',
-        version: '0.2.0',
-        controlMode: true,
-      };
-      ws!.send(JSON.stringify(ready));
-    };
+    updateBadge('active');
+    lastAction = msg.action;
+    commandCount++;
+    const cmdStart = Date.now();
+    const summary = summarizeParams(msg.action, msg.params);
 
-    ws.onmessage = async (event) => {
-      let msg: ServerMessage;
-      try {
-        msg = JSON.parse(event.data as string);
-      } catch {
-        return;
-      }
+    let response: ExtensionMessage;
+    try {
+      const data = await handleCommand(msg);
+      const timing = Date.now() - cmdStart;
+      response = { type: 'result', id: msg.id, success: true, data, timing };
+      activityLog.unshift({ action: msg.action, summary, success: true, timing, timestamp: Date.now() });
+    } catch (err) {
+      const timing = Date.now() - cmdStart;
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      response = { type: 'result', id: msg.id, success: false, data: null, error: errorMsg, timing };
+      activityLog.unshift({
+        action: msg.action,
+        summary,
+        success: false,
+        error: errorMsg,
+        timing,
+        timestamp: Date.now(),
+      });
+    }
 
-      if (msg.type === 'ping') {
-        const pong: ExtensionMessage = { type: 'pong' };
-        ws?.send(JSON.stringify(pong));
-        return;
-      }
+    await client?.send(response);
+    if (activityLog.length > 50) activityLog.length = 50;
+    updateBadge('on');
+  }
 
-      if (msg.type === 'command') {
-        updateBadge('active');
-        lastAction = msg.action;
-        commandCount++;
-        const cmdStart = Date.now();
-        const summary = summarizeParams(msg.action, msg.params);
+  function connect() {
+    if (client && client.getState() !== 'idle' && client.getState() !== 'failed') return;
 
-        try {
-          const result = await handleCommand(msg);
-          const timing = Date.now() - cmdStart;
-          const response: ExtensionMessage = {
-            type: 'result',
-            id: msg.id,
-            success: true,
-            data: result,
-            timing,
-          };
-          ws?.send(JSON.stringify(response));
-          activityLog.unshift({ action: msg.action, summary, success: true, timing, timestamp: Date.now() });
-        } catch (err) {
-          const timing = Date.now() - cmdStart;
-          const errorMsg = err instanceof Error ? err.message : String(err);
-          const response: ExtensionMessage = {
-            type: 'result',
-            id: msg.id,
-            success: false,
-            data: null,
-            error: errorMsg,
-            timing,
-          };
-          ws?.send(JSON.stringify(response));
-          activityLog.unshift({ action: msg.action, summary, success: false, error: errorMsg, timing, timestamp: Date.now() });
+    client = new SecureClient({
+      onPairRequest: requestPairing,
+      onMessage: (msg) => void onServerMessage(msg),
+      onState: (state, detail) => {
+        clientState = state;
+        stateDetail = detail ?? '';
+        if (state === 'ready') {
+          reconnectAttempt = 0;
+          updateBadge('on');
+          void client?.send({ type: 'ready', version: '0.3.0', controlMode: true });
+        } else if (state === 'pairing') {
+          updateBadge('pair');
+        } else if (state === 'idle' || state === 'failed') {
+          updateBadge(controlMode ? 'off' : 'disabled');
+          if (controlMode) scheduleReconnect();
         }
+      },
+    });
 
-        if (activityLog.length > 50) activityLog.length = 50;
-        updateBadge('on');
-      }
-    };
-
-    ws.onclose = () => {
-      ws = null;
-      updateBadge(controlMode ? 'off' : 'disabled');
-      if (controlMode) scheduleReconnect();
-    };
-
-    ws.onerror = () => {
-      ws?.close();
-    };
+    void client.connect();
   }
 
   function disconnect() {
@@ -167,8 +190,10 @@ export default defineBackground(() => {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
-    ws?.close();
-    ws = null;
+    resolvePairing(false);
+    client?.disconnect();
+    client = null;
+    clientState = 'idle';
     updateBadge('disabled');
   }
 
@@ -344,7 +369,7 @@ export default defineBackground(() => {
   function waitForNavigation(tabId: number): Promise<void> {
     return new Promise((resolve) => {
       const timeout = setTimeout(resolve, 10000);
-      const listener = (updatedTabId: number, info: chrome.tabs.TabChangeInfo) => {
+      const listener = (updatedTabId: number, info: chrome.tabs.OnUpdatedInfo) => {
         if (updatedTabId === tabId && info.status === 'complete') {
           chrome.tabs.onUpdated.removeListener(listener);
           clearTimeout(timeout);
@@ -560,9 +585,21 @@ export default defineBackground(() => {
 
   const consoleLogs: Array<{ level: string; text: string; timestamp: number }> = [];
 
-  function updateBadge(state: 'disabled' | 'off' | 'on' | 'active') {
-    const colors: Record<string, string> = { disabled: '#666', off: '#666', on: '#00d4aa', active: '#3b82f6' };
-    const labels: Record<string, string> = { disabled: '', off: 'OFF', on: 'ON', active: '...' };
+  function updateBadge(state: 'disabled' | 'off' | 'on' | 'active' | 'pair') {
+    const colors: Record<string, string> = {
+      disabled: '#666',
+      off: '#666',
+      on: '#00d4aa',
+      active: '#3b82f6',
+      pair: '#f59e0b',
+    };
+    const labels: Record<string, string> = {
+      disabled: '',
+      off: 'OFF',
+      on: 'ON',
+      active: '...',
+      pair: '?',
+    };
     chrome.action.setBadgeBackgroundColor({ color: colors[state] });
     chrome.action.setBadgeText({ text: labels[state] });
   }
@@ -571,7 +608,10 @@ export default defineBackground(() => {
     if (message?.type === 'get_status') {
       sendResponse({
         controlMode,
-        connected: ws !== null && ws.readyState === WebSocket.OPEN,
+        connected: client?.isReady() ?? false,
+        connectionState: clientState,
+        stateDetail,
+        pairRequest: pairRequest ? { agentName: pairRequest.agentName } : null,
         lastAction,
         activityLog: activityLog.slice(0, 15),
         commandCount,
@@ -580,10 +620,25 @@ export default defineBackground(() => {
       return true;
     }
 
+    if (message?.type === 'resolve_pairing') {
+      resolvePairing(Boolean(message.allow));
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message?.type === 'clear_pairings') {
+      clearPairings().then(() => {
+        disconnect();
+        sendResponse({ ok: true });
+      });
+      return true;
+    }
+
     if (message?.type === 'set_control_mode') {
       controlMode = message.enabled;
       chrome.storage.local.set({ controlMode });
       if (controlMode) {
+        controlEnabledAt = Date.now();
         captureScope().then(() => connect());
       } else {
         disconnect();

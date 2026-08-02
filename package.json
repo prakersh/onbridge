@@ -1,5 +1,5 @@
 {
-  "name": "onbridge",
+  "name": "onbridge-monorepo",
   "private": true,
   "license": "GPL-3.0-only",
   "description": "Browser control execution layer via MCP + Chrome Extension",
@@ -7,9 +7,13 @@
     "dev": "pnpm --parallel -r run dev",
     "build": "pnpm -r run build",
     "lint": "eslint packages/*/src",
-    "typecheck": "tsc --noEmit -p packages/shared/tsconfig.json"
+    "typecheck": "pnpm -r run typecheck",
+    "test": "vitest run"
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0"
   }
 }

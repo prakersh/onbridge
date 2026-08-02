@@ -10,13 +10,14 @@
   "main": "./dist/index.js",
   "scripts": {
     "build": "tsup",
-    "dev": "tsx --watch src/index.ts"
+    "dev": "tsx --watch src/index.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",
+    "@onbridge/shared": "workspace:*",
     "ws": "^8.18.0",
-    "zod": "^3.25.0",
-    "@onbridge/shared": "workspace:*"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/ws": "^8.5.0",
