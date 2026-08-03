@@ -62,6 +62,34 @@ jobs:
           chmod +x app.sh
           ./app.sh --package
 
+      # Exercises exactly what install.sh does to the published tarball. A
+      # `workspace:*` entry left in the shipped manifest made `npm install` fail
+      # with EUNSUPPORTEDPROTOCOL, which no other check caught because the
+      # in-repo build and the npx path both work fine.
+      - name: Verify the packaged server installs and runs
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          tar -xzf "artifacts/onbridge-mcp-server-v${{ steps.version.outputs.version }}.tar.gz" -C "$work"
+          cd "$work/onbridge-mcp-server-v${{ steps.version.outputs.version }}"
+          npm install --omit=dev
+          node - <<'EOF'
+          const { spawn } = require('node:child_process');
+          const p = spawn('node', ['dist/index.js'], { stdio: ['pipe', 'pipe', 'inherit'] });
+          let out = '';
+          p.stdout.on('data', d => out += d);
+          const send = o => p.stdin.write(JSON.stringify(o) + '\n');
+          send({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'ci',version:'1'}}});
+          setTimeout(() => send({jsonrpc:'2.0',id:2,method:'tools/list',params:{}}), 500);
+          setTimeout(() => {
+            const msgs = out.trim().split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            const list = msgs.find(m => m.id === 2);
+            p.kill();
+            if (!list?.result?.tools?.length) { console.error('packaged server did not register tools'); process.exit(1); }
+            console.log(`OK: packaged server runs, ${list.result.tools.length} tools`);
+          }, 2500);
+          EOF
+
       - name: Upload MCP Server artifact
         uses: actions/upload-artifact@v4
         with:

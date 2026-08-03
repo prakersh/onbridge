@@ -210,7 +210,23 @@ cmd_package() {
   mkdir -p "$mcp_artifact"
 
   cp -r "$ROOT_DIR/packages/mcp-server/dist" "$mcp_artifact/dist"
-  cp "$ROOT_DIR/packages/mcp-server/package.json" "$mcp_artifact/package.json"
+
+  # devDependencies are stripped from the shipped manifest. They reference
+  # @onbridge/shared as "workspace:*", and `npm install` inside the extracted
+  # tarball — which install.sh runs — fails with EUNSUPPORTEDPROTOCOL on that,
+  # even under --production. Nothing in devDependencies is needed at runtime.
+  node -e "
+    const fs = require('fs');
+    const pkg = JSON.parse(fs.readFileSync('$ROOT_DIR/packages/mcp-server/package.json', 'utf8'));
+    delete pkg.devDependencies;
+    delete pkg.scripts;
+    for (const [name, range] of Object.entries(pkg.dependencies ?? {})) {
+      if (String(range).startsWith('workspace:')) {
+        throw new Error('runtime dependency ' + name + ' uses the workspace protocol and will not install');
+      }
+    }
+    fs.writeFileSync('$mcp_artifact/package.json', JSON.stringify(pkg, null, 2) + '\n');
+  "
   cp "$ROOT_DIR/README.md" "$mcp_artifact/README.md" 2>/dev/null || true
   cp "$ROOT_DIR/LICENSE" "$mcp_artifact/LICENSE" 2>/dev/null || true
 
