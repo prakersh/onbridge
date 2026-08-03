@@ -211,13 +211,11 @@ cmd_package() {
 
   cp -r "$ROOT_DIR/packages/mcp-server/dist" "$mcp_artifact/dist"
   cp "$ROOT_DIR/packages/mcp-server/package.json" "$mcp_artifact/package.json"
+  cp "$ROOT_DIR/README.md" "$mcp_artifact/README.md" 2>/dev/null || true
+  cp "$ROOT_DIR/LICENSE" "$mcp_artifact/LICENSE" 2>/dev/null || true
 
-  # Include shared as bundled dependency (copy source for workspace resolution)
-  mkdir -p "$mcp_artifact/node_modules/@onbridge/shared"
-  if [[ -d "$ROOT_DIR/packages/shared/dist" ]]; then
-    cp -r "$ROOT_DIR/packages/shared/dist" "$mcp_artifact/node_modules/@onbridge/shared/dist"
-    cp "$ROOT_DIR/packages/shared/package.json" "$mcp_artifact/node_modules/@onbridge/shared/package.json"
-  fi
+  # @onbridge/shared is bundled into dist by tsup (noExternal), so it must NOT
+  # be copied in as a dependency — it is private, unpublished, and unresolvable.
 
   # Create tarball
   (cd "$ARTIFACTS_DIR" && tar -czf "onbridge-mcp-server-v${version}.tar.gz" "onbridge-mcp-server-v${version}")
@@ -233,8 +231,20 @@ cmd_package() {
     exit 1
   fi
 
-  (cd "$ROOT_DIR/packages/extension/.output" && zip -r "$ARTIFACTS_DIR/onbridge-extension-v${version}.zip" chrome-mv3/ -x '*.DS_Store')
-  log_ok "Extension → artifacts/onbridge-extension-v${version}.zip"
+  # Zipped from INSIDE chrome-mv3 so manifest.json sits at the archive root.
+  # The Chrome Web Store rejects an upload whose manifest is nested in a folder.
+  (cd "$ext_output" && zip -qr "$ARTIFACTS_DIR/onbridge-extension-v${version}.zip" . -x '*.DS_Store')
+  log_ok "Extension → artifacts/onbridge-extension-v${version}.zip (Web Store ready)"
+
+  # Listing captured first: piping into `grep -q` makes grep exit on the first
+  # match, unzip take SIGPIPE, and `set -o pipefail` report the whole pipeline
+  # as failed even though the check succeeded.
+  local zip_listing
+  zip_listing="$(unzip -l "$ARTIFACTS_DIR/onbridge-extension-v${version}.zip")"
+  if ! grep -qE ' manifest\.json$' <<<"$zip_listing"; then
+    log_err "manifest.json is not at the root of the extension zip — the Web Store will reject it"
+    exit 1
+  fi
 
   # ── Summary ──
   log_step "Package Summary"

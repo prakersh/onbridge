@@ -2,12 +2,36 @@
   "name": "onbridge",
   "version": "0.1.0",
   "license": "GPL-3.0-only",
-  "description": "MCP server for browser control via Chrome extension",
+  "description": "MCP server that lets AI agents drive your real Chrome browser — trusted input, approval gates, encrypted local bridge",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "browser-automation",
+    "chrome-extension",
+    "ai-agent",
+    "claude"
+  ],
+  "homepage": "https://github.com/prakersh/onbridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/prakersh/onbridge.git",
+    "directory": "packages/mcp-server"
+  },
+  "bugs": "https://github.com/prakersh/onbridge/issues",
   "type": "module",
   "bin": {
     "onbridge": "./dist/index.js"
   },
   "main": "./dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsup",
     "dev": "tsx --watch src/index.ts",
@@ -15,11 +39,11 @@
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",
-    "@onbridge/shared": "workspace:*",
     "ws": "^8.18.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@onbridge/shared": "workspace:*",
     "@types/ws": "^8.5.0",
     "tsup": "^8.0.0",
     "tsx": "^4.19.0",

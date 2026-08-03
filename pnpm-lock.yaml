@@ -57,9 +57,6 @@ importers:
       '@modelcontextprotocol/server':
         specifier: ^2.0.0
         version: 2.0.0
-      '@onbridge/shared':
-        specifier: workspace:*
-        version: link:../shared
       ws:
         specifier: ^8.18.0
         version: 8.21.1
@@ -67,6 +64,9 @@ importers:
         specifier: ^4.4.3
         version: 4.4.3
     devDependencies:
+      '@onbridge/shared':
+        specifier: workspace:*
+        version: link:../shared
       '@types/ws':
         specifier: ^8.5.0
         version: 8.18.1
