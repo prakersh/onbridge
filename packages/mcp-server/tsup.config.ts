@@ -1,4 +1,7 @@
 import { defineConfig } from 'tsup';
+import { readFileSync } from 'node:fs';
+
+const { version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 
 export default defineConfig({
   entry: ['src/index.ts'],
@@ -12,4 +15,8 @@ export default defineConfig({
   // No `banner` shebang here: src/index.ts already carries one and tsup preserves
   // it. Emitting both put a second shebang on line 2, which Node rejects as a
   // syntax error — it broke `npx onbridge` entirely.
+
+  // Injected from package.json, which ./app.sh --bump keeps in sync. Hardcoding
+  // it in server.ts meant the reported version silently drifted to a stale one.
+  define: { __ONBRIDGE_VERSION__: JSON.stringify(version) },
 });

@@ -7,10 +7,18 @@ import { registerTabTools } from './tools/tabs.js';
 import { registerAdvancedTools } from './tools/advanced.js';
 import { registerGovernanceTools } from './tools/governance.js';
 
+/**
+ * Injected at build time from package.json, which `./app.sh --bump` keeps in
+ * sync. Hardcoding it here let the reported version drift to a stale 0.1.0.
+ * The fallback covers `tsx` dev runs, where no define is applied.
+ */
+declare const __ONBRIDGE_VERSION__: string | undefined;
+const VERSION = typeof __ONBRIDGE_VERSION__ === 'string' ? __ONBRIDGE_VERSION__ : '0.0.0-dev';
+
 export function createServer(): McpServer {
   const server = new McpServer({
     name: 'onbridge',
-    version: '0.1.0',
+    version: VERSION,
   });
 
   const bridge = new Bridge();

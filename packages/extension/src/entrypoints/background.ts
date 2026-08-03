@@ -232,7 +232,13 @@ export default defineBackground(() => {
         if (state === 'ready') {
           reconnectAttempt = 0;
           updateBadge('on');
-          void client?.send({ type: 'ready', version: '0.3.0', controlMode: true });
+          // Read from the manifest so the reported version cannot drift from
+          // the shipped one, as a hardcoded string already had.
+          void client?.send({
+            type: 'ready',
+            version: chrome.runtime.getManifest().version,
+            controlMode: true,
+          });
         } else if (state === 'pairing') {
           updateBadge('pair');
         } else if (state === 'idle' || state === 'failed') {
