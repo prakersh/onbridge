@@ -90,6 +90,87 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
   );
 
   server.registerTool(
+    'extract_text',
+    {
+      description:
+        'Read the page as text, with tables rendered as markdown. Use this when you need to READ content — an article, a results table, a description — rather than act on it. ' +
+        'Far cheaper than a snapshot, which spends most of its tokens describing structure you do not need for reading. Pass a ref to read just that section.',
+      inputSchema: z.object({
+        ref: z.number().optional().describe('Read only this element and its descendants'),
+        maxChars: z.number().optional().describe('Truncate beyond this many characters (default 20000)'),
+      }),
+    },
+    async ({ ref, maxChars }) => {
+      if (!bridge.isConnected()) return notConnected();
+      try {
+        const data = (await bridge.sendCommand('extract_text', { ref, maxChars })) as {
+          text: string;
+          truncated: boolean;
+          chars: number;
+        };
+        const suffix = data.truncated
+          ? `\n\n[truncated — ${data.chars} characters total; re-read a specific section with ref]`
+          : '';
+        return pageText(bridge, data.text + suffix);
+      } catch (err) {
+        return error(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'list_actions',
+    {
+      description:
+        'List just the interactive elements on the page — buttons, links, inputs — with their refs, without the surrounding tree. ' +
+        'Use it to answer "what can I do here?" when you do not need full page structure. Much smaller than a snapshot.',
+      inputSchema: z.object({}),
+    },
+    async () => {
+      if (!bridge.isConnected()) return notConnected();
+      try {
+        const data = (await bridge.sendCommand('list_actions')) as {
+          actions: Array<Record<string, unknown>>;
+        };
+        if (!data.actions?.length) return pageText(bridge, 'No interactive elements found.');
+        const lines = data.actions.map((a) => {
+          const bits = [
+            `[${a.tag}${a.type ? `:${a.type}` : ''}:${a.ref}]`,
+            a.label ? `"${a.label}"` : '',
+            a.disabled ? '(disabled)' : '',
+            a.inViewport ? '' : '(off-screen)',
+          ].filter(Boolean);
+          return bits.join(' ');
+        });
+        return pageText(bridge, lines.join('\n'));
+      } catch (err) {
+        return error(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'highlight',
+    {
+      description:
+        'Briefly outline an element in the page so the watching user can see what you are about to act on. Purely visual — it changes nothing.',
+      inputSchema: z.object({
+        ref: z.number().describe('Element ref to outline'),
+        durationMs: z.number().optional().describe('How long to show it (default 2000)'),
+      }),
+    },
+    async ({ ref, durationMs }) => {
+      if (!bridge.isConnected()) return notConnected();
+      try {
+        await bridge.sendCommand('highlight', { ref, durationMs });
+        return text(bridge, `Highlighted element ${ref}.`);
+      } catch (err) {
+        return error(err);
+      }
+    },
+  );
+
+  server.registerTool(
     'get_url',
     {
       description: 'Get the current page URL and title.',

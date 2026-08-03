@@ -1,7 +1,14 @@
 import { defineBackground } from 'wxt/utils/define-background';
 import type { ServerMessage, ExtensionMessage, DomNode, PageSnapshot } from '@onbridge/shared';
 import { SecureClient, clearPairings, type ClientState } from '../core/secure-client.js';
-import { CdpUnavailable, detachAll, forgetRefusal } from '../core/cdp.js';
+import {
+  CdpUnavailable,
+  detachAll,
+  forgetRefusal,
+  getConsole,
+  clearConsole,
+  enableConsoleCapture,
+} from '../core/cdp.js';
 import * as trusted from '../core/trusted-input.js';
 import {
   classify,
@@ -373,7 +380,7 @@ export default defineBackground(() => {
       case 'set_cookie':
         return handleSetCookie(params as { name: string; value: string; domain: string });
       case 'console_logs':
-        return { logs: consoleLogs.slice() };
+        return handleConsoleLogs(params as { level?: string; clear?: boolean }, tabId);
       case 'download_file':
         return handleDownloadFile(params as { url?: string; ref?: number });
       case 'list_downloads':
@@ -754,6 +761,43 @@ export default defineBackground(() => {
   }
 
   /**
+   * Console capture needs CDP — there is no extension API for reading a page's
+   * console. Enabling it is best-effort so a tab where the debugger cannot
+   * attach still answers, with an explanation instead of a silent empty list.
+   */
+  async function handleConsoleLogs(
+    params: { level?: string; clear?: boolean },
+    tabId?: number,
+  ): Promise<{ logs: unknown[]; note?: string }> {
+    const targetTabId = tabId ?? (await getActiveTabId());
+    if (!targetTabId) throw new Error('No active tab found');
+    await enforceScope(targetTabId);
+
+    try {
+      await enableConsoleCapture(targetTabId);
+    } catch (err) {
+      if (err instanceof CdpUnavailable) {
+        return {
+          logs: [],
+          note: `Console capture unavailable: ${err.message}. Reload the tab after closing DevTools.`,
+        };
+      }
+      throw err;
+    }
+
+    let logs = getConsole(targetTabId);
+    if (params.level) logs = logs.filter((l) => l.level === params.level);
+    if (params.clear) clearConsole(targetTabId);
+
+    return {
+      logs: logs.slice(-100),
+      note: logs.length
+        ? undefined
+        : 'No console output captured yet. Capture starts when this tool is first called, so reload the page to see load-time messages.',
+    };
+  }
+
+  /**
    * A cheap fingerprint of the document, used only to detect that *something*
    * changed. Deliberately coarse — a full diff would cost more than it is worth
    * on every click.
@@ -1126,7 +1170,6 @@ export default defineBackground(() => {
     });
   }
 
-  const consoleLogs: Array<{ level: string; text: string; timestamp: number }> = [];
 
   function updateBadge(state: 'disabled' | 'off' | 'on' | 'active' | 'pair' | 'ask' | 'paused') {
     // A pending question outranks anything else — the agent is blocked on it.

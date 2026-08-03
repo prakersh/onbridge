@@ -90,6 +90,80 @@ export function send<T = any>(
   });
 }
 
+export interface ConsoleEntry {
+  level: string;
+  text: string;
+  url?: string;
+  timestamp: number;
+}
+
+/**
+ * Console output, captured per tab.
+ *
+ * The old `console_logs` tool returned an array that nothing ever wrote to — it
+ * always answered with an empty list. There is no extension API for reading a
+ * page's console, so this needs CDP.
+ */
+const consoleByTab = new Map<number, ConsoleEntry[]>();
+const CONSOLE_LIMIT = 200;
+
+export function getConsole(tabId: number): ConsoleEntry[] {
+  return consoleByTab.get(tabId) ?? [];
+}
+
+export function clearConsole(tabId: number): void {
+  consoleByTab.delete(tabId);
+}
+
+function record(tabId: number, entry: ConsoleEntry): void {
+  const list = consoleByTab.get(tabId) ?? [];
+  list.push(entry);
+  if (list.length > CONSOLE_LIMIT) list.splice(0, list.length - CONSOLE_LIMIT);
+  consoleByTab.set(tabId, list);
+}
+
+/** Enables the domains that emit console and error events. */
+export async function enableConsoleCapture(tabId: number): Promise<void> {
+  await attach(tabId);
+  await Promise.all([
+    send(tabId, 'Runtime.enable').catch(() => {}),
+    send(tabId, 'Log.enable').catch(() => {}),
+  ]);
+}
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  const tabId = source.tabId;
+  if (tabId == null) return;
+  const p = params as any;
+
+  if (method === 'Runtime.consoleAPICalled') {
+    record(tabId, {
+      level: p.type ?? 'log',
+      text: (p.args ?? [])
+        .map((a: any) => a.value ?? a.description ?? a.unserializableValue ?? '')
+        .join(' ')
+        .slice(0, 2000),
+      timestamp: Date.now(),
+    });
+  } else if (method === 'Runtime.exceptionThrown') {
+    const d = p.exceptionDetails ?? {};
+    record(tabId, {
+      level: 'error',
+      text: (d.exception?.description ?? d.text ?? 'Uncaught exception').slice(0, 2000),
+      url: d.url,
+      timestamp: Date.now(),
+    });
+  } else if (method === 'Log.entryAdded') {
+    // Network/security/deprecation warnings the page itself never sees.
+    record(tabId, {
+      level: p.entry?.level ?? 'info',
+      text: (p.entry?.text ?? '').slice(0, 2000),
+      url: p.entry?.url,
+      timestamp: Date.now(),
+    });
+  }
+});
+
 // Chrome tears the session down on navigation-ish events; keep state honest.
 chrome.debugger.onDetach.addListener((source) => {
   if (source.tabId != null) attached.delete(source.tabId);
@@ -98,4 +172,5 @@ chrome.debugger.onDetach.addListener((source) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   attached.delete(tabId);
   refused.delete(tabId);
+  consoleByTab.delete(tabId);
 });

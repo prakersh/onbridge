@@ -32,6 +32,12 @@ const PAGE = `<!doctype html><html><body>
 <my-widget></my-widget>
 <iframe id="frame" src="/frame" width="300" height="120"></iframe>
 
+<table>
+  <tr><th>Item</th><th>Price</th></tr>
+  <tr><td>Widget</td><td>$249</td></tr>
+  <tr><td>Gadget</td><td>$99</td></tr>
+</table>
+
 <script>
   // A web component with an OPEN shadow root: its content is invisible to a
   // flat querySelectorAll, which is exactly the gap being tested.
@@ -261,6 +267,32 @@ async function main() {
         ? ok('approved action proceeds as trusted input')
         : bad('approved action proceeds', JSON.stringify(firedAfterAllow));
     }
+
+    // ── extract_text renders tables as markdown ─────────────────────
+    const extracted = textOf(await call('extract_text', {}));
+    /\|\s*Widget\s*\|/.test(extracted) && /\| --- \|/.test(extracted)
+      ? ok('extract_text renders tables as markdown')
+      : bad('extract_text table rendering', extracted.slice(0, 200));
+
+    // ── list_actions is a cheap alternative to a snapshot ───────────
+    const actions = textOf(await call('list_actions', {}));
+    actions.includes('Place order') && actions.length < snapText.length
+      ? ok('list_actions lists controls and is smaller than a snapshot')
+      : bad('list_actions', `${actions.length} chars vs snapshot ${snapText.length}`);
+
+    // ── console_logs actually returns something now ─────────────────
+    await page.evaluate(() => console.warn('onbridge-console-probe'));
+    await page.waitForTimeout(300);
+    const logs = textOf(await call('console_logs', {}));
+    logs.includes('onbridge-console-probe')
+      ? ok('console_logs captures page console output')
+      : bad('console_logs captures output', logs.slice(0, 200));
+
+    // ── find honours its selector parameter ─────────────────────────
+    const bySelector = textOf(await call('find', { selector: '#danger' }));
+    bySelector.includes('Place order') && !bySelector.includes('Click me')
+      ? ok('find filters by CSS selector')
+      : bad('find selector filter', bySelector.slice(0, 200));
 
     // ── cookie values are withheld by default ───────────────────────
     const cookies = await call('get_cookies', {});

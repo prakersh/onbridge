@@ -9,7 +9,11 @@ export class CommandExecutor {
 
       case 'find': {
         const { findElements } = await import('./dom-capture.js');
-        return findElements(String(params.text ?? ''), params.role as string | undefined);
+        return findElements(
+          String(params.text ?? ''),
+          params.role as string | undefined,
+          params.selector as string | undefined,
+        );
       }
 
       case 'get_text':
@@ -57,12 +61,147 @@ export class CommandExecutor {
       case 'dismiss_modal':
         return this.dismissModal(params);
 
+      case 'extract_text':
+        return this.extractText(params);
+
+      case 'list_actions':
+        return this.listActions();
+
+      case 'highlight':
+        return this.highlight(params);
+
       case 'screenshot':
         return this.screenshot();
 
       default:
         throw new Error(`Unknown action: ${action}`);
     }
+  }
+
+  /**
+   * Reads readable text from the page or a subtree, with tables rendered as
+   * markdown. A snapshot is the right tool for *acting* on a page; for reading
+   * an article or a results table it wastes most of its tokens on structure.
+   */
+  private extractText(params: Record<string, unknown>): {
+    text: string;
+    truncated: boolean;
+    chars: number;
+  } {
+    const root = params.ref != null ? (this.getEl(params.ref as number) as HTMLElement) : document.body;
+    const maxChars = (params.maxChars as number) ?? 20_000;
+
+    const parts: string[] = [];
+    const seenTables = new Set<Element>();
+
+    for (const table of root.querySelectorAll('table')) {
+      seenTables.add(table);
+    }
+
+    const walk = (node: Element) => {
+      if (node.tagName === 'SCRIPT' || node.tagName === 'STYLE' || node.tagName === 'NOSCRIPT') return;
+      try {
+        const style = window.getComputedStyle(node);
+        if (style.display === 'none' || style.visibility === 'hidden') return;
+      } catch {
+        /* detached */
+      }
+
+      if (node.tagName === 'TABLE' && seenTables.has(node)) {
+        parts.push(this.tableToMarkdown(node as HTMLTableElement));
+        return;
+      }
+
+      let ownText = '';
+      for (const child of node.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) ownText += child.textContent ?? '';
+      }
+      ownText = ownText.replace(/\s+/g, ' ').trim();
+
+      if (ownText) {
+        const heading = /^H([1-6])$/.exec(node.tagName);
+        parts.push(heading ? `${'#'.repeat(Number(heading[1]))} ${ownText}` : ownText);
+      }
+
+      for (const child of node.children) walk(child);
+      if (node.shadowRoot) for (const child of node.shadowRoot.children) walk(child);
+    };
+
+    walk(root);
+
+    const full = parts.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return {
+      text: full.slice(0, maxChars),
+      truncated: full.length > maxChars,
+      chars: full.length,
+    };
+  }
+
+  private tableToMarkdown(table: HTMLTableElement): string {
+    const rows = Array.from(table.rows).slice(0, 200);
+    if (rows.length === 0) return '';
+
+    const cellText = (c: HTMLTableCellElement) =>
+      (c.textContent ?? '').replace(/\s+/g, ' ').replace(/\|/g, '\\|').trim();
+
+    const lines = rows.map((r) => `| ${Array.from(r.cells).map(cellText).join(' | ')} |`);
+    // Insert the markdown separator after the header row so the table renders.
+    const headerCols = rows[0].cells.length;
+    lines.splice(1, 0, `|${' --- |'.repeat(headerCols)}`);
+    return lines.join('\n');
+  }
+
+  /**
+   * The interactive elements only, without the surrounding tree. Answers "what
+   * can I do here?" at a fraction of a snapshot's size.
+   */
+  private async listActions(): Promise<{ actions: unknown[] }> {
+    const { captureSnapshot, getRefMap } = await import('./dom-capture.js');
+    captureSnapshot();
+
+    const actions: unknown[] = [];
+    for (const [ref, el] of getRefMap()) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) continue;
+
+      const tag = el.tagName.toLowerCase();
+      const label =
+        el.getAttribute('aria-label') ??
+        (el as HTMLInputElement).placeholder ??
+        (el.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 60);
+
+      actions.push({
+        ref,
+        tag,
+        label: label || undefined,
+        type: (el as HTMLInputElement).type || undefined,
+        disabled: (el as HTMLInputElement).disabled || undefined,
+        inViewport: rect.top >= 0 && rect.top < window.innerHeight,
+      });
+    }
+    return { actions };
+  }
+
+  /**
+   * Draws a temporary outline around an element. Useful when the user is
+   * watching and needs to see what the agent is about to act on.
+   */
+  private highlight(params: Record<string, unknown>): { success: boolean } {
+    const el = this.getEl(params.ref as number) as HTMLElement;
+    const ms = (params.durationMs as number) ?? 2000;
+
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const previous = el.style.outline;
+    const previousOffset = el.style.outlineOffset;
+    el.style.outline = '3px solid #00d4aa';
+    el.style.outlineOffset = '2px';
+
+    setTimeout(() => {
+      el.style.outline = previous;
+      el.style.outlineOffset = previousOffset;
+    }, ms);
+
+    return { success: true };
   }
 
   private getText(ref: number): { text: string } {

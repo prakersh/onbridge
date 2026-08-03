@@ -399,7 +399,7 @@ export function captureSnapshot(targetRef?: number, maxDepth = 20, compact = fal
   };
 }
 
-export function findElements(query: string, role?: string): FindResult[] {
+export function findElements(query: string, role?: string, selector?: string): FindResult[] {
   if (refMap.size === 0) {
     captureSnapshot();
   }
@@ -407,9 +407,26 @@ export function findElements(query: string, role?: string): FindResult[] {
   const results: FindResult[] = [];
   const lowerQuery = String(query ?? '').toLowerCase();
 
+  // `selector` was accepted by the tool schema but never read, so callers
+  // passing one silently got an unfiltered text search instead.
+  let selectorMatches: Set<Element> | undefined;
+  if (selector) {
+    try {
+      selectorMatches = new Set(deepQueryAll(selector));
+    } catch {
+      throw new Error(`Invalid CSS selector: ${selector}`);
+    }
+    // A selector may match elements that were never assigned a ref, so make sure
+    // they exist in the map before filtering against it.
+    if (refMap.size === 0 || ![...selectorMatches].some((el) => el.hasAttribute(ATTR))) {
+      captureSnapshot();
+    }
+  }
+
   for (const [ref, el] of refMap) {
     const elRole = getRole(el) ?? 'generic';
 
+    if (selectorMatches && !selectorMatches.has(el)) continue;
     if (role && elRole !== role) continue;
 
     const name = getAccessibleName(el);

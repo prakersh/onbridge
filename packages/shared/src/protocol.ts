@@ -34,7 +34,10 @@ export type CommandAction =
   | 'activity_log'
   /** Poses a question in the side panel and blocks until the user answers. */
   | 'ask_user'
-  | 'bridge_status';
+  | 'bridge_status'
+  | 'extract_text'
+  | 'list_actions'
+  | 'highlight';
 
 // MCP Server → Extension
 export type ServerMessage =
