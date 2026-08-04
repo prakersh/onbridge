@@ -14,6 +14,8 @@ import {
   classify,
   evaluatePolicy,
   DEFAULT_POLICY,
+  YOLO_TIMEOUT_MINUTES,
+  type ApprovalMode,
   type Policy,
   type RiskClass,
 } from '../core/policy.js';
@@ -82,6 +84,9 @@ export default defineBackground(() => {
 
   let policy: Policy = { ...DEFAULT_POLICY };
   let lastCommandAt = Date.now();
+  /** When bypass mode reverts to `auto` on its own. 0 when not in bypass. */
+  let yoloExpiresAt = 0;
+  let yoloTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** The agent is blocked on this until the user allows or denies. */
   let approvalRequest:
@@ -104,7 +109,12 @@ export default defineBackground(() => {
 
   chrome.storage.local.get(['controlMode', 'accessScope', 'policy'], (result) => {
     if (result.accessScope) accessScope = result.accessScope as AccessScope;
-    if (result.policy) policy = { ...DEFAULT_POLICY, ...(result.policy as Policy) };
+    if (result.policy) {
+      policy = { ...DEFAULT_POLICY, ...(result.policy as Policy) };
+      // yolo never survives a restart. Leaving prompts disabled across sessions
+      // because of a choice made days ago is exactly how people get surprised.
+      if (policy.mode === 'yolo') policy.mode = 'auto';
+    }
     if (result.controlMode) {
       controlMode = true;
       captureScope().then(() => connect());
@@ -338,7 +348,16 @@ export default defineBackground(() => {
     }
 
     if (action === 'bridge_status') {
-      return { accessScope, paused, commandCount, controlMode, degraded: degraded || undefined };
+      return {
+        accessScope,
+        paused,
+        commandCount,
+        controlMode,
+        approvalMode: policy.mode,
+        allowlist: policy.allowlist,
+        denylist: policy.denylist,
+        degraded: degraded || undefined,
+      };
     }
 
     if (paused) {
@@ -1177,10 +1196,14 @@ export default defineBackground(() => {
   }
 
 
-  function updateBadge(state: 'disabled' | 'off' | 'on' | 'active' | 'pair' | 'ask' | 'paused') {
+  function updateBadge(
+    state: 'disabled' | 'off' | 'on' | 'active' | 'pair' | 'ask' | 'paused' | 'yolo',
+  ) {
     // A pending question outranks anything else — the agent is blocked on it.
-    if (askRequest && state !== 'ask') state = 'ask';
+    if (askRequest || approvalRequest) state = 'ask';
     else if (paused && (state === 'on' || state === 'active')) state = 'paused';
+    // Bypass mode must be impossible to miss while it is on.
+    else if (policy.mode === 'yolo' && (state === 'on' || state === 'active')) state = 'yolo';
 
     const colors: Record<string, string> = {
       disabled: '#666',
@@ -1190,6 +1213,7 @@ export default defineBackground(() => {
       pair: '#f59e0b',
       ask: '#f59e0b',
       paused: '#a855f7',
+      yolo: '#ef4444',
     };
     const labels: Record<string, string> = {
       disabled: '',
@@ -1199,6 +1223,7 @@ export default defineBackground(() => {
       pair: '?',
       ask: '?',
       paused: 'II',
+      yolo: '!',
     };
     chrome.action.setBadgeBackgroundColor({ color: colors[state] });
     chrome.action.setBadgeText({ text: labels[state] });
@@ -1214,6 +1239,7 @@ export default defineBackground(() => {
         paused,
         degraded,
         policy,
+        yoloExpiresAt,
         approvalRequest: approvalRequest
           ? {
               action: approvalRequest.action,
@@ -1246,6 +1272,49 @@ export default defineBackground(() => {
       policy = { ...policy, ...(message.policy as Partial<Policy>) };
       chrome.storage.local.set({ policy });
       sendResponse({ ok: true, policy });
+      return true;
+    }
+
+    // Reachable only from the extension's own pages. There is deliberately no
+    // MCP tool for this: an agent able to widen its own permissions would make
+    // every approval prompt meaningless.
+    if (message?.type === 'set_approval_mode') {
+      const mode = message.mode as ApprovalMode;
+      if (mode !== 'yolo' && mode !== 'auto' && mode !== 'strict') {
+        sendResponse({ ok: false, reason: 'unknown mode' });
+        return true;
+      }
+      policy = { ...policy, mode };
+      chrome.storage.local.set({ policy });
+
+      if (yoloTimer) {
+        clearTimeout(yoloTimer);
+        yoloTimer = null;
+      }
+      if (mode === 'yolo') {
+        yoloExpiresAt = Date.now() + YOLO_TIMEOUT_MINUTES * 60_000;
+        // Falls back on its own so an unattended run cannot leave the browser
+        // permanently unguarded.
+        yoloTimer = setTimeout(() => {
+          policy = { ...policy, mode: 'auto' };
+          yoloExpiresAt = 0;
+          chrome.storage.local.set({ policy });
+          void chrome.notifications
+            ?.create({
+              type: 'basic',
+              iconUrl: chrome.runtime.getURL('icon.svg'),
+              title: 'onbridge — approvals re-enabled',
+              message: `Bypass mode expired after ${YOLO_TIMEOUT_MINUTES} minutes.`,
+              priority: 1,
+            })
+            .catch(() => {});
+        }, YOLO_TIMEOUT_MINUTES * 60_000);
+      } else {
+        yoloExpiresAt = 0;
+      }
+
+      updateBadge(client?.isReady() ? 'on' : 'off');
+      sendResponse({ ok: true, mode, expiresAt: yoloExpiresAt || undefined });
       return true;
     }
 

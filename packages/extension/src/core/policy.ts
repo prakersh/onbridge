@@ -49,22 +49,49 @@ export function classify(action: string, labelText?: string): RiskClass {
   return 'write';
 }
 
+/**
+ * How much the user wants to be asked.
+ *
+ * Set from the side panel only — deliberately not reachable from any MCP tool.
+ * An agent that can widen its own permissions makes the whole layer theatre.
+ */
+export type ApprovalMode =
+  /** Nothing is asked. For unattended runs on sites you do not mind breaking. */
+  | 'yolo'
+  /** Risk-based: credential access and real-world consequences are asked. */
+  | 'auto'
+  /** Everything that changes state is asked, one action at a time. */
+  | 'strict';
+
+/**
+ * Reads stay exempt even in strict mode. Approving every snapshot would make the
+ * browser unusable and train the user to click Allow without reading it, which
+ * is worse than not asking — the prompts that matter stop being noticed.
+ */
+export const MODE_APPROVALS: Record<ApprovalMode, RiskClass[]> = {
+  yolo: [],
+  auto: ['sensitive', 'destructive'],
+  strict: ['navigate', 'write', 'sensitive', 'destructive'],
+};
+
 export interface Policy {
+  mode: ApprovalMode;
   /** Empty means "any domain". Entries are hostname suffixes. */
   allowlist: string[];
   denylist: string[];
-  /** Which classes require an explicit user approval. */
-  requireApproval: RiskClass[];
   /** Minutes of inactivity after which control mode revokes itself. 0 = never. */
   idleRevokeMinutes: number;
 }
 
 export const DEFAULT_POLICY: Policy = {
+  mode: 'auto',
   allowlist: [],
   denylist: [],
-  requireApproval: ['sensitive', 'destructive'],
   idleRevokeMinutes: 30,
 };
+
+/** Minutes before yolo drops back to auto on its own. */
+export const YOLO_TIMEOUT_MINUTES = 60;
 
 function hostOf(url: string): string {
   try {
@@ -96,6 +123,9 @@ export function evaluatePolicy(
 ): PolicyDecision {
   const host = hostOf(url);
 
+  // Domain lists are explicit user configuration, not a risk heuristic, so they
+  // are enforced in every mode — including yolo. Turning off the prompts means
+  // "stop asking me", not "ignore the boundaries I set".
   if (host && policy.denylist.length && matchesDomain(host, policy.denylist)) {
     return { verdict: 'deny', reason: `${host} is on the blocked list for this browser.` };
   }
@@ -107,13 +137,15 @@ export function evaluatePolicy(
     };
   }
 
-  if (policy.requireApproval.includes(risk)) {
+  if (MODE_APPROVALS[policy.mode]?.includes(risk)) {
     return {
       verdict: 'approve',
       reason:
         risk === 'destructive'
           ? `"${action}" looks like it commits a real-world action`
-          : `"${action}" can read credentials or run arbitrary code`,
+          : risk === 'sensitive'
+            ? `"${action}" can read credentials or run arbitrary code`
+            : `you asked to approve every step`,
     };
   }
 

@@ -34,12 +34,12 @@ import {
   verifyProof,
 } from '@onbridge/shared';
 
-const PORT = 9876;
 const EXT_ORIGIN = 'chrome-extension://testextensionid';
 const SERVER = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 
 let srv: ChildProcess;
 let home: string;
+let port = 0;
 
 beforeAll(async () => {
   home = mkdtempSync(join(tmpdir(), 'onbridge-test-'));
@@ -48,7 +48,13 @@ beforeAll(async () => {
     env: { ...process.env, ONBRIDGE_HOME: home },
   });
   srv.stderr!.on('data', (d) => {
-    if (process.env.ONBRIDGE_TEST_VERBOSE) process.stderr.write(`[srv] ${d}`);
+    const text = String(d);
+    // Capture the port the server actually bound. The bridge scans 9876-9885,
+    // so assuming 9876 makes the suite talk to whatever else already holds it
+    // and fail with "invalid auth proof" — a crypto-looking error that is not.
+    const m = /listening on 127\.0\.0\.1:(\d+)/.exec(text);
+    if (m) port = Number(m[1]);
+    if (process.env.ONBRIDGE_TEST_VERBOSE) process.stderr.write(`[srv] ${text}`);
   });
   srv.on('exit', (code, sig) => {
     if (process.env.ONBRIDGE_TEST_VERBOSE) process.stderr.write(`[srv] EXITED code=${code} sig=${sig}\n`);
@@ -76,6 +82,12 @@ afterAll(() => {
 });
 
 async function waitForPort(): Promise<void> {
+  for (let i = 0; i < 100; i++) {
+    if (port) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!port) throw new Error('server never reported a listening port');
+
   for (let i = 0; i < 60; i++) {
     try {
       const ws = await connect(EXT_ORIGIN);
@@ -103,8 +115,8 @@ async function closeAndSettle(ws: WebSocket): Promise<void> {
 function connect(origin?: string): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const ws = origin
-      ? new WebSocket(`ws://127.0.0.1:${PORT}`, { origin })
-      : new WebSocket(`ws://127.0.0.1:${PORT}`);
+      ? new WebSocket(`ws://127.0.0.1:${port}`, { origin })
+      : new WebSocket(`ws://127.0.0.1:${port}`);
     ws.once('open', () => resolve(ws));
     ws.once('error', reject);
     setTimeout(() => reject(new Error('timeout')), 4000);

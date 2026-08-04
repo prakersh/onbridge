@@ -10,6 +10,13 @@ interface ActivityEntry {
 }
 
 type AccessScope = 'current_tab' | 'current_window' | 'all_tabs';
+type ApprovalMode = 'yolo' | 'auto' | 'strict';
+
+const MODES: { value: ApprovalMode; label: string; blurb: string }[] = [
+  { value: 'strict', label: 'Ask every step', blurb: 'Approve each navigation and change. Reads still pass.' },
+  { value: 'auto', label: 'Balanced', blurb: 'Only credential access and real-world actions are asked.' },
+  { value: 'yolo', label: 'Bypass', blurb: 'Nothing is asked. Reverts on its own after 60 minutes.' },
+];
 
 interface Status {
   controlMode: boolean;
@@ -19,11 +26,12 @@ interface Status {
   paused: boolean;
   degraded: string;
   policy: {
+    mode: ApprovalMode;
     allowlist: string[];
     denylist: string[];
-    requireApproval: string[];
     idleRevokeMinutes: number;
   };
+  yoloExpiresAt: number;
   approvalRequest: {
     action: string;
     risk: string;
@@ -47,7 +55,8 @@ const EMPTY: Status = {
   stateDetail: '',
   paused: false,
   degraded: '',
-  policy: { allowlist: [], denylist: [], requireApproval: [], idleRevokeMinutes: 30 },
+  policy: { mode: 'auto', allowlist: [], denylist: [], idleRevokeMinutes: 30 },
+  yoloExpiresAt: 0,
   approvalRequest: null,
   pairRequest: null,
   askRequest: null,
@@ -297,6 +306,57 @@ export default function App() {
             >
               {status.paused ? '▶  Resume automation' : '⏸  Pause automation'}
             </button>
+          )}
+
+          {/* ── Approval mode ── */}
+          <div>
+            <div className="mb-1.5 text-xs font-medium uppercase tracking-wide text-neutral-400">
+              Approvals
+            </div>
+            <div className="flex gap-1">
+              {MODES.map((m) => (
+                <button
+                  key={m.value}
+                  title={m.blurb}
+                  onClick={() => send({ type: 'set_approval_mode', mode: m.value }).then(refresh)}
+                  className={`flex-1 rounded-md px-2 py-1.5 text-xs transition-colors ${
+                    status.policy.mode === m.value
+                      ? m.value === 'yolo'
+                        ? 'border border-red-500/50 bg-red-500/20 text-red-300'
+                        : 'border border-emerald-500/40 bg-emerald-500/20 text-emerald-300'
+                      : 'border border-neutral-700 bg-neutral-800 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+            <p className="mt-1 text-[10px] text-neutral-600">
+              {MODES.find((m) => m.value === status.policy.mode)?.blurb}
+            </p>
+          </div>
+
+          {status.policy.mode === 'yolo' && (
+            <div className="rounded-lg border border-red-500/50 bg-red-500/10 p-3">
+              <div className="mb-1 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-red-300">
+                <span className="animate-pulse">●</span> Approvals are off
+              </div>
+              <p className="text-xs text-neutral-300">
+                The agent can read credentials, run scripts, and click things that spend money or
+                delete data — without asking you first.
+              </p>
+              <p className="mt-1 text-[11px] text-neutral-500">
+                {status.yoloExpiresAt
+                  ? `Reverts to Balanced in ${Math.max(0, Math.round((status.yoloExpiresAt - Date.now()) / 60000))} min, and on browser restart.`
+                  : 'Reverts on browser restart.'}
+              </p>
+              <button
+                onClick={() => send({ type: 'set_approval_mode', mode: 'auto' }).then(refresh)}
+                className="mt-2 w-full rounded-md bg-red-500 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-400"
+              >
+                Turn approvals back on
+              </button>
+            </div>
           )}
 
           <div>

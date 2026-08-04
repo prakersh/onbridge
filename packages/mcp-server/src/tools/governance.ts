@@ -66,15 +66,30 @@ export function registerGovernanceTools(server: McpServer, bridge: Bridge): void
       }
       try {
         const data = (await bridge.sendCommand('bridge_status')) as Record<string, unknown>;
+        const modeNote: Record<string, string> = {
+          yolo: 'BYPASS — nothing is gated. Be correspondingly careful.',
+          auto: 'Balanced — credential access and real-world actions need the user to approve.',
+          strict: 'Ask every step — every navigation and change needs the user to approve.',
+        };
+        const mode = String(data.approvalMode ?? 'auto');
+        const allowlist = (data.allowlist as string[]) ?? [];
+        const denylist = (data.denylist as string[]) ?? [];
+
         return text(
           bridge,
           [
             'Extension: CONNECTED (encrypted, paired)',
             `Bridge port: 127.0.0.1:${bridge.getPort()}`,
             `Access scope: ${data.accessScope ?? 'unknown'}`,
+            `Approval mode: ${mode} — ${modeNote[mode] ?? ''}`,
+            allowlist.length ? `Allowed sites only: ${allowlist.join(', ')}` : 'Allowed sites: any',
+            denylist.length ? `Blocked sites: ${denylist.join(', ')}` : '',
             `Automation: ${data.paused ? 'PAUSED by the user' : 'active'}`,
+            data.degraded ? `Input fidelity: DEGRADED (${data.degraded})` : '',
             `Commands this session: ${data.commandCount ?? 0}`,
-          ].join('\n'),
+          ]
+            .filter(Boolean)
+            .join('\n'),
         );
       } catch (err) {
         return error(err);

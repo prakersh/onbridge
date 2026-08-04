@@ -28,9 +28,24 @@ import {
 } from '@onbridge/shared';
 import type { ExtensionMessage, ServerMessage } from '@onbridge/shared';
 
-export const PORT = 9876;
 export const EXT_ORIGIN = 'chrome-extension://testextensionid';
 const SERVER = fileURLToPath(new URL('../dist/index.js', import.meta.url));
+
+/**
+ * The port the server under test actually bound.
+ *
+ * Never assume 9876. The bridge scans 9876-9885, so if anything else already
+ * holds the first port — a `pnpm dev` server, a previous run — our server binds
+ * a later one. Hardcoding 9876 made the suite silently talk to that *other*
+ * server and fail with "invalid auth proof", which looks like a crypto bug and
+ * is not one.
+ */
+let boundPort = 0;
+
+export function getPort(): number {
+  if (!boundPort) throw new Error('server has not reported a bound port yet');
+  return boundPort;
+}
 
 export interface Harness {
   proc: ChildProcess;
@@ -48,7 +63,12 @@ export function startServer(): Harness {
   });
 
   proc.stderr!.on('data', (d) => {
-    if (process.env.ONBRIDGE_TEST_VERBOSE) process.stderr.write(`[srv] ${d}`);
+    const text = String(d);
+    // The bridge announces the port it actually bound; capture it rather than
+    // assuming the first one in the range was free.
+    const m = /listening on 127\.0\.0\.1:(\d+)/.exec(text);
+    if (m) boundPort = Number(m[1]);
+    if (process.env.ONBRIDGE_TEST_VERBOSE) process.stderr.write(`[srv] ${text}`);
   });
 
   let buf = '';
@@ -95,10 +115,11 @@ export function startServer(): Harness {
 }
 
 export function connect(origin?: string): Promise<WebSocket> {
+  const port = getPort();
   return new Promise((resolve, reject) => {
     const ws = origin
-      ? new WebSocket(`ws://127.0.0.1:${PORT}`, { origin })
-      : new WebSocket(`ws://127.0.0.1:${PORT}`);
+      ? new WebSocket(`ws://127.0.0.1:${port}`, { origin })
+      : new WebSocket(`ws://127.0.0.1:${port}`);
     ws.once('open', () => resolve(ws));
     ws.once('error', reject);
     setTimeout(() => reject(new Error('connect timeout')), 4000);
@@ -233,6 +254,13 @@ export async function openSession(): Promise<Session> {
 }
 
 export async function waitForListening(): Promise<void> {
+  // Wait for the server to report its port before attempting any connection.
+  for (let i = 0; i < 100; i++) {
+    if (boundPort) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!boundPort) throw new Error('server never reported a listening port');
+
   for (let i = 0; i < 60; i++) {
     try {
       const ws = await connect(EXT_ORIGIN);
@@ -243,5 +271,5 @@ export async function waitForListening(): Promise<void> {
       await new Promise((r) => setTimeout(r, 200));
     }
   }
-  throw new Error('server never started listening');
+  throw new Error(`server never accepted a connection on ${boundPort}`);
 }

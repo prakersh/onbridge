@@ -230,6 +230,18 @@ async function main() {
         : bad('iframe element clickable', 'no click registered in the frame');
     }
 
+    // ── approval modes ───────────────────────────────────────────────
+    // The agent must never be able to widen its own permissions.
+    const modeTools = (await rpc('tools/list')).result.tools.map((t) => t.name);
+    modeTools.some((n) => /policy|approval_mode|permission/i.test(n))
+      ? bad('agent cannot change its own approval mode', `exposed: ${modeTools.filter(n => /policy|mode/i.test(n))}`)
+      : ok('agent cannot change its own approval mode (no such tool)');
+
+    const statusText = textOf(await call('bridge_status', {}));
+    /Approval mode: auto/.test(statusText)
+      ? ok('bridge_status reports the approval mode')
+      : bad('bridge_status reports mode', statusText.slice(0, 160));
+
     // ── approval gate: a destructive click must block ────────────────
     const dangerRef = /\[button:(\d+)\][^\n]*Place order/.exec(snapText)?.[1];
     if (!dangerRef) {
@@ -322,6 +334,49 @@ async function main() {
     img?.data?.length > 1000
       ? ok('screenshot returns image data', `${Math.round(img.data.length / 1024)}kb`)
       : bad('screenshot returns image data');
+
+    // ── bypass mode actually bypasses ───────────────────────────────
+    await send({ type: 'set_approval_mode', mode: 'yolo' });
+    const yoloStatus = textOf(await call('bridge_status', {}));
+    /Approval mode: yolo/.test(yoloStatus)
+      ? ok('bypass mode is reported to the agent')
+      : bad('bypass mode reported', yoloStatus.slice(0, 120));
+
+    const beforeYolo = (await page.evaluate(() => window.__log)).filter((e) => e.t === 'danger').length;
+    await call('click', { ref: Number(dangerRef) });
+    await page.waitForTimeout(500);
+    const afterYolo = (await page.evaluate(() => window.__log)).filter((e) => e.t === 'danger').length;
+    afterYolo === beforeYolo + 1
+      ? ok('bypass mode runs a destructive action without prompting')
+      : bad('bypass mode skips prompting', `danger clicks ${beforeYolo} → ${afterYolo}`);
+
+    // Even in bypass, an explicit domain block must still hold.
+    await send({ type: 'set_policy', policy: { denylist: ['127.0.0.1'] } });
+    const blocked = await call('click', { ref: Number(dangerRef) });
+    /Blocked by user policy/.test(textOf(blocked))
+      ? ok('bypass mode still honours the domain denylist')
+      : bad('bypass honours denylist', textOf(blocked).slice(0, 140));
+
+    await send({ type: 'set_policy', policy: { denylist: [] } });
+    await send({ type: 'set_approval_mode', mode: 'strict' });
+
+    // ── strict mode gates an ordinary write ─────────────────────────
+    const strictClick = call('click', { ref: Number(btnRef) });
+    await page.waitForTimeout(700);
+    const strictGate = await send({ type: 'get_status' });
+    strictGate?.approvalRequest?.risk === 'write'
+      ? ok('strict mode gates an ordinary click')
+      : bad('strict mode gates writes', JSON.stringify(strictGate?.approvalRequest));
+    await send({ type: 'resolve_approval', allow: true });
+    await strictClick;
+
+    // Reads must stay ungated even in strict, or the mode is unusable.
+    const strictRead = await call('get_url', {});
+    !/declined|Blocked/.test(textOf(strictRead))
+      ? ok('strict mode still lets reads through')
+      : bad('strict mode allows reads', textOf(strictRead).slice(0, 120));
+
+    await send({ type: 'set_approval_mode', mode: 'auto' });
 
     // ── ask_user round trip through the real panel ──────────────────
     const askPromise = call('ask_user', { question: 'Proceed?', options: ['yes', 'no'] });
