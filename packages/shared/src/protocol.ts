@@ -1,3 +1,5 @@
+import type { AgentIdentity } from './handshake.js';
+
 export type CommandAction =
   | 'navigate'
   | 'back'
@@ -42,6 +44,14 @@ export type CommandAction =
 // MCP Server → Extension
 export type ServerMessage =
   | { type: 'command'; id: string; action: CommandAction; params: Record<string, unknown>; tabId?: number }
+  /**
+   * A late identity refinement. The bridge starts listening before the agent
+   * client sends MCP `initialize`, so the extension can already be connected by
+   * the time we learn the real client name. Rather than delay the handshake on
+   * something that may never arrive, we hand over our best guess up front and
+   * correct it here.
+   */
+  | { type: 'agent_identity'; agent: AgentIdentity }
   | { type: 'ping' };
 
 // Extension → MCP Server

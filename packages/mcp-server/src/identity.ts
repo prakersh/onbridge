@@ -16,6 +16,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import type { AgentIdentity } from '@onbridge/shared';
 
 /** ONBRIDGE_HOME lets tests point at a scratch dir instead of the real one. */
 const DIR = process.env.ONBRIDGE_HOME || join(homedir(), '.onbridge');
@@ -81,9 +82,83 @@ export function forgetPeer(extId: string): void {
   writeJsonPrivate(PEERS_FILE, peers);
 }
 
-/** Shown in the extension's pairing prompt so the user knows who is asking. */
-export function getAgentName(): string {
-  return process.env.ONBRIDGE_AGENT_NAME?.trim() || 'An AI agent';
+/**
+ * Best-effort guess at which agent is running us, from the environment alone.
+ *
+ * Only used until MCP `initialize` arrives with the client's own `clientInfo`,
+ * which is authoritative and usually lands within a second of startup. The guess
+ * matters because the extension can finish its handshake first, and "An AI agent
+ * wants to control your browser" is not a prompt anyone can make a decision
+ * about.
+ *
+ * Order matters: the explicit override wins, then agent-specific markers, then
+ * the terminal. None of this is a security boundary — a local process can set
+ * any of these. It is a label for the human.
+ */
+function detectAgentFromEnv(): { name: string; source: 'env' | 'unknown' } {
+  const env = process.env;
+  if (env.CLAUDECODE || env.CLAUDE_CODE_ENTRYPOINT) return { name: 'Claude Code', source: 'env' };
+  if (env.CURSOR_TRACE_ID || env.CURSOR_SESSION_ID) return { name: 'Cursor', source: 'env' };
+  if (env.WINDSURF_SESSION_ID) return { name: 'Windsurf', source: 'env' };
+  if (env.TERM_PROGRAM === 'vscode' && env.VSCODE_GIT_ASKPASS_MAIN) {
+    return { name: 'VS Code', source: 'env' };
+  }
+  if (env.ZED_TERM) return { name: 'Zed', source: 'env' };
+
+  return { name: 'Unidentified agent', source: 'unknown' };
+}
+
+/**
+ * Identity of the agent driving this server, shown in the extension.
+ *
+ * `clientInfo` is filled in from MCP `initialize` once the agent client
+ * introduces itself; until then we fall back to the environment sniff.
+ */
+export function buildAgentIdentity(opts: {
+  port: number;
+  serverVersion: string;
+  startedAt: number;
+  clientInfo?: { name?: string; version?: string; title?: string };
+}): AgentIdentity {
+  // An explicit override outranks everything, including what the client says
+  // about itself: someone who set it has a reason, and silently ignoring it
+  // would make the label untrustworthy in exactly the setups that use it.
+  const override = process.env.ONBRIDGE_AGENT_NAME?.trim();
+  const reported = opts.clientInfo?.title?.trim() || opts.clientInfo?.name?.trim();
+  const guessed = detectAgentFromEnv();
+
+  const name = override ?? (reported ? prettifyClientName(reported) : guessed.name);
+  const source: AgentIdentity['source'] = override ? 'env' : reported ? 'mcp' : guessed.source;
+
+  return {
+    name,
+    version: opts.clientInfo?.version,
+    source,
+    pid: process.pid,
+    cwd: safeCwd(),
+    port: opts.port,
+    serverVersion: opts.serverVersion,
+    startedAt: opts.startedAt,
+  };
+}
+
+/** MCP clients report slugs like `claude-code`; the panel shows this to a human. */
+function prettifyClientName(raw: string): string {
+  if (/[A-Z ]/.test(raw)) return raw; // already human-formatted
+  return raw
+    .split(/[-_.]/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+function safeCwd(): string | undefined {
+  try {
+    return process.cwd();
+  } catch {
+    // cwd can be gone if the directory was deleted out from under us.
+    return undefined;
+  }
 }
 
 /**

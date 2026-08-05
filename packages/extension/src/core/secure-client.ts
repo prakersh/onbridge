@@ -1,8 +1,13 @@
 /**
- * Extension side of the onbridge secure channel.
+ * Extension side of the onbridge secure channel — one socket to one agent.
  *
  * Wraps a WebSocket with the ECDH handshake, pairing, and AES-GCM framing so the
  * background script only ever sees plaintext messages.
+ *
+ * This class owns exactly one port. Discovering which ports have agents on them,
+ * and deciding which of several agents is in control, belongs to
+ * `ConnectionManager` — keeping that out of here is what makes several
+ * simultaneous agents possible.
  *
  * The pairing secret lives in `chrome.storage.local`, which is extension-private
  * — no web page can reach it. It is never sent anywhere.
@@ -13,7 +18,6 @@ import {
   PROOF_PAIR,
   PROOF_AUTH_EXT,
   PROOF_AUTH_SRV,
-  WS_PORT_RANGE,
   computeSessionId,
   deriveHandshakeKeys,
   deriveSessionKey,
@@ -28,17 +32,47 @@ import {
   verifyProof,
   ReplayGuard,
 } from '@onbridge/shared';
-import type { ExtensionMessage, HandshakeFrame, ServerMessage } from '@onbridge/shared';
+import type {
+  AgentIdentity,
+  ExtensionMessage,
+  HandshakeFrame,
+  ServerMessage,
+} from '@onbridge/shared';
 
 const PAIRINGS_KEY = 'onbridge_pairings';
 
-export type ClientState = 'idle' | 'connecting' | 'pairing' | 'authenticating' | 'ready' | 'failed';
+/**
+ * How long we wait for a port to prove it is an onbridge server, i.e. to answer
+ * `hello` with `hello_ack`. Short, because we probe ten ports and most are dead.
+ */
+const PROBE_TIMEOUT_MS = 3_000;
+
+/**
+ * How long the rest of the handshake may take once a server has answered.
+ *
+ * This has to outlast a human reading the pairing prompt and clicking Allow.
+ * It previously shared the probe's 3-5s budget, which meant the client hung up
+ * on the server *while the prompt was still on screen*, retried, and re-prompted
+ * — the connect/disconnect storm that made first-time pairing feel broken. The
+ * server allows 90s for the same reason; these two numbers must stay in step.
+ */
+const HANDSHAKE_TIMEOUT_MS = 90_000;
+
+export type ClientState =
+  | 'idle'
+  | 'connecting'
+  | 'pairing'
+  | 'authenticating'
+  | 'ready'
+  | 'failed';
 
 export interface SecureClientHooks {
   /** Resolve true to pair. The user must actively choose — never auto-resolve. */
-  onPairRequest: (agentName: string) => Promise<boolean>;
+  onPairRequest: (agent: AgentIdentity) => Promise<boolean>;
   onMessage: (msg: ServerMessage) => void;
   onState: (state: ClientState, detail?: string) => void;
+  /** Fired when the agent's identity first arrives, and again if it is refined. */
+  onIdentity?: (agent: AgentIdentity) => void;
 }
 
 async function loadPairing(serverId: string): Promise<Uint8Array | undefined> {
@@ -65,6 +99,12 @@ export class SecureClient {
   private state: ClientState = 'idle';
   private txCounter = 0;
   private replay = new ReplayGuard();
+  /**
+   * Set once this client is retired. Every callback checks it, so a client the
+   * manager has moved on from can never resurrect itself — abandoned clients
+   * firing `onState` late is what used to multiply reconnect attempts.
+   */
+  private disposed = false;
 
   private priv?: CryptoKey;
   private ePub = '';
@@ -76,8 +116,13 @@ export class SecureClient {
   private sNonce?: Uint8Array;
   private sessionId = '';
   private serverId = '';
+  private identity?: AgentIdentity;
+  private pendingChallenge?: string;
 
-  constructor(private hooks: SecureClientHooks) {}
+  constructor(
+    readonly port: number,
+    private hooks: SecureClientHooks,
+  ) {}
 
   isReady(): boolean {
     return this.state === 'ready' && this.ws?.readyState === WebSocket.OPEN;
@@ -87,34 +132,41 @@ export class SecureClient {
     return this.state;
   }
 
+  getServerId(): string {
+    return this.serverId;
+  }
+
+  getIdentity(): AgentIdentity | undefined {
+    return this.identity;
+  }
+
   private setState(s: ClientState, detail?: string): void {
+    if (this.disposed) return;
     this.state = s;
     this.hooks.onState(s, detail);
   }
 
-  /** Probes the port range; the server binds the first free one. */
-  async connect(portHint?: number): Promise<void> {
-    const ports = portHint ? [portHint, ...WS_PORT_RANGE.filter((p) => p !== portHint)] : WS_PORT_RANGE;
+  /**
+   * Runs the whole handshake against this client's port. Rejects if the port is
+   * not serving onbridge, if the user denies pairing, or if authentication
+   * fails — the manager treats those differently.
+   */
+  connect(): Promise<void> {
     this.setState('connecting');
 
-    for (const port of ports) {
-      try {
-        await this.tryPort(port);
-        return;
-      } catch {
-        // Port not serving onbridge, or handshake refused. Try the next.
-      }
-    }
-    this.setState('failed', 'No onbridge MCP server found on ports 9876-9885.');
-  }
-
-  private tryPort(port: number): Promise<void> {
     return new Promise((resolve, reject) => {
       let settled = false;
-      const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(`ws://127.0.0.1:${this.port}`);
+      } catch (err) {
+        return reject(err as Error);
+      }
+
       const giveUp = (why: string) => {
         if (settled) return;
         settled = true;
+        clearTimeout(timer);
         try {
           ws.close();
         } catch {
@@ -123,7 +175,13 @@ export class SecureClient {
         reject(new Error(why));
       };
 
-      const timer = setTimeout(() => giveUp('timeout'), 5000);
+      // Starts as a probe budget and is extended once the server proves it
+      // speaks onbridge. See PROBE_TIMEOUT_MS / HANDSHAKE_TIMEOUT_MS.
+      let timer = setTimeout(() => giveUp('no onbridge server on this port'), PROBE_TIMEOUT_MS);
+      const extendDeadline = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => giveUp('handshake timed out'), HANDSHAKE_TIMEOUT_MS);
+      };
 
       ws.onopen = () => void this.sendHello(ws);
 
@@ -134,8 +192,15 @@ export class SecureClient {
       let queue: Promise<void> = Promise.resolve();
       ws.onmessage = (ev) => {
         queue = queue.then(async () => {
+          if (this.disposed) return;
           try {
-            await this.handleFrame(ws, JSON.parse(ev.data as string) as HandshakeFrame);
+            const frame = JSON.parse(ev.data as string) as HandshakeFrame;
+            // The first sign of life from a real server. Everything after this
+            // may legitimately wait on a human.
+            if (frame.t === 'hello_ack') extendDeadline();
+
+            await this.handleFrame(ws, frame);
+
             if (this.state === 'ready' && !settled) {
               settled = true;
               clearTimeout(timer);
@@ -143,16 +208,12 @@ export class SecureClient {
               resolve();
             }
           } catch (err) {
-            clearTimeout(timer);
             giveUp((err as Error).message);
           }
         });
       };
 
-      ws.onerror = () => {
-        clearTimeout(timer);
-        giveUp('socket error');
-      };
+      ws.onerror = () => giveUp('socket error');
 
       ws.onclose = (ev) => {
         clearTimeout(timer);
@@ -181,6 +242,11 @@ export class SecureClient {
       eNonce: this.eNonce,
     };
     ws.send(JSON.stringify(hello));
+  }
+
+  private noteIdentity(agent: AgentIdentity): void {
+    this.identity = agent;
+    this.hooks.onIdentity?.(agent);
   }
 
   private async handleFrame(ws: WebSocket, frame: HandshakeFrame): Promise<void> {
@@ -220,14 +286,23 @@ export class SecureClient {
     const inner = JSON.parse(await openFrame(key, frame)) as HandshakeFrame | ServerMessage;
 
     if (this.state === 'ready') {
-      this.hooks.onMessage(inner as ServerMessage);
+      const msg = inner as ServerMessage;
+      // Identity is refined once the agent client sends MCP `initialize`, which
+      // often lands after we are already connected.
+      if (msg.type === 'agent_identity') {
+        this.noteIdentity(msg.agent);
+        return;
+      }
+      this.hooks.onMessage(msg);
       return;
     }
 
     const hs = inner as HandshakeFrame;
 
     if (hs.t === 'pair_required') {
-      const allowed = await this.hooks.onPairRequest(hs.agentName);
+      this.noteIdentity(hs.agent);
+      const allowed = await this.hooks.onPairRequest(hs.agent);
+      if (this.disposed) return;
       if (!allowed) {
         await this.sendSealed(ws, this.handshakeKey!, { t: 'pair_denied' });
         throw new Error('pairing denied');
@@ -242,6 +317,7 @@ export class SecureClient {
     }
 
     if (hs.t === 'challenge') {
+      this.noteIdentity(hs.agent);
       await this.sendSealed(ws, this.handshakeKey!, {
         t: 'auth',
         proof: await makeProof(this.pairingSecret!, PROOF_AUTH_EXT, this.sessionId, hs.nonce),
@@ -269,8 +345,6 @@ export class SecureClient {
     if (hs.t === 'auth_fail') throw new Error(hs.reason);
   }
 
-  private pendingChallenge?: string;
-
   private async promote(): Promise<void> {
     this.sessionKey = await deriveSessionKey(
       this.shared!,
@@ -297,13 +371,22 @@ export class SecureClient {
     await this.sendSealed(this.ws!, this.sessionKey!, msg);
   }
 
+  /**
+   * Closes the socket and permanently retires this client. `disposed` is what
+   * stops a late callback from a client the manager already replaced.
+   */
   disconnect(): void {
+    this.disposed = true;
     const ws = this.ws;
     this.ws = null;
     this.sessionKey = undefined;
     this.pairingSecret = undefined;
     this.shared = undefined;
-    ws?.close();
-    this.setState('idle');
+    this.state = 'idle';
+    try {
+      ws?.close();
+    } catch {
+      /* already closed */
+    }
   }
 }

@@ -33,6 +33,7 @@ import {
   toB64,
   verifyProof,
 } from '@onbridge/shared';
+import type { AgentIdentity } from '@onbridge/shared';
 
 const EXT_ORIGIN = 'chrome-extension://testextensionid';
 const SERVER = fileURLToPath(new URL('../dist/index.js', import.meta.url));
@@ -129,6 +130,8 @@ interface HsResult {
   pairingSecret: Uint8Array;
   serverProofValid?: boolean;
   denied?: boolean;
+  /** Who the server says is driving it. Shown to the user before they approve. */
+  agent?: AgentIdentity;
 }
 
 /** Runs the extension half of the handshake. */
@@ -179,6 +182,7 @@ function handshake(
             const inner = JSON.parse(await openFrame(st.ready ? st.sessionKey : st.hsKey, frame));
 
             if (inner.t === 'pair_required') {
+              st.agent = inner.agent;
               if (!opts.allow) {
                 await sendSealed(st.hsKey, { t: 'pair_denied' });
                 clearTimeout(timer);
@@ -195,11 +199,13 @@ function handshake(
                 paired: st.paired,
                 serverId: st.serverId,
                 pairingSecret: st.pair,
+                agent: st.agent,
               });
             }
 
             if (inner.t === 'challenge') {
               st.challenge = inner.nonce;
+              st.agent = inner.agent;
               await sendSealed(st.hsKey, {
                 t: 'auth',
                 proof: await makeProof(st.pair, PROOF_AUTH_EXT, st.sessionId, inner.nonce),
@@ -223,6 +229,7 @@ function handshake(
                 serverId: st.serverId,
                 pairingSecret: st.pair,
                 serverProofValid: valid,
+                agent: st.agent,
               });
             }
           } catch (e) {
@@ -287,6 +294,22 @@ describe('pairing lifecycle', () => {
     const ws = await connect(EXT_ORIGIN);
     const r = await handshake(ws, { pairingSecret: secret, allow: false });
     expect(r.serverProofValid).toBe(true);
+    await closeAndSettle(ws);
+  });
+
+  it('names the agent in the pairing prompt', async () => {
+    // "An AI agent wants to control your browser" is not a prompt anyone can
+    // make a decision about, and it is the only thing standing between a user
+    // and handing over their logged-in browser.
+    const ws = await connect(EXT_ORIGIN);
+    const r = await handshake(ws, { pairingSecret: secret, allow: false });
+    expect(r.agent).toBeDefined();
+    // The test harness introduces itself as "vitest" over MCP `initialize`.
+    expect(r.agent!.name).toBe('Vitest');
+    expect(r.agent!.source).toBe('mcp');
+    expect(r.agent!.pid).toBeGreaterThan(0);
+    expect(r.agent!.cwd).toBeTruthy();
+    expect(r.agent!.port).toBe(port);
     await closeAndSettle(ws);
   });
 

@@ -139,26 +139,67 @@ async function main() {
   await panel.goto(`chrome-extension://${extId}/sidepanel.html`);
   const send = (msg) => panel.evaluate((m) => new Promise((r) => chrome.runtime.sendMessage(m, r)), msg);
 
-  await send({ type: 'set_scope', scope: 'all_tabs' });
+  await send({ type: 'set_scope', scope: 'all' });
   await send({ type: 'set_control_mode', enabled: true });
 
   // ── pairing ─────────────────────────────────────────────────────────
   let paired = false;
   let promptSeen = false;
-  for (let i = 0; i < 40; i++) {
+  let sessionId = null;
+  // Dial count for the port that actually paired. The pairing prompt used to
+  // share the 3-5s port-probe budget, so the client hung up while the prompt was
+  // still on screen, retried, and re-prompted — a connect/disconnect storm. A
+  // clean first pairing is exactly one dial, however long the human takes.
+  let pairedAttempts = 0;
+  for (let i = 0; i < 60; i++) {
     const st = await send({ type: 'get_status' });
     if (st?.pairRequest && !promptSeen) {
       promptSeen = true;
-      st.pairRequest.agentName === 'Verify Bot'
+      const agent = st.pairRequest.agent;
+      agent?.name === 'Verify Bot'
         ? ok('pairing prompt names the requesting agent')
-        : bad('pairing prompt names the agent', st.pairRequest.agentName);
+        : bad('pairing prompt names the agent', JSON.stringify(agent));
+      agent?.pid > 0 && agent?.cwd
+        ? ok('pairing prompt identifies the agent process and project')
+        : bad('pairing prompt shows pid and cwd', JSON.stringify(agent));
+
+      // Deliberately slow. A human reading the prompt takes seconds, and the
+      // client must not give up while they do.
+      await new Promise((r) => setTimeout(r, 6000));
       await send({ type: 'resolve_pairing', allow: true });
     }
-    if (st?.connected) { paired = true; break; }
+    const onHold = (st?.sessions ?? []).find((s) => s.status === 'on_hold' || s.status === 'active');
+    if (onHold) {
+      paired = true;
+      sessionId = onHold.id;
+      pairedAttempts = onHold.attempts;
+      break;
+    }
     await new Promise((r) => setTimeout(r, 250));
   }
   if (!promptSeen) bad('pairing was requested', 'connected without ever prompting');
-  paired ? ok('extension paired and connected over encrypted channel') : bad('extension paired', 'never connected');
+  paired
+    ? ok('extension paired over encrypted channel after a slow human approval')
+    : bad('extension paired', 'never connected');
+
+  pairedAttempts === 1
+    ? ok('a slow human approval takes exactly one connection attempt')
+    : bad('pairing is a single clean connect', `${pairedAttempts} dials to the paired port`);
+
+  // ── an authenticated agent controls nothing until granted ───────────
+  if (paired) {
+    const held = await call('get_url', {});
+    /has not been given control|not been given/i.test(textOf(held))
+      ? ok('a connected agent with no grant is refused, with an actionable reason')
+      : bad('agent on hold is refused', textOf(held).slice(0, 200));
+
+    const granted = await send({
+      type: 'activate_session',
+      id: sessionId,
+      scope: 'all',
+    });
+    granted?.ok ? ok('user can hand a held agent control') : bad('activate session', granted?.reason);
+  }
 
   if (paired) {
     await page.bringToFront();
@@ -395,8 +436,144 @@ async function main() {
     }
   }
 
+  // ── two agents, two windows ─────────────────────────────────────────
+  // The isolation claim: separate agent sessions can drive separate windows
+  // without reaching into each other's. This is the scenario that motivated the
+  // whole multi-session design, so it gets tested against real windows.
+  let srv2;
+  const home2 = mkdtempSync(join(tmpdir(), 'onbridge-browser2-'));
+  if (paired) {
+    srv2 = spawn('node', [join(ROOT, 'packages/mcp-server/dist/index.js')], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ONBRIDGE_HOME: home2, ONBRIDGE_AGENT_NAME: 'Second Agent' },
+    });
+    srv2.stderr.on('data', (d) => process.env.V && process.stderr.write(`[srv2] ${d}`));
+    let buf2 = '';
+    const waiters2 = new Map();
+    srv2.stdout.on('data', (d) => {
+      buf2 += d;
+      const lines = buf2.split('\n');
+      buf2 = lines.pop() ?? '';
+      for (const l of lines) {
+        if (!l.trim()) continue;
+        try { const m = JSON.parse(l); waiters2.get(m.id)?.(m); waiters2.delete(m.id); } catch {}
+      }
+    });
+    let id2 = 1;
+    const rpc2 = (method, params = {}) => new Promise((res, rej) => {
+      const i = id2++;
+      waiters2.set(i, res);
+      srv2.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: i, method, params }) + '\n');
+      setTimeout(() => waiters2.delete(i) && rej(new Error(`${method} timeout`)), 30000);
+    });
+    const call2 = (name, args = {}) => rpc2('tools/call', { name, arguments: args });
+    await rpc2('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'verify2', version: '1' },
+    });
+
+    // A genuinely separate browser window. ctx.newPage() would only add a tab to
+    // the existing one, which would not exercise window isolation at all.
+    const win1Id = await panel.evaluate(() => chrome.windows.getCurrent().then((w) => w.id));
+    const win2Id = await panel.evaluate(
+      (url) => chrome.windows.create({ url }).then((w) => w.id),
+      PAGE_URL,
+    );
+    const winIds = [win1Id, win2Id];
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Pair and grant the second agent. It must appear as a distinct session.
+    let sess2 = null;
+    for (let i = 0; i < 60; i++) {
+      const st = await send({ type: 'get_status' });
+      if (st?.pairRequest) await send({ type: 'resolve_pairing', allow: true });
+      const found = (st?.sessions ?? []).find(
+        (s) => s.agent?.name === 'Second Agent' && (s.status === 'on_hold' || s.status === 'active'),
+      );
+      if (found) { sess2 = found; break; }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+
+    sess2
+      ? ok('a second agent is discovered as its own session')
+      : bad('second agent discovered', 'never appeared');
+
+    if (sess2) {
+      const both = await send({ type: 'get_status' });
+      const names = (both.sessions ?? []).map((s) => s.agent?.name).filter(Boolean);
+      names.includes('Verify Bot') && names.includes('Second Agent')
+        ? ok('both agents are listed with distinct identities')
+        : bad('two distinct agents listed', names.join(', '));
+
+      // The first agent already holds 'all'. A second browser-wide grant must be
+      // refused rather than silently letting two agents fight over one browser.
+      const clash = await send({ type: 'activate_session', id: sess2.id, scope: 'all' });
+      !clash?.ok && /already controls/i.test(clash?.reason ?? '')
+        ? ok('an overlapping grant is refused with a reason')
+        : bad('overlapping grant refused', JSON.stringify(clash));
+
+      // Narrow the first agent to one window so the second can hold the other.
+      await send({ type: 'hold_session', id: sessionId });
+      const w1 = await send({ type: 'activate_session', id: sessionId, windowId: winIds[0], scope: 'window' });
+      const w2 = await send({ type: 'activate_session', id: sess2.id, windowId: winIds[1], scope: 'window' });
+      w1?.ok && w2?.ok
+        ? ok('two agents can hold two different windows at once')
+        : bad('two agents hold two windows', JSON.stringify({ w1, w2 }));
+
+      if (w1?.ok && w2?.ok) {
+        // The isolation boundary itself: agent 1 naming a tab in agent 2's
+        // window must be refused, not silently served.
+        const tabsIn2 = await panel.evaluate(
+          (wid) => chrome.tabs.query({ windowId: wid }).then((t) => t.map((x) => x.id)),
+          winIds[1],
+        );
+        // `switch_tab` takes a tab id straight from the agent, so it is the
+        // actual escape route — unlike `get_url`, which takes no target and
+        // would silently answer about the agent's own window either way.
+        const cross = await call('switch_tab', { tabId: tabsIn2[0] });
+        /Access denied/i.test(textOf(cross))
+          ? ok('an agent cannot reach into the other agent window')
+          : bad('cross-window access denied', textOf(cross).slice(0, 160));
+
+        // And the same call inside its own window must still work, so the check
+        // above is proving isolation rather than a broken switch_tab.
+        const tabsIn1 = await panel.evaluate(
+          (wid) => chrome.tabs.query({ windowId: wid }).then((t) => t.map((x) => x.id)),
+          winIds[0],
+        );
+        const sameWindow = await call('switch_tab', { tabId: tabsIn1[0] });
+        !/Access denied/i.test(textOf(sameWindow))
+          ? ok('switch_tab still works within the granted window')
+          : bad('switch_tab works in own window', textOf(sameWindow).slice(0, 160));
+
+        // And each agent still works inside its own window.
+        const own = await call2('get_url', {});
+        !/Access denied|not been given/i.test(textOf(own))
+          ? ok('each agent still works inside its own window')
+          : bad('agent works in its own window', textOf(own).slice(0, 160));
+
+        // A panel opened in window 2 must report window 2's agent, not window 1's.
+        const panel2 = await ctx.newPage();
+        await panel2.goto(`chrome-extension://${extId}/sidepanel.html`);
+        const st2 = await panel2.evaluate(
+          (wid) => new Promise((r) => chrome.runtime.sendMessage({ type: 'get_status', windowId: wid }, r)),
+          winIds[1],
+        );
+        st2?.sessions?.find((s) => s.ownsThisWindow)?.agent?.name === 'Second Agent'
+          ? ok('the panel reports the agent controlling its own window')
+          : bad(
+              'panel is window-aware',
+              st2?.sessions?.find((s) => s.ownsThisWindow)?.agent?.name ?? 'none',
+            );
+      }
+    }
+  }
+
   await ctx.close();
   srv.kill();
+  srv2?.kill();
+  rmSync(home2, { recursive: true, force: true });
   http.close();
   rmSync(home, { recursive: true, force: true });
   rmSync(profile, { recursive: true, force: true });

@@ -21,7 +21,16 @@ export function createServer(): McpServer {
     version: VERSION,
   });
 
-  const bridge = new Bridge();
+  const bridge = new Bridge(VERSION);
+
+  // The agent client introduces itself in `initialize`. This is the only
+  // authoritative answer to "which agent is this", and the extension shows it in
+  // the pairing prompt — so a user approving access knows what they are
+  // approving instead of being asked about "an AI agent".
+  bridge.setClientInfoSource(() => server.server.getClientVersion());
+  // Only a nudge to redraw an already-connected panel. Identity itself does not
+  // depend on this firing, because some clients never send the notification.
+  server.server.oninitialized = () => bridge.refreshIdentity();
 
   registerNavigationTools(server, bridge);
   registerObservationTools(server, bridge);

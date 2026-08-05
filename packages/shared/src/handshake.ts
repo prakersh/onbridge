@@ -16,14 +16,14 @@
  *    │  ── frames below are sealed under handshakeKey ──     │
  *    │                                                       │
  *   first run:                                               │
- *    │  pair_required {agentName}                            │
+ *    │  pair_required {agent}                                │
  *    │ <─────────────────────────────────────────────────────│
  *    │  (side panel: Allow / Deny)                           │
  *    │  pair_confirm {proof}          or  pair_denied        │
  *    │ ─────────────────────────────────────────────────────>│
  *    │                                                       │
  *   thereafter:                                              │
- *    │  challenge    {nonce}                                 │
+ *    │  challenge    {nonce, agent}                          │
  *    │ <─────────────────────────────────────────────────────│
  *    │  auth         {proof, nonce}                          │
  *    │ ─────────────────────────────────────────────────────>│
@@ -45,17 +45,51 @@ import {
   type SealedFrame,
 } from './crypto.js';
 
-export const HANDSHAKE_VERSION = 1;
+/**
+ * Bumped to 2 for the agent-identity fields. A mismatched peer is rejected with
+ * a message telling the user to update, which is far better than the silent
+ * misbehaviour you get from changing frame shapes in place.
+ */
+export const HANDSHAKE_VERSION = 2;
 
 /** Domain-separation labels. Distinct per direction to prevent proof reflection. */
 export const PROOF_PAIR = 'onbridge/pair/ext';
 export const PROOF_AUTH_EXT = 'onbridge/auth/ext';
 export const PROOF_AUTH_SRV = 'onbridge/auth/srv';
 
+/**
+ * Who is on the other end of the bridge.
+ *
+ * This exists so the user is never approving "An AI agent" in the abstract. With
+ * several agents able to connect at once, "which one is this?" stops being a
+ * nicety and becomes the difference between approving the session you just
+ * started and approving one you forgot was running.
+ *
+ * None of it is a security claim — a hostile local process can put anything it
+ * likes here. Authentication is the pairing secret; this is for the human.
+ */
+export interface AgentIdentity {
+  /** e.g. "Claude Code". From MCP clientInfo when available. */
+  name: string;
+  version?: string;
+  /**
+   * How `name` was established, so the panel can distinguish a name the client
+   * reported from one we inferred from the environment.
+   */
+  source: 'mcp' | 'env' | 'unknown';
+  /** Process id and working directory — usually the project being worked on. */
+  pid: number;
+  cwd?: string;
+  /** Which loopback port this agent's bridge bound. Disambiguates same-name agents. */
+  port: number;
+  serverVersion: string;
+  startedAt: number;
+}
+
 export type HandshakeFrame =
   | { t: 'hello'; v: number; extId: string; ePub: string; eNonce: string }
   | { t: 'hello_ack'; sPub: string; sNonce: string; serverId: string; paired: boolean }
-  | { t: 'pair_required'; agentName: string }
+  | { t: 'pair_required'; agent: AgentIdentity }
   | { t: 'pair_confirm'; proof: string }
   | { t: 'pair_denied' }
   /**
@@ -65,7 +99,7 @@ export type HandshakeFrame =
    * requires the user to click Allow, so the worst case is a nuisance prompt.
    */
   | { t: 'pair_reset' }
-  | { t: 'challenge'; nonce: string }
+  | { t: 'challenge'; nonce: string; agent: AgentIdentity }
   | { t: 'auth'; proof: string }
   | { t: 'auth_ok'; proof: string }
   | { t: 'auth_fail'; reason: string }

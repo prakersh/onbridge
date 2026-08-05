@@ -1,4 +1,20 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  AgentIcon,
+  AlertIcon,
+  BridgeIcon,
+  CheckIcon,
+  ClockIcon,
+  CrossIcon,
+  HoldIcon,
+  LockIcon,
+  PauseIcon,
+  PlayIcon,
+  PowerIcon,
+  ScopeIcon,
+  SendIcon,
+  TrashIcon,
+} from './icons.js';
 
 interface ActivityEntry {
   action: string;
@@ -9,8 +25,32 @@ interface ActivityEntry {
   timestamp: number;
 }
 
-type AccessScope = 'current_tab' | 'current_window' | 'all_tabs';
+type ScopeKind = 'tab' | 'window' | 'all';
 type ApprovalMode = 'yolo' | 'auto' | 'strict';
+type SessionStatus = 'connecting' | 'pending_approval' | 'on_hold' | 'active' | 'failed';
+
+interface AgentInfo {
+  name: string;
+  version?: string;
+  source: 'mcp' | 'env' | 'unknown';
+  pid: number;
+  cwd?: string;
+  serverVersion: string;
+}
+
+interface SessionView {
+  id: string;
+  port: number;
+  status: SessionStatus;
+  detail: string;
+  scope: { kind: ScopeKind; tabId?: number; windowId?: number } | null;
+  scopeLabel: string | null;
+  commandCount: number;
+  lastAction: string;
+  connectedAt: number;
+  ownsThisWindow: boolean;
+  agent: AgentInfo | null;
+}
 
 const MODES: { value: ApprovalMode; label: string; blurb: string }[] = [
   { value: 'strict', label: 'Ask every step', blurb: 'Approve each navigation and change. Reads still pass.' },
@@ -18,11 +58,20 @@ const MODES: { value: ApprovalMode; label: string; blurb: string }[] = [
   { value: 'yolo', label: 'Bypass', blurb: 'Nothing is asked. Reverts on its own after 60 minutes.' },
 ];
 
+const SCOPE_OPTIONS: { value: ScopeKind; label: string; desc: string }[] = [
+  { value: 'tab', label: 'Tab', desc: 'Only the tab that is active in this window right now' },
+  { value: 'window', label: 'Window', desc: 'Every tab in this window' },
+  { value: 'all', label: 'All', desc: 'Every tab in every window' },
+];
+
 interface Status {
   controlMode: boolean;
+  windowId?: number;
+  sessions: SessionView[];
+  activeSessionId: string | null;
   connected: boolean;
-  connectionState: string;
-  stateDetail: string;
+  anyConnected: boolean;
+  preferredScope: ScopeKind;
   paused: boolean;
   degraded: string;
   policy: {
@@ -40,19 +89,20 @@ interface Status {
     url: string;
     askedAt: number;
   } | null;
-  pairRequest: { agentName: string } | null;
+  pairRequest: { port: number; agent: AgentInfo } | null;
   askRequest: { question: string; options?: string[]; askedAt: number } | null;
   lastAction: string;
   activityLog: ActivityEntry[];
   commandCount: number;
-  accessScope: AccessScope;
 }
 
 const EMPTY: Status = {
   controlMode: false,
+  sessions: [],
+  activeSessionId: null,
   connected: false,
-  connectionState: 'idle',
-  stateDetail: '',
+  anyConnected: false,
+  preferredScope: 'window',
   paused: false,
   degraded: '',
   policy: { mode: 'auto', allowlist: [], denylist: [], idleRevokeMinutes: 30 },
@@ -63,14 +113,7 @@ const EMPTY: Status = {
   lastAction: '',
   activityLog: [],
   commandCount: 0,
-  accessScope: 'current_tab',
 };
-
-const SCOPE_OPTIONS: { value: AccessScope; label: string; desc: string }[] = [
-  { value: 'current_tab', label: 'Tab', desc: 'Only the tab that was active when you enabled control' },
-  { value: 'current_window', label: 'Window', desc: 'Every tab in this window' },
-  { value: 'all_tabs', label: 'All', desc: 'Every tab in every window' },
-];
 
 const send = <T,>(msg: Record<string, unknown>): Promise<T> =>
   new Promise((resolve) => chrome.runtime.sendMessage(msg, resolve));
@@ -83,17 +126,39 @@ const safeHost = (url: string): string => {
   }
 };
 
+/** Long paths are unreadable in a 320px panel; the tail is the informative part. */
+const shortPath = (p?: string): string => {
+  if (!p) return '';
+  const parts = p.split('/').filter(Boolean);
+  return parts.length <= 2 ? p : `…/${parts.slice(-2).join('/')}`;
+};
+
 export default function App() {
   const [status, setStatus] = useState<Status>(EMPTY);
   const [draft, setDraft] = useState('');
   const [sendState, setSendState] = useState<'idle' | 'queued' | 'answered' | 'error'>('idle');
   const [expandedError, setExpandedError] = useState<number | null>(null);
+  const [notice, setNotice] = useState('');
+  const windowIdRef = useRef<number | undefined>(undefined);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  const refresh = useCallback(() => {
-    chrome.runtime.sendMessage({ type: 'get_status' }, (res: Status) => {
-      if (res) setStatus(res);
+  // Which window this panel belongs to. Everything about "who controls this" is
+  // answered relative to it — a panel in another window must show that window's
+  // agent, not whichever one happens to be busiest.
+  useEffect(() => {
+    chrome.windows.getCurrent().then((w) => {
+      windowIdRef.current = w.id;
+      refresh();
     });
+  }, []);
+
+  const refresh = useCallback(() => {
+    chrome.runtime.sendMessage(
+      { type: 'get_status', windowId: windowIdRef.current },
+      (res: Status) => {
+        if (res) setStatus(res);
+      },
+    );
   }, []);
 
   useEffect(() => {
@@ -106,6 +171,15 @@ export default function App() {
   useEffect(() => {
     if (status.askRequest) inputRef.current?.focus();
   }, [status.askRequest?.askedAt]);
+
+  const act = async (msg: Record<string, unknown>) => {
+    const res = await send<{ ok: boolean; reason?: string }>(msg);
+    if (res && !res.ok && res.reason) {
+      setNotice(res.reason);
+      setTimeout(() => setNotice(''), 6000);
+    }
+    refresh();
+  };
 
   const submit = async (textOverride?: string) => {
     const text = (textOverride ?? draft).trim();
@@ -121,13 +195,16 @@ export default function App() {
     refresh();
   };
 
-  const conn = status.connected
-    ? { color: 'bg-emerald-400', label: 'Connected', note: 'encrypted · paired' }
-    : status.connectionState === 'pairing'
-      ? { color: 'bg-amber-400', label: 'Waiting to pair', note: '' }
+  const owner = status.sessions.find((s) => s.ownsThisWindow);
+  const others = status.sessions.filter((s) => !s.ownsThisWindow && s.status !== 'failed');
+
+  const conn = owner
+    ? { color: 'bg-emerald-400', label: owner.agent?.name ?? 'Connected' }
+    : status.pairRequest
+      ? { color: 'bg-amber-400', label: 'Waiting to pair' }
       : status.controlMode
-        ? { color: 'bg-amber-400 animate-pulse', label: 'Connecting…', note: status.stateDetail }
-        : { color: 'bg-neutral-600', label: 'Off', note: '' };
+        ? { color: 'bg-amber-400 animate-pulse', label: 'Looking for agents…' }
+        : { color: 'bg-neutral-600', label: 'Off' };
 
   const fmt = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
   const ago = (ts: number) => {
@@ -142,40 +219,42 @@ export default function App() {
     <div className="flex h-screen flex-col bg-neutral-900 text-neutral-100 font-sans text-sm">
       {/* ── Header ── */}
       <div className="flex items-center gap-2 border-b border-neutral-800 px-4 py-3">
-        <svg viewBox="0 0 128 128" className="h-5 w-5">
-          <circle cx="64" cy="52" r="24" fill="none" stroke="#00d4aa" strokeWidth="8" />
-          <path d="M48 80 L64 96 L80 80" fill="none" stroke="#00d4aa" strokeWidth="8" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
+        <BridgeIcon className="h-5 w-5 text-emerald-400" />
         <span className="font-semibold">onbridge</span>
-        <div className="ml-auto flex items-center gap-1.5">
-          <span className={`h-2 w-2 rounded-full ${conn.color}`} />
-          <span className="text-xs text-neutral-400">{conn.label}</span>
+        <div className="ml-auto flex min-w-0 items-center gap-1.5">
+          <span className={`h-2 w-2 shrink-0 rounded-full ${conn.color}`} />
+          <span className="truncate text-xs text-neutral-400">{conn.label}</span>
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto">
+        {notice && (
+          <div className="mx-3 mt-3 flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-2.5 text-xs text-amber-200">
+            <AlertIcon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>{notice}</span>
+          </div>
+        )}
+
         {/* ── Pairing request ── */}
         {status.pairRequest && (
           <div className="m-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
-            <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-amber-300">
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-amber-300">
               Pairing request
             </div>
-            <p className="mb-3 text-neutral-200">
-              <span className="font-medium">{status.pairRequest.agentName}</span> wants to control
-              your browser.
-            </p>
-            <p className="mb-3 text-xs text-neutral-400">
-              You only need to approve this once. Afterwards this agent connects silently.
+            <AgentCard agent={status.pairRequest.agent} port={status.pairRequest.port} />
+            <p className="mb-3 mt-2 text-xs text-neutral-400">
+              Approve this once and it connects silently from then on. Check the project path
+              above matches the session you just started.
             </p>
             <div className="flex gap-2">
               <button
-                onClick={() => send({ type: 'resolve_pairing', allow: true }).then(refresh)}
+                onClick={() => act({ type: 'resolve_pairing', allow: true })}
                 className="flex-1 rounded-md bg-emerald-500 py-2 font-medium text-neutral-900 transition-colors hover:bg-emerald-400"
               >
                 Allow
               </button>
               <button
-                onClick={() => send({ type: 'resolve_pairing', allow: false }).then(refresh)}
+                onClick={() => act({ type: 'resolve_pairing', allow: false })}
                 className="flex-1 rounded-md border border-neutral-700 bg-neutral-800 py-2 transition-colors hover:bg-neutral-700"
               >
                 Deny
@@ -188,16 +267,13 @@ export default function App() {
         {status.approvalRequest && (
           <div className="m-3 rounded-lg border border-red-500/50 bg-red-500/10 p-3">
             <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-red-300">
-              <span className="animate-pulse">●</span> Approval needed
+              <AlertIcon className="h-3.5 w-3.5" /> Approval needed
             </div>
             <p className="mb-1 text-neutral-100">
               The agent wants to{' '}
               <span className="font-mono font-medium">{status.approvalRequest.action}</span>
               {status.approvalRequest.detail && (
-                <>
-                  {' '}
-                  <span className="text-neutral-300">{status.approvalRequest.detail}</span>
-                </>
+                <> <span className="text-neutral-300">{status.approvalRequest.detail}</span></>
               )}
             </p>
             {status.approvalRequest.url && (
@@ -208,13 +284,13 @@ export default function App() {
             <p className="mb-3 text-xs text-neutral-400">{status.approvalRequest.reason}.</p>
             <div className="flex gap-2">
               <button
-                onClick={() => send({ type: 'resolve_approval', allow: true }).then(refresh)}
+                onClick={() => act({ type: 'resolve_approval', allow: true })}
                 className="flex-1 rounded-md bg-red-500 py-2 font-medium text-white transition-colors hover:bg-red-400"
               >
                 Allow once
               </button>
               <button
-                onClick={() => send({ type: 'resolve_approval', allow: false }).then(refresh)}
+                onClick={() => act({ type: 'resolve_approval', allow: false })}
                 className="flex-1 rounded-md border border-neutral-700 bg-neutral-800 py-2 transition-colors hover:bg-neutral-700"
               >
                 Deny
@@ -230,7 +306,7 @@ export default function App() {
         {status.askRequest && (
           <div className="m-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
             <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-amber-300">
-              <span className="animate-pulse">●</span> Agent is waiting for you
+              <ClockIcon className="h-3.5 w-3.5" /> Agent is waiting for you
             </div>
             <p className="mb-3 whitespace-pre-wrap text-neutral-100">{status.askRequest.question}</p>
             {status.askRequest.options && status.askRequest.options.length > 0 && (
@@ -253,8 +329,8 @@ export default function App() {
         {/* ── Degraded input warning ── */}
         {status.degraded && status.connected && (
           <div className="mx-3 mt-3 rounded-lg border border-orange-500/40 bg-orange-500/10 p-3">
-            <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-orange-300">
-              Reduced fidelity
+            <div className="mb-1 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-orange-300">
+              <AlertIcon className="h-3.5 w-3.5" /> Reduced fidelity
             </div>
             <p className="text-xs text-neutral-300">
               onbridge could not attach its debugger, so clicks and typing are being simulated
@@ -267,8 +343,8 @@ export default function App() {
           </div>
         )}
 
-        {/* ── Controls ── */}
         <div className="space-y-3 p-3">
+          {/* ── Control mode ── */}
           <button
             onClick={() =>
               send({ type: 'set_control_mode', enabled: !status.controlMode }).then(() =>
@@ -278,10 +354,15 @@ export default function App() {
             className={`flex w-full items-center justify-between rounded-lg border p-3 transition-colors ${
               status.controlMode
                 ? 'border-emerald-500/40 bg-emerald-500/15'
-                : 'border-neutral-700 bg-neutral-800 hover:bg-neutral-750'
+                : 'border-neutral-700 bg-neutral-800 hover:bg-neutral-700'
             }`}
           >
-            <span className="font-medium">Control Mode</span>
+            <span className="flex items-center gap-2 font-medium">
+              <PowerIcon
+                className={`h-4 w-4 ${status.controlMode ? 'text-emerald-400' : 'text-neutral-500'}`}
+              />
+              Control Mode
+            </span>
             <div
               className={`relative h-6 w-10 rounded-full transition-colors ${
                 status.controlMode ? 'bg-emerald-500' : 'bg-neutral-600'
@@ -295,16 +376,99 @@ export default function App() {
             </div>
           </button>
 
-          {status.connected && (
+          {/* ── This window's agent ── */}
+          {status.controlMode && (
+            <div>
+              <div className="mb-1.5 text-xs font-medium uppercase tracking-wide text-neutral-400">
+                Controlling this window
+              </div>
+              {owner ? (
+                <SessionCard
+                  session={owner}
+                  primary
+                  onHold={() => act({ type: 'hold_session', id: owner.id })}
+                  onDisconnect={() => act({ type: 'disconnect_session', id: owner.id })}
+                />
+              ) : (
+                <p className="rounded-lg border border-dashed border-neutral-700 px-3 py-4 text-center text-xs text-neutral-500">
+                  No agent controls this window.
+                  {status.sessions.some((s) => s.status === 'on_hold')
+                    ? ' Pick one from Waiting below.'
+                    : ' Start an agent with onbridge configured and it will appear here.'}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* ── Grant scope ── */}
+          {status.controlMode && (
+            <div>
+              <div className="mb-1.5 text-xs font-medium uppercase tracking-wide text-neutral-400">
+                Grant on approval
+              </div>
+              <div className="flex gap-1">
+                {SCOPE_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.value}
+                    title={opt.desc}
+                    onClick={() => act({ type: 'set_scope', scope: opt.value })}
+                    className={`flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-1.5 text-xs transition-colors ${
+                      status.preferredScope === opt.value
+                        ? 'border border-emerald-500/40 bg-emerald-500/20 text-emerald-300'
+                        : 'border border-neutral-700 bg-neutral-800 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                    }`}
+                  >
+                    <ScopeIcon kind={opt.value} className="h-3 w-3" />
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-1 text-[10px] text-neutral-600">
+                {SCOPE_OPTIONS.find((o) => o.value === status.preferredScope)?.desc}. Applies to
+                the next agent you approve; existing grants are unchanged.
+              </p>
+            </div>
+          )}
+
+          {/* ── Other agents ── */}
+          {others.length > 0 && (
+            <div>
+              <div className="mb-1.5 flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-neutral-400">
+                <HoldIcon className="h-3.5 w-3.5" />
+                Waiting · {others.length}
+              </div>
+              <div className="space-y-1.5">
+                {others.map((s) => (
+                  <SessionCard
+                    key={s.id}
+                    session={s}
+                    onActivate={() =>
+                      act({
+                        type: 'activate_session',
+                        id: s.id,
+                        windowId: windowIdRef.current,
+                        scope: status.preferredScope,
+                      })
+                    }
+                    onDisconnect={() => act({ type: 'disconnect_session', id: s.id })}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ── Pause ── */}
+          {owner && (
             <button
-              onClick={() => send({ type: 'set_paused', paused: !status.paused }).then(refresh)}
-              className={`w-full rounded-lg border py-2 text-sm font-medium transition-colors ${
+              onClick={() => act({ type: 'set_paused', paused: !status.paused })}
+              className={`flex w-full items-center justify-center gap-2 rounded-lg border py-2 text-sm font-medium transition-colors ${
                 status.paused
                   ? 'border-purple-500/40 bg-purple-500/15 text-purple-200 hover:bg-purple-500/25'
                   : 'border-neutral-700 bg-neutral-800 text-neutral-300 hover:bg-neutral-700'
               }`}
             >
-              {status.paused ? '▶  Resume automation' : '⏸  Pause automation'}
+              {status.paused ? <PlayIcon className="h-4 w-4" /> : <PauseIcon className="h-4 w-4" />}
+              {status.paused ? 'Resume automation' : 'Pause automation'}
             </button>
           )}
 
@@ -318,7 +482,7 @@ export default function App() {
                 <button
                   key={m.value}
                   title={m.blurb}
-                  onClick={() => send({ type: 'set_approval_mode', mode: m.value }).then(refresh)}
+                  onClick={() => act({ type: 'set_approval_mode', mode: m.value })}
                   className={`flex-1 rounded-md px-2 py-1.5 text-xs transition-colors ${
                     status.policy.mode === m.value
                       ? m.value === 'yolo'
@@ -339,7 +503,7 @@ export default function App() {
           {status.policy.mode === 'yolo' && (
             <div className="rounded-lg border border-red-500/50 bg-red-500/10 p-3">
               <div className="mb-1 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-red-300">
-                <span className="animate-pulse">●</span> Approvals are off
+                <AlertIcon className="h-3.5 w-3.5" /> Approvals are off
               </div>
               <p className="text-xs text-neutral-300">
                 The agent can read credentials, run scripts, and click things that spend money or
@@ -351,43 +515,13 @@ export default function App() {
                   : 'Reverts on browser restart.'}
               </p>
               <button
-                onClick={() => send({ type: 'set_approval_mode', mode: 'auto' }).then(refresh)}
+                onClick={() => act({ type: 'set_approval_mode', mode: 'auto' })}
                 className="mt-2 w-full rounded-md bg-red-500 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-400"
               >
                 Turn approvals back on
               </button>
             </div>
           )}
-
-          <div>
-            <div className="mb-1.5 text-xs font-medium uppercase tracking-wide text-neutral-400">
-              Access scope
-            </div>
-            <div className="flex gap-1">
-              {SCOPE_OPTIONS.map((opt) => (
-                <button
-                  key={opt.value}
-                  title={opt.desc}
-                  disabled={status.controlMode}
-                  onClick={() => send({ type: 'set_scope', scope: opt.value }).then(refresh)}
-                  className={`flex-1 rounded-md px-2 py-1.5 text-xs transition-colors ${
-                    status.accessScope === opt.value
-                      ? 'border border-emerald-500/40 bg-emerald-500/20 text-emerald-300'
-                      : status.controlMode
-                        ? 'cursor-not-allowed border border-neutral-800 bg-neutral-800/50 text-neutral-600'
-                        : 'border border-neutral-700 bg-neutral-800 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-            {status.controlMode && (
-              <p className="mt-1 text-[10px] text-neutral-600">
-                Turn off Control Mode to change scope
-              </p>
-            )}
-          </div>
 
           {/* ── Domain allowlist ── */}
           <div>
@@ -417,7 +551,8 @@ export default function App() {
               className="w-full rounded-md border border-neutral-700 bg-neutral-800 px-2 py-1.5 text-xs text-neutral-100 placeholder-neutral-600 outline-none focus:border-emerald-500/50"
             />
             <p className="mt-1 text-[10px] text-neutral-600">
-              Leave empty to allow any site. Subdomains are included.
+              Leave empty to allow any site. Subdomains are included. Enforced in every approval
+              mode, including Bypass.
             </p>
           </div>
         </div>
@@ -430,16 +565,17 @@ export default function App() {
             </span>
             {status.commandCount > 0 && (
               <button
-                onClick={() => send({ type: 'clear_activity_log' }).then(refresh)}
-                className="text-xs text-neutral-500 transition-colors hover:text-neutral-300"
+                onClick={() => act({ type: 'clear_activity_log', id: owner?.id })}
+                className="flex items-center gap-1 text-xs text-neutral-500 transition-colors hover:text-neutral-300"
               >
-                Clear · {status.commandCount}
+                <TrashIcon className="h-3 w-3" />
+                {status.commandCount}
               </button>
             )}
           </div>
           {status.activityLog.length === 0 ? (
             <p className="py-6 text-center text-xs text-neutral-600">
-              {status.connected ? 'Waiting for the agent…' : 'Not connected'}
+              {owner ? 'Waiting for the agent…' : 'No agent controls this window'}
             </p>
           ) : (
             <div className="space-y-1">
@@ -451,8 +587,8 @@ export default function App() {
                       e.success ? 'bg-neutral-800/50 hover:bg-neutral-800' : 'bg-red-950/30 hover:bg-red-950/50'
                     }`}
                   >
-                    <span className={e.success ? 'text-emerald-400' : 'text-red-400'}>
-                      {e.success ? '✓' : '✗'}
+                    <span className={`mt-0.5 shrink-0 ${e.success ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {e.success ? <CheckIcon className="h-3 w-3" /> : <CrossIcon className="h-3 w-3" />}
                     </span>
                     <span className="flex-1 truncate">
                       <span className="font-mono text-neutral-200">{e.action}</span>{' '}
@@ -490,13 +626,23 @@ export default function App() {
           placeholder={status.askRequest ? 'Type your answer…' : 'Send a note to the agent…'}
           className="w-full resize-none rounded-md border border-neutral-700 bg-neutral-800 px-3 py-2 text-sm text-neutral-100 placeholder-neutral-500 outline-none focus:border-emerald-500/50"
         />
-        <div className="mt-1.5 flex items-center justify-between">
-          <span className="text-[11px] text-neutral-500">
-            {sendState === 'answered' && <span className="text-emerald-400">✓ delivered to agent</span>}
-            {sendState === 'queued' && (
-              <span className="text-amber-400">⏳ queued — arrives on the agent's next action</span>
+        <div className="mt-1.5 flex items-center justify-between gap-2">
+          <span className="flex min-w-0 items-center gap-1 text-[11px] text-neutral-500">
+            {sendState === 'answered' && (
+              <span className="flex items-center gap-1 text-emerald-400">
+                <CheckIcon className="h-3 w-3" /> delivered to agent
+              </span>
             )}
-            {sendState === 'error' && <span className="text-red-400">✗ not connected</span>}
+            {sendState === 'queued' && (
+              <span className="flex items-center gap-1 text-amber-400">
+                <ClockIcon className="h-3 w-3" /> queued — arrives on next action
+              </span>
+            )}
+            {sendState === 'error' && (
+              <span className="flex items-center gap-1 text-red-400">
+                <CrossIcon className="h-3 w-3" /> not connected
+              </span>
+            )}
             {sendState === 'idle' &&
               (status.askRequest
                 ? 'The agent is blocked until you reply'
@@ -505,11 +651,128 @@ export default function App() {
           <button
             onClick={() => void submit()}
             disabled={!draft.trim()}
-            className="rounded-md bg-emerald-500 px-3 py-1 text-xs font-medium text-neutral-900 transition-colors hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-neutral-700 disabled:text-neutral-500"
+            className="flex shrink-0 items-center gap-1 rounded-md bg-emerald-500 px-3 py-1 text-xs font-medium text-neutral-900 transition-colors hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-neutral-700 disabled:text-neutral-500"
           >
-            Send
+            <SendIcon className="h-3 w-3" /> Send
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The identity block. Deliberately shows the project path and pid: with several
+ * agents running, the name alone ("Claude Code") identifies none of them.
+ */
+function AgentCard({ agent, port }: { agent: AgentInfo | null; port: number }) {
+  if (!agent) {
+    return (
+      <div className="flex items-center gap-2 text-neutral-300">
+        <AgentIcon className="h-4 w-4 text-neutral-500" />
+        <span>Unidentified agent on port {port}</span>
+      </div>
+    );
+  }
+  return (
+    <div className="min-w-0">
+      <div className="flex items-center gap-2">
+        <AgentIcon className="h-4 w-4 shrink-0 text-emerald-400" />
+        <span className="truncate font-medium text-neutral-100">{agent.name}</span>
+        {agent.version && <span className="shrink-0 text-[10px] text-neutral-500">{agent.version}</span>}
+        {/* A name the client reported is worth more than one we inferred. */}
+        {agent.source !== 'mcp' && (
+          <span
+            title="Inferred from the environment — the agent did not identify itself"
+            className="shrink-0 rounded bg-neutral-700 px-1 text-[9px] uppercase tracking-wide text-neutral-400"
+          >
+            guessed
+          </span>
+        )}
+      </div>
+      {agent.cwd && (
+        <div className="mt-0.5 truncate pl-6 font-mono text-[10px] text-neutral-500" title={agent.cwd}>
+          {shortPath(agent.cwd)}
+        </div>
+      )}
+      <div className="mt-0.5 pl-6 font-mono text-[10px] text-neutral-600">
+        pid {agent.pid} · port {port} · onbridge {agent.serverVersion}
+      </div>
+    </div>
+  );
+}
+
+function SessionCard({
+  session,
+  primary,
+  onActivate,
+  onHold,
+  onDisconnect,
+}: {
+  session: SessionView;
+  primary?: boolean;
+  onActivate?: () => void;
+  onHold?: () => void;
+  onDisconnect?: () => void;
+}) {
+  const tone = primary
+    ? 'border-emerald-500/40 bg-emerald-500/10'
+    : session.status === 'pending_approval'
+      ? 'border-amber-500/40 bg-amber-500/10'
+      : 'border-neutral-700 bg-neutral-800/60';
+
+  return (
+    <div className={`rounded-lg border p-2.5 ${tone}`}>
+      <AgentCard agent={session.agent} port={session.port} />
+
+      <div className="mt-2 flex items-center gap-2 pl-6 text-[10px]">
+        {session.scope ? (
+          <span className="flex items-center gap-1 text-emerald-300">
+            <ScopeIcon kind={session.scope.kind} className="h-3 w-3" />
+            {session.scopeLabel}
+          </span>
+        ) : (
+          <span className="flex items-center gap-1 text-neutral-500">
+            <HoldIcon className="h-3 w-3" />
+            {session.status === 'pending_approval' ? 'awaiting pairing' : 'no control granted'}
+          </span>
+        )}
+        {primary && (
+          <span className="flex items-center gap-1 text-neutral-500">
+            <LockIcon className="h-3 w-3" /> encrypted
+          </span>
+        )}
+        {session.commandCount > 0 && (
+          <span className="ml-auto font-mono text-neutral-600">{session.commandCount} cmds</span>
+        )}
+      </div>
+
+      <div className="mt-2 flex gap-1.5 pl-6">
+        {onActivate && session.status !== 'pending_approval' && (
+          <button
+            onClick={onActivate}
+            className="flex-1 rounded-md bg-emerald-500 py-1 text-xs font-medium text-neutral-900 transition-colors hover:bg-emerald-400"
+          >
+            Give this agent control
+          </button>
+        )}
+        {onHold && (
+          <button
+            onClick={onHold}
+            className="flex-1 rounded-md border border-neutral-700 bg-neutral-800 py-1 text-xs text-neutral-300 transition-colors hover:bg-neutral-700"
+          >
+            Release
+          </button>
+        )}
+        {onDisconnect && (
+          <button
+            onClick={onDisconnect}
+            title="Disconnect this agent"
+            className="rounded-md border border-neutral-700 bg-neutral-800 px-2 py-1 text-neutral-400 transition-colors hover:border-red-500/50 hover:text-red-300"
+          >
+            <CrossIcon className="h-3 w-3" />
+          </button>
+        )}
       </div>
     </div>
   );

@@ -1,6 +1,19 @@
 import { defineBackground } from 'wxt/utils/define-background';
-import type { ServerMessage, ExtensionMessage, DomNode, PageSnapshot } from '@onbridge/shared';
-import { SecureClient, clearPairings, type ClientState } from '../core/secure-client.js';
+import type {
+  ServerMessage,
+  ExtensionMessage,
+  DomNode,
+  PageSnapshot,
+  AgentIdentity,
+} from '@onbridge/shared';
+import { clearPairings } from '../core/secure-client.js';
+import {
+  ConnectionManager,
+  scopeAllows,
+  describeScope,
+  type AgentSession,
+  type SessionScope,
+} from '../core/connection-manager.js';
 import {
   CdpUnavailable,
   detachAll,
@@ -20,8 +33,6 @@ import {
   type RiskClass,
 } from '../core/policy.js';
 
-const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000];
-
 /**
  * A pairing prompt is only honoured shortly after the user enables control mode.
  * Outside that window a local process cannot make us nag the user.
@@ -35,30 +46,18 @@ const ASK_TTL_MS = 105_000;
  *  leaving the agent staring at an opaque timeout. */
 const APPROVAL_TTL_MS = 25_000;
 
-interface ActivityEntry {
-  action: string;
-  summary: string;
-  success: boolean;
-  error?: string;
-  timing: number;
-  timestamp: number;
-}
-
 export default defineBackground(() => {
-  let client: SecureClient | null = null;
-  let clientState: ClientState = 'idle';
-  let stateDetail = '';
   let controlMode = false;
-  let reconnectAttempt = 0;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let lastAction = '';
-  let activityLog: ActivityEntry[] = [];
-  let commandCount = 0;
 
   /** Set when the user flips control mode on — gates the pairing prompt. */
   let controlEnabledAt = 0;
   let pairRequest:
-    | { agentName: string; resolve: (ok: boolean) => void; timer: ReturnType<typeof setTimeout> }
+    | {
+        agent: AgentIdentity;
+        port: number;
+        resolve: (ok: boolean) => void;
+        timer: ReturnType<typeof setTimeout>;
+      }
     | null = null;
 
   /** The agent is blocked on this until the user answers in the side panel. */
@@ -102,13 +101,16 @@ export default defineBackground(() => {
       }
     | null = null;
 
-  type AccessScope = 'current_tab' | 'current_window' | 'all_tabs';
-  let accessScope: AccessScope = 'current_tab';
-  let scopeTabId: number | undefined;
-  let scopeWindowId: number | undefined;
+  /**
+   * What the user picks in the panel before handing an agent control. It is
+   * resolved against the window the panel is open in, which is what makes
+   * "control this window" mean the window the user is looking at.
+   */
+  type ScopeKind = 'tab' | 'window' | 'all';
+  let preferredScope: ScopeKind = 'window';
 
-  chrome.storage.local.get(['controlMode', 'accessScope', 'policy'], (result) => {
-    if (result.accessScope) accessScope = result.accessScope as AccessScope;
+  chrome.storage.local.get(['controlMode', 'preferredScope', 'policy'], (result) => {
+    if (result.preferredScope) preferredScope = result.preferredScope as ScopeKind;
     if (result.policy) {
       policy = { ...DEFAULT_POLICY, ...(result.policy as Policy) };
       // yolo never survives a restart. Leaving prompts disabled across sessions
@@ -117,32 +119,67 @@ export default defineBackground(() => {
     }
     if (result.controlMode) {
       controlMode = true;
-      captureScope().then(() => connect());
+      controlEnabledAt = Date.now();
+      manager.start();
     }
   });
 
-  async function captureScope() {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    scopeTabId = tab?.id;
-    scopeWindowId = tab?.windowId;
+  /** Builds a concrete grant from the user's preference and a given window. */
+  async function buildScope(kind: ScopeKind, windowId?: number): Promise<SessionScope> {
+    if (kind === 'all') return { kind: 'all' };
+    const [tab] = windowId
+      ? await chrome.tabs.query({ active: true, windowId })
+      : await chrome.tabs.query({ active: true, currentWindow: true });
+    if (kind === 'window') return { kind: 'window', windowId: windowId ?? tab?.windowId };
+    return { kind: 'tab', tabId: tab?.id, windowId: windowId ?? tab?.windowId };
   }
 
-  async function enforceScope(tabId: number): Promise<void> {
-    if (accessScope === 'all_tabs') return;
+  /**
+   * Refuses a tab outside the session's grant.
+   *
+   * This is the isolation boundary between concurrent agents: an agent given one
+   * window cannot reach into another, no matter what tab id it asks for.
+   */
+  async function enforceScope(session: AgentSession, tabId: number): Promise<void> {
+    const scope = session.scope;
+    if (!scope) {
+      throw new Error(
+        'This agent has not been given control of anything yet. Ask the user to press ' +
+          '"Give this agent control" in the onbridge side panel.',
+      );
+    }
+    if (scope.kind === 'all') return;
 
-    if (accessScope === 'current_tab') {
-      if (tabId !== scopeTabId) {
-        throw new Error(`Access denied: agent is scoped to current tab only (tab ${scopeTabId}). Requested tab ${tabId}.`);
-      }
-      return;
+    let windowId: number | undefined;
+    try {
+      windowId = (await chrome.tabs.get(tabId)).windowId;
+    } catch {
+      throw new Error(`Tab ${tabId} no longer exists.`);
     }
 
-    if (accessScope === 'current_window') {
-      const tab = await chrome.tabs.get(tabId);
-      if (tab.windowId !== scopeWindowId) {
-        throw new Error(`Access denied: agent is scoped to current window only. Tab ${tabId} is in a different window.`);
-      }
+    if (!scopeAllows(scope, tabId, windowId!)) {
+      throw new Error(
+        `Access denied: this agent controls ${describeScope(scope)} and tab ${tabId} is ` +
+          'outside it. Another agent may be driving that window.',
+      );
     }
+  }
+
+  /** The tab a scoped command defaults to when the agent names none. */
+  async function defaultTabFor(session: AgentSession): Promise<number | undefined> {
+    const scope = session.scope;
+    if (!scope) return undefined;
+    if (scope.kind === 'tab') return scope.tabId;
+
+    // For a window grant, the active tab *of that window* — not of whatever
+    // window Chrome last focused, which is what `currentWindow` would give and
+    // is wrong the moment two agents drive two windows.
+    if (scope.kind === 'window' && scope.windowId != null) {
+      const [tab] = await chrome.tabs.query({ active: true, windowId: scope.windowId });
+      return tab?.id;
+    }
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    return tab?.id;
   }
 
   function summarizeParams(action: string, params: Record<string, unknown>): string {
@@ -167,7 +204,7 @@ export default defineBackground(() => {
    * Surfaces the Allow/Deny prompt. Resolves false unless the user actively
    * allows — an unanswered prompt is a denial, never a default-yes.
    */
-  function requestPairing(agentName: string): Promise<boolean> {
+  function requestPairing(agent: AgentIdentity, port: number): Promise<boolean> {
     if (Date.now() - controlEnabledAt > PAIR_WINDOW_MS) {
       return Promise.resolve(false);
     }
@@ -179,7 +216,7 @@ export default defineBackground(() => {
         resolve(false);
       }, PAIR_PROMPT_TTL_MS);
 
-      pairRequest = { agentName, resolve, timer };
+      pairRequest = { agent, port, resolve, timer };
       updateBadge('pair');
     });
   }
@@ -192,30 +229,45 @@ export default defineBackground(() => {
     resolve(allow);
   }
 
-  async function onServerMessage(msg: ServerMessage): Promise<void> {
+  const manager = new ConnectionManager({
+    onPairRequest: requestPairing,
+    onCommand: (session, msg) => void onServerMessage(session, msg),
+    onChange: () => {
+      updateBadge(manager.hasActive() ? 'on' : controlMode ? 'off' : 'disabled');
+    },
+    log: (m) => console.debug('[onbridge]', m),
+  });
+
+  async function onServerMessage(session: AgentSession, msg: ServerMessage): Promise<void> {
     if (msg.type === 'ping') {
-      await client?.send({ type: 'pong' });
+      await manager.send(session.id, { type: 'pong' });
       return;
     }
     if (msg.type !== 'command') return;
 
     updateBadge('active');
-    lastAction = msg.action;
-    commandCount++;
+    session.lastAction = msg.action;
+    session.commandCount++;
     const cmdStart = Date.now();
     const summary = summarizeParams(msg.action, msg.params);
 
     let response: ExtensionMessage;
     try {
-      const data = await handleCommand(msg);
+      const data = await handleCommand(session, msg);
       const timing = Date.now() - cmdStart;
       response = { type: 'result', id: msg.id, success: true, data, timing };
-      activityLog.unshift({ action: msg.action, summary, success: true, timing, timestamp: Date.now() });
+      session.activityLog.unshift({
+        action: msg.action,
+        summary,
+        success: true,
+        timing,
+        timestamp: Date.now(),
+      });
     } catch (err) {
       const timing = Date.now() - cmdStart;
       const errorMsg = err instanceof Error ? err.message : String(err);
       response = { type: 'result', id: msg.id, success: false, data: null, error: errorMsg, timing };
-      activityLog.unshift({
+      session.activityLog.unshift({
         action: msg.action,
         summary,
         success: false,
@@ -225,64 +277,20 @@ export default defineBackground(() => {
       });
     }
 
-    await client?.send(response);
-    if (activityLog.length > 50) activityLog.length = 50;
+    await manager.send(session.id, response);
+    if (session.activityLog.length > 50) session.activityLog.length = 50;
     updateBadge('on');
   }
 
-  function connect() {
-    if (client && client.getState() !== 'idle' && client.getState() !== 'failed') return;
-
-    client = new SecureClient({
-      onPairRequest: requestPairing,
-      onMessage: (msg) => void onServerMessage(msg),
-      onState: (state, detail) => {
-        clientState = state;
-        stateDetail = detail ?? '';
-        if (state === 'ready') {
-          reconnectAttempt = 0;
-          updateBadge('on');
-          // Read from the manifest so the reported version cannot drift from
-          // the shipped one, as a hardcoded string already had.
-          void client?.send({
-            type: 'ready',
-            version: chrome.runtime.getManifest().version,
-            controlMode: true,
-          });
-        } else if (state === 'pairing') {
-          updateBadge('pair');
-        } else if (state === 'idle' || state === 'failed') {
-          updateBadge(controlMode ? 'off' : 'disabled');
-          if (controlMode) scheduleReconnect();
-        }
-      },
-    });
-
-    void client.connect();
-  }
-
   function disconnect() {
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
     resolvePairing(false);
     resolveAsk(null); // never leave the agent blocked on a dead channel
-    client?.disconnect();
-    client = null;
-    clientState = 'idle';
+    manager.stop();
     // Release the debugger so Chrome drops the "onbridge is debugging this
     // browser" banner the moment control mode ends.
     detachAll();
     degraded = '';
     updateBadge('disabled');
-  }
-
-  function scheduleReconnect() {
-    if (!controlMode) return;
-    const delay = RECONNECT_DELAYS[Math.min(reconnectAttempt, RECONNECT_DELAYS.length - 1)];
-    reconnectAttempt++;
-    reconnectTimer = setTimeout(connect, delay);
   }
 
   /**
@@ -336,8 +344,11 @@ export default defineBackground(() => {
     }
   }
 
-  async function handleCommand(msg: ServerMessage & { type: 'command' }): Promise<unknown> {
-    const { action, params: rawParams, tabId } = msg;
+  async function handleCommand(
+    session: AgentSession,
+    msg: ServerMessage & { type: 'command' },
+  ): Promise<unknown> {
+    const { action, params: rawParams } = msg;
     let params = rawParams;
 
     // ask_user and bridge_status are meta-commands: they must work even while
@@ -348,15 +359,23 @@ export default defineBackground(() => {
     }
 
     if (action === 'bridge_status') {
+      const peers = manager
+        .list()
+        .filter((s) => s.id !== session.id)
+        .map((s) => `${s.identity?.name ?? 'agent'} on :${s.port} (${s.status})`);
       return {
-        accessScope,
+        accessScope: session.scope ? describeScope(session.scope) : 'nothing yet',
+        scopeKind: session.scope?.kind ?? null,
+        sessionStatus: session.status,
+        agent: session.identity?.name,
         paused,
-        commandCount,
+        commandCount: session.commandCount,
         controlMode,
         approvalMode: policy.mode,
         allowlist: policy.allowlist,
         denylist: policy.denylist,
         degraded: degraded || undefined,
+        otherAgents: peers,
       };
     }
 
@@ -367,11 +386,18 @@ export default defineBackground(() => {
     }
 
     lastCommandAt = Date.now();
+
+    // Resolve the target tab once, against *this session's* grant, and use it
+    // for everything downstream. Letting each handler fall back to Chrome's
+    // "current window" independently is wrong as soon as two agents drive two
+    // windows — whichever window was focused last would win.
+    const tabId = msg.tabId ?? (await defaultTabFor(session));
+    if (tabId != null) await enforceScope(session, tabId);
     await enforcePolicy(action, params, tabId);
 
     // Translate global refs down to per-frame refs before dispatch. Everything
     // below this point works in the target frame's own ref space.
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     let frameId = 0;
     if (targetTabId) {
       const localised = localiseRefs(params, targetTabId);
@@ -391,17 +417,17 @@ export default defineBackground(() => {
       case 'reload':
         return handleReload(params as { hard?: boolean }, tabId);
       case 'list_tabs':
-        return handleListTabs();
+        return handleListTabs(session);
       case 'switch_tab':
-        return handleSwitchTab(params as { tabId: number });
+        return handleSwitchTab(session, params as { tabId: number });
       case 'new_tab':
-        return handleNewTab(params as { url?: string });
+        return handleNewTab(session, params as { url?: string });
       case 'close_tab':
-        return handleCloseTab(params as { tabId?: number });
+        return handleCloseTab(session, params as { tabId?: number }, tabId);
       case 'screenshot':
         return handleScreenshot(params as { fullPage?: boolean; quality?: number }, tabId);
       case 'get_cookies':
-        return handleGetCookies(params as { domain?: string });
+        return handleGetCookies(params as { domain?: string }, tabId);
       case 'set_cookie':
         return handleSetCookie(params as { name: string; value: string; domain: string });
       case 'console_logs':
@@ -411,7 +437,9 @@ export default defineBackground(() => {
       case 'list_downloads':
         return handleListDownloads(params as { limit?: number });
       case 'activity_log':
-        return { entries: activityLog.slice(0, 30), totalCommands: commandCount };
+        // This session's own history only. One agent reading another's actions
+        // would leak what a different project is doing into its context.
+        return { entries: session.activityLog.slice(0, 30), totalCommands: session.commandCount };
       case 'upload':
         return handleFileUpload(params as { ref: number; filePath: string }, tabId);
       case 'click':
@@ -500,7 +528,7 @@ export default defineBackground(() => {
     params: Record<string, unknown>,
     tabId?: number,
   ): Promise<PageSnapshot> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab found');
 
     const snap = (await routeToContentScript('snapshot', params, targetTabId, 0)) as PageSnapshot;
@@ -571,7 +599,7 @@ export default defineBackground(() => {
     params: Record<string, unknown>,
     tabId?: number,
   ): Promise<void> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     const url = targetTabId ? ((await chrome.tabs.get(targetTabId)).url ?? '') : '';
 
     const label = targetTabId ? await labelForClick(action, params, targetTabId) : undefined;
@@ -645,9 +673,8 @@ export default defineBackground(() => {
     tabId?: number,
     frameId = 0,
   ): Promise<unknown> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab found');
-    await enforceScope(targetTabId);
 
     // CDP's main-world evaluate cannot resolve a ref inside a child frame, so
     // iframe interaction goes through that frame's content script. Those events
@@ -745,10 +772,9 @@ export default defineBackground(() => {
     tabId?: number,
     frameId = 0,
   ): Promise<unknown> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab found');
 
-    await enforceScope(targetTabId);
     const tabBefore = await chrome.tabs.get(targetTabId);
     const urlBefore = tabBefore.url ?? '';
 
@@ -794,9 +820,8 @@ export default defineBackground(() => {
     params: { level?: string; clear?: boolean },
     tabId?: number,
   ): Promise<{ logs: unknown[]; note?: string }> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab found');
-    await enforceScope(targetTabId);
 
     try {
       await enableConsoleCapture(targetTabId);
@@ -847,10 +872,9 @@ export default defineBackground(() => {
     tabId?: number,
     frameId = 0,
   ): Promise<unknown> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab found');
 
-    await enforceScope(targetTabId);
     if (frameId === 0) await ensureContentScript(targetTabId);
 
     return new Promise((resolve, reject) => {
@@ -880,11 +904,6 @@ export default defineBackground(() => {
     });
   }
 
-  async function getActiveTabId(): Promise<number | undefined> {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    return tab?.id;
-  }
-
   async function ensureContentScript(tabId: number): Promise<void> {
     try {
       await chrome.tabs.sendMessage(tabId, { type: 'ping' });
@@ -898,7 +917,7 @@ export default defineBackground(() => {
   }
 
   async function handleNavigate(params: { url: string }, tabId?: number): Promise<unknown> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab');
 
     await chrome.tabs.update(targetTabId, { url: params.url });
@@ -907,7 +926,7 @@ export default defineBackground(() => {
   }
 
   async function handleGoBack(tabId?: number): Promise<{ url: string; title: string }> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab');
     await chrome.tabs.goBack(targetTabId);
     await waitForNavigation(targetTabId);
@@ -916,7 +935,7 @@ export default defineBackground(() => {
   }
 
   async function handleGoForward(tabId?: number): Promise<{ url: string; title: string }> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab');
     await chrome.tabs.goForward(targetTabId);
     await waitForNavigation(targetTabId);
@@ -925,7 +944,7 @@ export default defineBackground(() => {
   }
 
   async function handleReload(params: { hard?: boolean }, tabId?: number): Promise<{ url: string; title: string }> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab');
     await chrome.tabs.reload(targetTabId, { bypassCache: params.hard });
     await waitForNavigation(targetTabId);
@@ -947,32 +966,53 @@ export default defineBackground(() => {
     });
   }
 
-  async function handleListTabs(): Promise<Array<{ id: number; url: string; title: string; active: boolean }>> {
+  /**
+   * Only the tabs this session may touch. Listing tabs it cannot act on would
+   * hand one agent a map of another agent's windows, and invite it to try.
+   */
+  async function handleListTabs(
+    session: AgentSession,
+  ): Promise<Array<{ id: number; url: string; title: string; active: boolean }>> {
+    const scope = session.scope;
+    if (!scope) return [];
+
     let tabs: chrome.tabs.Tab[];
-    if (accessScope === 'current_tab') {
-      tabs = scopeTabId ? [await chrome.tabs.get(scopeTabId)] : [];
-    } else if (accessScope === 'current_window') {
-      tabs = scopeWindowId ? await chrome.tabs.query({ windowId: scopeWindowId }) : [];
+    if (scope.kind === 'tab') {
+      tabs = scope.tabId ? [await chrome.tabs.get(scope.tabId)] : [];
+    } else if (scope.kind === 'window') {
+      tabs = scope.windowId != null ? await chrome.tabs.query({ windowId: scope.windowId }) : [];
     } else {
       tabs = await chrome.tabs.query({});
     }
     return tabs.map((t) => ({ id: t.id!, url: t.url ?? '', title: t.title ?? '', active: t.active ?? false }));
   }
 
-  async function handleSwitchTab(params: { tabId: number }): Promise<{ url: string; title: string }> {
-    await enforceScope(params.tabId);
+  async function handleSwitchTab(
+    session: AgentSession,
+    params: { tabId: number },
+  ): Promise<{ url: string; title: string }> {
+    await enforceScope(session, params.tabId);
     await chrome.tabs.update(params.tabId, { active: true });
     const tab = await chrome.tabs.get(params.tabId);
     return { url: tab.url ?? '', title: tab.title ?? '' };
   }
 
-  async function handleNewTab(params: { url?: string }): Promise<{ tabId: number; url: string; title: string }> {
-    if (accessScope === 'current_tab') {
-      throw new Error('Access denied: cannot open new tabs in "current tab" scope.');
+  async function handleNewTab(
+    session: AgentSession,
+    params: { url?: string },
+  ): Promise<{ tabId: number; url: string; title: string }> {
+    const scope = session.scope;
+    if (!scope || scope.kind === 'tab') {
+      throw new Error(
+        'Access denied: this agent controls a single tab, and a new tab would fall outside it. ' +
+          'Ask the user to grant window-level control instead.',
+      );
     }
     const createOpts: chrome.tabs.CreateProperties = { url: params.url };
-    if (accessScope === 'current_window' && scopeWindowId) {
-      createOpts.windowId = scopeWindowId;
+    // Pin the new tab into the granted window so it lands inside the scope
+    // rather than wherever Chrome last had focus.
+    if (scope.kind === 'window' && scope.windowId != null) {
+      createOpts.windowId = scope.windowId;
     }
     const tab = await chrome.tabs.create(createOpts);
     if (params.url) {
@@ -983,10 +1023,14 @@ export default defineBackground(() => {
     return { tabId: tab.id!, url: tab.url ?? '', title: tab.title ?? '' };
   }
 
-  async function handleCloseTab(params: { tabId?: number }): Promise<{ success: boolean }> {
-    const targetTabId = params.tabId ?? (await getActiveTabId());
+  async function handleCloseTab(
+    session: AgentSession,
+    params: { tabId?: number },
+    fallbackTabId?: number,
+  ): Promise<{ success: boolean }> {
+    const targetTabId = params.tabId ?? fallbackTabId;
     if (!targetTabId) throw new Error('No active tab');
-    await enforceScope(targetTabId);
+    await enforceScope(session, targetTabId);
     await chrome.tabs.remove(targetTabId);
     return { success: true };
   }
@@ -1000,9 +1044,8 @@ export default defineBackground(() => {
     params: { fullPage?: boolean; quality?: number },
     tabId?: number,
   ): Promise<{ base64: string }> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     if (targetTabId) {
-      await enforceScope(targetTabId);
       try {
         return { base64: await trusted.screenshot(targetTabId, params) };
       } catch (err) {
@@ -1026,14 +1069,16 @@ export default defineBackground(() => {
    * Names and domains answer almost every legitimate question ("am I logged
    * in?") without handing over the key.
    */
-  async function handleGetCookies(params: {
-    domain?: string;
-    includeValues?: boolean;
-  }): Promise<{ cookies: Array<Record<string, unknown>>; redacted: boolean; note?: string }> {
+  async function handleGetCookies(
+    params: {
+      domain?: string;
+      includeValues?: boolean;
+    },
+    tabId?: number,
+  ): Promise<{ cookies: Array<Record<string, unknown>>; redacted: boolean; note?: string }> {
     const query: chrome.cookies.GetAllDetails = {};
     if (params.domain) query.domain = params.domain;
     else {
-      const tabId = await getActiveTabId();
       if (tabId) {
         const tab = await chrome.tabs.get(tabId);
         if (tab.url) query.url = tab.url;
@@ -1136,7 +1181,7 @@ export default defineBackground(() => {
   }
 
   async function handleFileUpload(params: { ref: number; filePath: string }, tabId?: number): Promise<{ success: boolean }> {
-    const targetTabId = tabId ?? (await getActiveTabId());
+    const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab');
 
     // Use Chrome Debugger API (CDP) to set files on file inputs
@@ -1231,11 +1276,46 @@ export default defineBackground(() => {
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'get_status') {
+      // The panel tells us which window it is in. Everything about "who is
+      // driving" is answered relative to that window — a panel in window A must
+      // not report the agent that owns window B as if it were in charge here.
+      const windowId = typeof message.windowId === 'number' ? message.windowId : undefined;
+      const sessions = manager.list();
+      const mine = windowId != null ? manager.sessionForWindow(windowId) : undefined;
+
+      const view = (s: AgentSession) => ({
+        id: s.id,
+        port: s.port,
+        status: s.status,
+        detail: s.detail,
+        scope: s.scope,
+        scopeLabel: s.scope ? describeScope(s.scope) : null,
+        commandCount: s.commandCount,
+        attempts: s.attempts,
+        lastAction: s.lastAction,
+        connectedAt: s.connectedAt,
+        /** Owns the window this panel is in — drives the "controlling" heading. */
+        ownsThisWindow: mine?.id === s.id,
+        agent: s.identity
+          ? {
+              name: s.identity.name,
+              version: s.identity.version,
+              source: s.identity.source,
+              pid: s.identity.pid,
+              cwd: s.identity.cwd,
+              serverVersion: s.identity.serverVersion,
+            }
+          : null,
+      });
+
       sendResponse({
         controlMode,
-        connected: client?.isReady() ?? false,
-        connectionState: clientState,
-        stateDetail,
+        windowId,
+        sessions: sessions.map(view),
+        activeSessionId: mine?.id ?? null,
+        connected: Boolean(mine),
+        anyConnected: sessions.some((s) => s.status === 'active' || s.status === 'on_hold'),
+        preferredScope,
         paused,
         degraded,
         policy,
@@ -1250,15 +1330,58 @@ export default defineBackground(() => {
               askedAt: approvalRequest.askedAt,
             }
           : null,
-        pairRequest: pairRequest ? { agentName: pairRequest.agentName } : null,
+        pairRequest: pairRequest
+          ? {
+              port: pairRequest.port,
+              agent: {
+                name: pairRequest.agent.name,
+                version: pairRequest.agent.version,
+                source: pairRequest.agent.source,
+                pid: pairRequest.agent.pid,
+                cwd: pairRequest.agent.cwd,
+                serverVersion: pairRequest.agent.serverVersion,
+              },
+            }
+          : null,
         askRequest: askRequest
           ? { question: askRequest.question, options: askRequest.options, askedAt: askRequest.askedAt }
           : null,
-        lastAction,
-        activityLog: activityLog.slice(0, 30),
-        commandCount,
-        accessScope,
+        lastAction: mine?.lastAction ?? '',
+        activityLog: (mine?.activityLog ?? []).slice(0, 30),
+        commandCount: mine?.commandCount ?? 0,
       });
+      return true;
+    }
+
+    /**
+     * Hands a session territory. The window comes from the panel that asked, so
+     * "give this agent control" always means the window the user is looking at.
+     */
+    if (message?.type === 'activate_session') {
+      const kind = (message.scope as ScopeKind) ?? preferredScope;
+      buildScope(kind, message.windowId as number | undefined).then((scope) => {
+        const res = manager.activate(String(message.id), scope);
+        if (res.ok) {
+          void manager.send(String(message.id), {
+            type: 'ready',
+            version: chrome.runtime.getManifest().version,
+            controlMode: true,
+          });
+        }
+        sendResponse(res);
+      });
+      return true;
+    }
+
+    if (message?.type === 'hold_session') {
+      manager.hold(String(message.id));
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message?.type === 'disconnect_session') {
+      manager.disconnect(String(message.id));
+      sendResponse({ ok: true });
       return true;
     }
 
@@ -1313,7 +1436,7 @@ export default defineBackground(() => {
         yoloExpiresAt = 0;
       }
 
-      updateBadge(client?.isReady() ? 'on' : 'off');
+      updateBadge(manager.hasActive() ? 'on' : 'off');
       sendResponse({ ok: true, mode, expiresAt: yoloExpiresAt || undefined });
       return true;
     }
@@ -1337,18 +1460,21 @@ export default defineBackground(() => {
         sendResponse({ ok: true, delivered: 'answered' });
         return true;
       }
-      if (!client?.isReady()) {
+      if (!manager.hasActive()) {
         sendResponse({ ok: false, reason: 'not_connected' });
         return true;
       }
-      void client.send({ type: 'event', event: 'user_message', data: { text } });
+      // Goes to every agent currently holding territory. With two agents driving
+      // two windows there is no way to know which one a free-form note is for,
+      // and silently picking one would put it in front of the wrong session.
+      void manager.broadcastActive({ type: 'event', event: 'user_message', data: { text } });
       sendResponse({ ok: true, delivered: 'queued' });
       return true;
     }
 
     if (message?.type === 'set_paused') {
       paused = Boolean(message.paused);
-      updateBadge(client?.isReady() ? 'on' : 'off');
+      updateBadge(manager.hasActive() ? 'on' : 'off');
       sendResponse({ ok: true, paused });
       return true;
     }
@@ -1372,29 +1498,31 @@ export default defineBackground(() => {
       chrome.storage.local.set({ controlMode });
       if (controlMode) {
         controlEnabledAt = Date.now();
-        captureScope().then(() => connect());
+        manager.start();
       } else {
         disconnect();
-        scopeTabId = undefined;
-        scopeWindowId = undefined;
       }
       sendResponse({ ok: true });
       return true;
     }
 
+    // The default grant offered when the user hands an agent control. Changing
+    // it never widens a grant already made — existing sessions keep the scope
+    // they were given until the user explicitly re-grants.
     if (message?.type === 'set_scope') {
-      accessScope = message.scope;
-      chrome.storage.local.set({ accessScope });
-      if (controlMode) {
-        captureScope();
-      }
-      sendResponse({ ok: true });
+      preferredScope = message.scope as ScopeKind;
+      chrome.storage.local.set({ preferredScope });
+      sendResponse({ ok: true, preferredScope });
       return true;
     }
 
     if (message?.type === 'clear_activity_log') {
-      activityLog = [];
-      commandCount = 0;
+      const target = message.id ? manager.get(String(message.id)) : undefined;
+      const targets = target ? [target] : manager.list();
+      for (const s of targets) {
+        s.activityLog = [];
+        s.commandCount = 0;
+      }
       sendResponse({ ok: true });
       return true;
     }

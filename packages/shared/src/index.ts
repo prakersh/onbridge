@@ -25,7 +25,7 @@ export {
   fingerprint,
 } from './crypto.js';
 
-export type { HandshakeFrame } from './handshake.js';
+export type { HandshakeFrame, AgentIdentity } from './handshake.js';
 export {
   HANDSHAKE_VERSION,
   PROOF_PAIR,

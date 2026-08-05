@@ -23,14 +23,15 @@ import {
 } from '@onbridge/shared';
 import type { ServerMessage, ExtensionMessage, CommandAction, HandshakeFrame } from '@onbridge/shared';
 import {
+  buildAgentIdentity,
   forgetPeer,
-  getAgentName,
   getPeer,
   getServerId,
   makeOriginCheck,
   savePeer,
   touchPeer,
 } from './identity.js';
+import type { AgentIdentity } from '@onbridge/shared';
 
 type PendingCommand = {
   resolve: (data: unknown) => void;
@@ -71,9 +72,49 @@ export class Bridge {
   private isOriginAllowed = makeOriginCheck((m) => this.log(m));
   /** Notes typed in the side panel, awaiting delivery on the next tool result. */
   private userMessages: string[] = [];
+  private startedAt = Date.now();
+  private serverVersion = '0.0.0';
+  /**
+   * Pulled on demand rather than pushed once.
+   *
+   * The obvious wiring — set this from an `oninitialized` callback — silently
+   * does nothing for any client that omits the `notifications/initialized`
+   * notification, and identity then falls back to an environment guess forever.
+   * Reading it at the moment we need it is correct regardless, because the SDK
+   * records `clientInfo` while handling the `initialize` *request*.
+   */
+  private clientInfoSource?: () => { name?: string; version?: string; title?: string } | undefined;
 
-  constructor() {
+  constructor(serverVersion?: string) {
+    if (serverVersion) this.serverVersion = serverVersion;
     void this.listen();
+  }
+
+  /** Current best answer to "who is driving this server", for the pairing UI. */
+  private agentIdentity(): AgentIdentity {
+    return buildAgentIdentity({
+      port: this.port,
+      serverVersion: this.serverVersion,
+      startedAt: this.startedAt,
+      clientInfo: this.clientInfoSource?.(),
+    });
+  }
+
+  setClientInfoSource(fn: () => { name?: string; version?: string; title?: string } | undefined): void {
+    this.clientInfoSource = fn;
+  }
+
+  /**
+   * Pushes a refreshed identity to an already-connected extension. The bridge
+   * usually finishes its handshake before the agent client has introduced
+   * itself, so without this the panel would keep showing the first guess.
+   */
+  refreshIdentity(): void {
+    const agent = this.agentIdentity();
+    this.log(`agent identified: ${agent.name}${agent.version ? ` ${agent.version}` : ''}`);
+    if (this.isConnected()) {
+      void this.sendSealed(this.session!.sessionKey!, { type: 'agent_identity', agent });
+    }
   }
 
   /**
@@ -178,7 +219,15 @@ export class Bridge {
 
         try {
           if (frame.t === 'hello') {
-            if (frame.v !== HANDSHAKE_VERSION) return fail(`unsupported version ${frame.v}`);
+            if (frame.v !== HANDSHAKE_VERSION) {
+              // Say which side is behind. "unsupported version 1" sent people
+              // hunting for a crypto fault instead of running an update.
+              const who = frame.v < HANDSHAKE_VERSION ? 'browser extension' : 'onbridge MCP server';
+              return fail(
+                `handshake version mismatch (extension speaks v${frame.v}, server speaks ` +
+                  `v${HANDSHAKE_VERSION}) — update the ${who}`,
+              );
+            }
 
             const shared = await deriveSharedSecret(kp.privateKey, frame.ePub);
             const { handshakeKey, pairingSecret } = await deriveHandshakeKeys(
@@ -218,11 +267,15 @@ export class Bridge {
             if (known) {
               const nonce = toB64(randomBytes(16));
               this.session.challengeNonce = nonce;
-              await this.sendSealed(this.session.handshakeKey, { t: 'challenge', nonce });
+              await this.sendSealed(this.session.handshakeKey, {
+                t: 'challenge',
+                nonce,
+                agent: this.agentIdentity(),
+              });
             } else {
               await this.sendSealed(this.session.handshakeKey, {
                 t: 'pair_required',
-                agentName: getAgentName(),
+                agent: this.agentIdentity(),
               });
             }
             return;
@@ -295,7 +348,10 @@ export class Bridge {
         const { pairingSecret } = await deriveHandshakeKeys(s.shared, s.eNonce, s.sNonce);
         s.pairingSecret = pairingSecret;
         s.state = 'pairing';
-        return this.sendSealed(s.handshakeKey, { t: 'pair_required', agentName: getAgentName() });
+        return this.sendSealed(s.handshakeKey, {
+          t: 'pair_required',
+          agent: this.agentIdentity(),
+        });
       }
       if (hs.t !== 'auth') return fail(`expected auth, got ${hs.t}`);
       const ok = await verifyProof(

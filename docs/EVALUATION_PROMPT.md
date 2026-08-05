@@ -7,7 +7,9 @@ Paste everything below the line into a fresh agent session that has the
 
 1. Open the onbridge side panel and turn on **Control Mode**. Approve the pairing
    prompt when it appears.
-2. Set **Access scope** to **All**.
+2. Set **Grant on approval** to **All**, then press **Give this agent control**.
+   Until you do, the agent is connected but controls nothing and every command
+   is refused — that is by design, not a fault.
 3. Set **Approvals** to **Bypass**. This is what makes the run unattended — the
    agent will not stall waiting for you. Bypass reverts to Balanced by itself
    after 60 minutes and on browser restart.
@@ -89,8 +91,8 @@ for the end.
 
 ## Phase 0 — Preflight
 
-1. Call `bridge_status`. Record: connected? approval mode? access scope? input
-   fidelity degraded?
+1. Call `bridge_status`. Record: connected? approval mode? what scope were you
+   granted? input fidelity degraded? which other agents are connected?
 2. **Stop if it reports `DEGRADED`** — say so at the top of your report and note
    that all input results are suspect. Continue anyway, but flag it.
 3. Call `tools/list` (or inspect your available tools). Record how many onbridge
