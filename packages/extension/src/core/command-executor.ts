@@ -5,6 +5,13 @@ export class CommandExecutor {
   async execute(action: string, params: Record<string, unknown>): Promise<unknown> {
     switch (action) {
       case 'snapshot':
+        // The background knows this frame's Chrome frame id; the frame itself
+        // does not. Stamping it on the document is what later lets CDP pick the
+        // matching execution context, so a ref inside an iframe can be resolved
+        // in its own frame instead of being unreachable from the top one.
+        if (typeof params.frameId === 'number') {
+          document.documentElement.setAttribute('data-onbridge-frame', String(params.frameId));
+        }
         return captureSnapshot(params.target as number | undefined, params.depth as number | undefined, params.compact as boolean | undefined);
 
       case 'find': {

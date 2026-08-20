@@ -16,11 +16,19 @@ import { fileURLToPath } from 'node:url';
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const EXT = join(ROOT, 'packages/extension/.output/chrome-mv3');
 
-const FRAME = `<!doctype html><html><body>
-<button id="fbtn">Inside the iframe</button>
+/**
+ * Served same-origin at /frame and cross-origin from a second port. A
+ * cross-origin iframe is an out-of-process frame, so it is the case that cannot
+ * be reached from the parent document by any means other than CDP.
+ */
+const FRAME = (label) => `<!doctype html><html><body>
+<button id="fbtn">Inside the ${label} iframe</button>
+<input id="finp" placeholder="frame input">
 <script>
+  window.__frameSecret = '${label}-main-world';
   window.__frameLog = [];
-  fbtn.addEventListener('click', () => __frameLog.push('clicked'));
+  fbtn.addEventListener('click', e => __frameLog.push({t:'click', trusted:e.isTrusted}));
+  finp.addEventListener('input', e => __frameLog.push({t:'input', trusted:e.isTrusted, value:e.target.value}));
 </script></body></html>`;
 
 const PAGE = `<!doctype html><html><body>
@@ -30,7 +38,8 @@ const PAGE = `<!doctype html><html><body>
 <input id="inp" placeholder="type here">
 
 <my-widget></my-widget>
-<iframe id="frame" src="/frame" width="300" height="120"></iframe>
+<iframe id="frame" src="/frame" width="300" height="140"></iframe>
+<iframe id="xframe" src="http://localhost:8932/frame" width="300" height="140"></iframe>
 
 <table>
   <tr><th>Item</th><th>Price</th></tr>
@@ -74,10 +83,18 @@ async function main() {
   // ── static test page ────────────────────────────────────────────────
   const http = createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/html' });
-    res.end(req.url === '/frame' ? FRAME : PAGE);
+    res.end(req.url === '/frame' ? FRAME('same-origin') : PAGE);
   });
   await new Promise((r) => http.listen(8931, '127.0.0.1', r));
   const PAGE_URL = 'http://127.0.0.1:8931/';
+
+  // A different port is a different origin, which is what forces Chrome to put
+  // this frame in its own process.
+  const xhttp = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(FRAME('cross-origin'));
+  });
+  await new Promise((r) => xhttp.listen(8932, 'localhost', r));
 
   // ── MCP server ──────────────────────────────────────────────────────
   const home = mkdtempSync(join(tmpdir(), 'onbridge-browser-'));
@@ -257,18 +274,64 @@ async function main() {
     }
 
     // ── iframes ──────────────────────────────────────────────────────
-    const frameRef = /\[button:(\d+)\][^\n]*Inside the iframe/.exec(snapText)?.[1];
-    if (!frameRef) {
-      bad('iframe content appears in the snapshot');
-    } else {
-      ok('iframe content appears in the snapshot');
-      await call('click', { ref: Number(frameRef) });
+    // The trust assertion is the point. The old check only asked whether a click
+    // registered, which the synthetic fallback also satisfies — so it passed
+    // throughout the entire period iframe input was untrusted.
+    for (const [label, host] of [['same-origin', '127.0.0.1:8931'], ['cross-origin', 'localhost:8932']]) {
+      const re = new RegExp(`\\[button:(\\d+)\\][^\\n]*Inside the ${label} iframe`);
+      const m = re.exec(snapText);
+      if (!m) {
+        bad(`${label} iframe content appears in the snapshot`);
+        continue;
+      }
+      ok(`${label} iframe content appears in the snapshot`);
+      const bref = Number(m[1]);
+      // The frame's own input is the first textbox after its button, which keeps
+      // the two identically-shaped frames from being confused for each other.
+      const inpRef = /\[textbox:(\d+)\]/.exec(snapText.slice(m.index))?.[1];
+
+      const frameEl = page.frames().find((f) => f.url() === `http://${host}/frame`);
+      if (!frameEl) {
+        bad(`${label} iframe located`, 'frame not found in the page');
+        continue;
+      }
+
+      const clickRes = await call('click', { ref: bref });
       await page.waitForTimeout(400);
-      const frameEl = page.frames().find((f) => f.url().endsWith('/frame'));
-      const frameClicks = frameEl ? await frameEl.evaluate(() => window.__frameLog) : [];
-      frameClicks.length
-        ? ok('element inside an iframe is clickable')
-        : bad('iframe element clickable', 'no click registered in the frame');
+      const log = await frameEl.evaluate(() => window.__frameLog);
+      const click = log.find((e) => e.t === 'click');
+      if (!click) {
+        bad(`${label} iframe element is clickable`, textOf(clickRes).slice(0, 200));
+      } else if (!click.trusted) {
+        bad(`${label} iframe click is trusted`, 'isTrusted was false — synthetic fallback');
+      } else {
+        ok(`${label} iframe click is trusted`);
+      }
+
+      // Typing must land in the frame's own input, not the top document's.
+      if (inpRef == null) {
+        bad(`${label} iframe input found in the snapshot`);
+      } else {
+        const typeRes = await call('type', { ref: Number(inpRef), text: 'typed' });
+        await page.waitForTimeout(400);
+        const typed = (await frameEl.evaluate(() => window.__frameLog))
+          .filter((e) => e.t === 'input')
+          .pop();
+        typed?.trusted && typed.value === 'typed'
+          ? ok(`${label} iframe accepts trusted typing`)
+          : bad(`${label} iframe trusted typing`, JSON.stringify(typed ?? textOf(typeRes).slice(0, 160)));
+      }
+
+      // evaluate must run in THAT frame's main world — reading a page global is
+      // the only way to tell a real main-world context from an isolated one.
+      // It is a sensitive action, so it gates on approval like any other.
+      const evP = call('evaluate', { ref: bref, script: 'return window.__frameSecret' });
+      await page.waitForTimeout(700);
+      await send({ type: 'resolve_approval', allow: true });
+      const evText = textOf(await evP);
+      evText.includes(`${label}-main-world`)
+        ? ok(`${label} iframe evaluate runs in that frame's main world`)
+        : bad(`${label} iframe evaluate scope`, evText.slice(0, 160));
     }
 
     // ── approval modes ───────────────────────────────────────────────
@@ -443,6 +506,15 @@ async function main() {
   let srv2;
   const home2 = mkdtempSync(join(tmpdir(), 'onbridge-browser2-'));
   if (paired) {
+    // Wait for the anti-nuisance window to close before starting the second
+    // agent, so this exercises the case that actually bites — an agent started
+    // well after control mode was switched on — instead of depending on how long
+    // the preceding tests happened to take.
+    for (let i = 0; i < 90; i++) {
+      const st = await send({ type: 'get_status' });
+      if (st?.pairWindowOpen === false) break;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
     srv2 = spawn('node', [join(ROOT, 'packages/mcp-server/dist/index.js')], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, ONBRIDGE_HOME: home2, ONBRIDGE_AGENT_NAME: 'Second Agent' },
@@ -485,19 +557,37 @@ async function main() {
 
     // Pair and grant the second agent. It must appear as a distinct session.
     let sess2 = null;
-    for (let i = 0; i < 60; i++) {
+    let lastSeen = [];
+    let sawBlocked = false;
+    // A port that failed a probe backs off for 20s before it is retried, and the
+    // sweep itself runs every 10s — so a newly started agent can take about half
+    // a minute to be noticed. Poll well past that rather than racing it.
+    for (let i = 0; i < 120; i++) {
       const st = await send({ type: 'get_status' });
+      // New agents are only accepted shortly after the user turns control mode
+      // on. By now that window has long lapsed, which is exactly the situation a
+      // user hits when they start a second agent mid-session: the panel must say
+      // so and offer a way in, rather than leaving it silently unable to connect.
+      if (st?.pairBlocked) {
+        sawBlocked = true;
+        await send({ type: 'arm_pairing' });
+      }
       if (st?.pairRequest) await send({ type: 'resolve_pairing', allow: true });
+      lastSeen = (st?.sessions ?? []).map((x) => `${x.agent?.name ?? '?'}:${x.status}@${x.port}`);
       const found = (st?.sessions ?? []).find(
         (s) => s.agent?.name === 'Second Agent' && (s.status === 'on_hold' || s.status === 'active'),
       );
       if (found) { sess2 = found; break; }
-      await new Promise((r) => setTimeout(r, 250));
+      await new Promise((r) => setTimeout(r, 500));
     }
+
+    sawBlocked
+      ? ok('a late-arriving agent is reported, not silently refused')
+      : bad('late pairing surfaced', 'pairBlocked was never set — the refusal was silent');
 
     sess2
       ? ok('a second agent is discovered as its own session')
-      : bad('second agent discovered', 'never appeared');
+      : bad('second agent discovered', `sessions seen: [${lastSeen.join(', ')}]`);
 
     if (sess2) {
       const both = await send({ type: 'get_status' });
@@ -575,6 +665,7 @@ async function main() {
   srv2?.kill();
   rmSync(home2, { recursive: true, force: true });
   http.close();
+  xhttp.close();
   rmSync(home, { recursive: true, force: true });
   rmSync(profile, { recursive: true, force: true });
 

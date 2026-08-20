@@ -51,6 +51,15 @@ export default defineBackground(() => {
 
   /** Set when the user flips control mode on — gates the pairing prompt. */
   let controlEnabledAt = 0;
+  /**
+   * A pairing prompt suppressed by the anti-nuisance window.
+   *
+   * Refusing silently is right for a background process trying to nag, and wrong
+   * for the case that actually happens: the user starts a second agent an hour
+   * into a session, and it never connects with no reason given anywhere. Keeping
+   * the last refusal lets the panel say so and offer a deliberate way in.
+   */
+  let pairBlocked: { name: string; port: number; at: number } | null = null;
   let pairRequest:
     | {
         agent: AgentIdentity;
@@ -206,6 +215,8 @@ export default defineBackground(() => {
    */
   function requestPairing(agent: AgentIdentity, port: number): Promise<boolean> {
     if (Date.now() - controlEnabledAt > PAIR_WINDOW_MS) {
+      pairBlocked = { name: agent.name, port, at: Date.now() };
+      updateBadge('pair');
       return Promise.resolve(false);
     }
     if (pairRequest) pairRequest.resolve(false);
@@ -531,7 +542,12 @@ export default defineBackground(() => {
     const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab found');
 
-    const snap = (await routeToContentScript('snapshot', params, targetTabId, 0)) as PageSnapshot;
+    const snap = (await routeToContentScript(
+      'snapshot',
+      { ...params, frameId: 0 },
+      targetTabId,
+      0,
+    )) as PageSnapshot;
     const map = new Map<number, FrameRef>();
     globalRefCounter = 0;
     remapTree(snap.tree, 0, map);
@@ -550,7 +566,7 @@ export default defineBackground(() => {
       try {
         const sub = (await routeToContentScript(
           'snapshot',
-          params,
+          { ...params, frameId: frame.frameId },
           targetTabId,
           frame.frameId,
         )) as PageSnapshot;
@@ -676,22 +692,20 @@ export default defineBackground(() => {
     const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab found');
 
-    // CDP's main-world evaluate cannot resolve a ref inside a child frame, so
-    // iframe interaction goes through that frame's content script. Those events
-    // are synthetic, which some embedded widgets will ignore.
-    if (frameId !== 0) return routeToContentScript(action, params, targetTabId, frameId);
-
     try {
       switch (action) {
         case 'type':
-          await trusted.typeText(targetTabId, params.ref as number, String(params.text ?? ''), {
-            clear: Boolean(params.clear),
-            submit: Boolean(params.submit),
-          });
+          await trusted.typeText(
+            targetTabId,
+            params.ref as number,
+            String(params.text ?? ''),
+            { clear: Boolean(params.clear), submit: Boolean(params.submit) },
+            frameId,
+          );
           return { success: true, trusted: true };
 
         case 'hover':
-          await trusted.hover(targetTabId, params.ref as number);
+          await trusted.hover(targetTabId, params.ref as number, frameId);
           return { success: true, trusted: true };
 
         case 'press_key':
@@ -703,7 +717,12 @@ export default defineBackground(() => {
           return { success: true, trusted: true };
 
         case 'drag':
-          await trusted.dragAndDrop(targetTabId, params.fromRef as number, params.toRef as number);
+          await trusted.dragAndDrop(
+            targetTabId,
+            params.fromRef as number,
+            params.toRef as number,
+            frameId,
+          );
           return { success: true, trusted: true };
 
         case 'evaluate':
@@ -712,6 +731,7 @@ export default defineBackground(() => {
               targetTabId,
               String(params.script ?? ''),
               params.ref as number | undefined,
+              frameId,
             ),
           };
       }
@@ -720,7 +740,7 @@ export default defineBackground(() => {
       degraded = err.message;
     }
 
-    return routeToContentScript(action, params, targetTabId);
+    return routeToContentScript(action, params, targetTabId, frameId);
   }
 
   /**
@@ -734,18 +754,18 @@ export default defineBackground(() => {
     tabId: number,
     frameId = 0,
   ): Promise<unknown> {
-    // A ref inside an iframe is not resolvable from the main world; that frame's
-    // content script handles it with synthetic events instead.
-    if (frameId !== 0) return routeToContentScript(action, params, tabId, frameId);
-
     try {
       let ref = params.ref as number | undefined;
 
       if (action === 'click_by_text') {
+        // `click_by_text` carries no ref, so `localiseRefs` cannot tell which
+        // frame it means. Text is resolved in the top frame, and the resulting
+        // ref is therefore a top-frame ref.
         const matches = (await routeToContentScript(
           'find',
           { text: params.text, role: params.role },
           tabId,
+          frameId,
         )) as Array<{ ref: number }>;
         if (!matches?.length) throw new Error(`No element found with text "${params.text}"`);
         ref = matches[Math.min((params.index as number) ?? 0, matches.length - 1)]?.ref;
@@ -753,11 +773,16 @@ export default defineBackground(() => {
 
       if (ref == null) throw new Error('No element ref to click');
 
-      await trusted.click(tabId, ref, {
-        button: params.button as string | undefined,
-        doubleClick: Boolean(params.doubleClick),
-        modifiers: params.modifiers as string[] | undefined,
-      });
+      await trusted.click(
+        tabId,
+        ref,
+        {
+          button: params.button as string | undefined,
+          doubleClick: Boolean(params.doubleClick),
+          modifiers: params.modifiers as string[] | undefined,
+        },
+        frameId,
+      );
       return { success: true, trusted: true };
     } catch (err) {
       if (!(err instanceof CdpUnavailable)) throw err;
@@ -843,7 +868,7 @@ export default defineBackground(() => {
       logs: logs.slice(-100),
       note: logs.length
         ? undefined
-        : 'No console output captured yet. Capture starts when this tool is first called, so reload the page to see load-time messages.',
+        : 'No console output captured yet. Capture starts when onbridge first attaches to the tab, so messages logged before that — including at page load — are not recorded. Reload the page to see them.',
     };
   }
 
@@ -1330,6 +1355,11 @@ export default defineBackground(() => {
               askedAt: approvalRequest.askedAt,
             }
           : null,
+        pairBlocked,
+        // Whether a newly-appearing agent would be offered to the user at all.
+        // Once this closes, a new agent cannot get in without a deliberate
+        // gesture, which is worth being able to see rather than infer.
+        pairWindowOpen: controlMode && Date.now() - controlEnabledAt <= PAIR_WINDOW_MS,
         pairRequest: pairRequest
           ? {
               port: pairRequest.port,
@@ -1479,6 +1509,21 @@ export default defineBackground(() => {
       return true;
     }
 
+    /**
+     * Re-opens the pairing window on an explicit user gesture.
+     *
+     * This is the only way back in once the window has lapsed, and it is
+     * deliberately a click in the extension's own UI: that is what separates a
+     * user who wants a second agent from a process trying to nag them.
+     */
+    if (message?.type === 'arm_pairing') {
+      controlEnabledAt = Date.now();
+      pairBlocked = null;
+      updateBadge(controlMode ? 'on' : 'off');
+      sendResponse({ ok: true });
+      return true;
+    }
+
     if (message?.type === 'resolve_pairing') {
       resolvePairing(Boolean(message.allow));
       sendResponse({ ok: true });
@@ -1498,6 +1543,7 @@ export default defineBackground(() => {
       chrome.storage.local.set({ controlMode });
       if (controlMode) {
         controlEnabledAt = Date.now();
+        pairBlocked = null;
         manager.start();
       } else {
         disconnect();

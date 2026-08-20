@@ -90,6 +90,7 @@ interface Status {
     askedAt: number;
   } | null;
   pairRequest: { port: number; agent: AgentInfo } | null;
+  pairBlocked: { name: string; port: number; at: number } | null;
   askRequest: { question: string; options?: string[]; askedAt: number } | null;
   lastAction: string;
   activityLog: ActivityEntry[];
@@ -109,6 +110,7 @@ const EMPTY: Status = {
   yoloExpiresAt: 0,
   approvalRequest: null,
   pairRequest: null,
+  pairBlocked: null,
   askRequest: null,
   lastAction: '',
   activityLog: [],
@@ -260,6 +262,27 @@ export default function App() {
                 Deny
               </button>
             </div>
+          </div>
+        )}
+
+        {/* ── Pairing refused because the window had lapsed ── */}
+        {!status.pairRequest && status.pairBlocked && (
+          <div className="m-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
+            <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-amber-300">
+              <ClockIcon className="h-3.5 w-3.5" /> A new agent tried to connect
+            </div>
+            <p className="mb-3 text-xs text-neutral-400">
+              <span className="font-medium text-neutral-200">{status.pairBlocked.name}</span> asked
+              to pair on port {status.pairBlocked.port}, but new agents are only accepted for a
+              short window after you turn Control Mode on — so nothing can nag you for access while
+              you are not looking. Accept new agents again if you started this one.
+            </p>
+            <button
+              onClick={() => act({ type: 'arm_pairing' })}
+              className="w-full rounded-md bg-amber-500 py-2 font-medium text-neutral-900 transition-colors hover:bg-amber-400"
+            >
+              Accept new agents for 60s
+            </button>
           </div>
         )}
 

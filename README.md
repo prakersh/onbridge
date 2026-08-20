@@ -168,7 +168,9 @@ Notes worth knowing:
 
 - `extract_text` is the cheap way to *read* a page (tables come back as markdown). `snapshot` is for *acting* on one.
 - `list_actions` answers "what can I do here?" for a fraction of a snapshot.
-- Shadow DOM and iframes are captured. Refs are frame-qualified automatically.
+- Shadow DOM and iframes are captured. Refs are frame-qualified automatically, and
+  clicks and typing inside an iframe are real trusted input — including
+  cross-origin frames, which run in their own process.
 - A lost ref is re-resolved from a recorded locator instead of failing outright.
 - `click` reports whether the page actually changed, so you can tell a real click from one that hit nothing.
 
