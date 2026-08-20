@@ -115,14 +115,14 @@ jobs:
           body: |
             ## OnBridge v${{ steps.version.outputs.version }}
 
-            ### 📦 Artifacts
+            ### Artifacts
 
             | Artifact | Description |
             |---|---|
             | `onbridge-mcp-server-v${{ steps.version.outputs.version }}.tar.gz` | MCP server — install via `npx onbridge` or extract and run |
             | `onbridge-extension-v${{ steps.version.outputs.version }}.zip` | Chrome extension (MV3) — load unpacked in `chrome://extensions/` |
 
-            ### 🚀 Quick Start
+            ### Quick Start
 
             ```bash
             # MCP Server (after npm publish)
