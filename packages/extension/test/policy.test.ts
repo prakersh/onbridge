@@ -1,13 +1,23 @@
 import { describe, it, expect } from 'vitest';
+import { ALL_COMMAND_ACTIONS } from '@onbridge/shared';
 import {
   classify,
   evaluatePolicy,
+  destinationUrls,
+  firstDomainDenial,
+  originOf,
   DEFAULT_POLICY,
   DESTRUCTIVE_TEXT,
   MODE_APPROVALS,
   type ApprovalMode,
   type Policy,
 } from '../src/core/policy.js';
+
+/** Actions that genuinely belong in the `write` class, for the coverage check. */
+const WRITE_ACTIONS = new Set([
+  'click', 'click_by_text', 'type', 'fill_form', 'select', 'hover', 'scroll',
+  'press_key', 'drag', 'dismiss_modal',
+]);
 
 describe('risk classification', () => {
   it('treats observation as read', () => {
@@ -162,5 +172,62 @@ describe('approval requirements', () => {
     const d = evaluatePolicy(DEFAULT_POLICY, 'destructive', 'https://x.com/', 'click');
     expect(d.verdict).toBe('approve');
     if (d.verdict === 'approve') expect(d.reason.length).toBeGreaterThan(10);
+  });
+});
+
+describe('classification coverage', () => {
+  it('classifies every action the bridge can carry', () => {
+    // `extract_text`, `list_actions` and `highlight` were in no set at all, so
+    // they fell through to the write default and asked for approval in strict
+    // mode. Enumerating the union is what makes that visible instead of silent.
+    const unclassified = ALL_COMMAND_ACTIONS.filter((a) => classify(a) === 'write' && !WRITE_ACTIONS.has(a));
+    expect(unclassified).toEqual([]);
+  });
+
+  it('keeps read-only tools out of the approval path', () => {
+    for (const a of ['extract_text', 'list_actions', 'highlight']) {
+      expect(classify(a), a).toBe('read');
+    }
+  });
+});
+
+describe('domain lists cover where a command goes, not just where it starts', () => {
+  const denied: Policy = { ...DEFAULT_POLICY, denylist: ['evil.test'] };
+  const allowed: Policy = { ...DEFAULT_POLICY, allowlist: ['work.test'] };
+
+  it('reads the destination out of a navigation command', () => {
+    expect(destinationUrls('navigate', { url: 'https://evil.test/x' })).toEqual([
+      'https://evil.test/x',
+    ]);
+    expect(destinationUrls('click', { ref: 3 })).toEqual([]);
+  });
+
+  it('blocks navigating to a denied site from an allowed one', () => {
+    // The gap this closes: judging `navigate` only by the tab's *current* URL
+    // let the agent reach any denylisted site in one call. The page loads, its
+    // scripts run, and its content comes back — the denial arrived too late to
+    // mean anything.
+    const urls = ['https://fine.test/', ...destinationUrls('navigate', { url: 'https://evil.test/' })];
+    expect(firstDomainDenial(denied, urls, 'navigate', 'navigate')).toMatch(/blocked list/);
+  });
+
+  it('blocks opening a tab outside the allowlist', () => {
+    const urls = ['https://work.test/', ...destinationUrls('new_tab', { url: 'https://elsewhere.test/' })];
+    expect(firstDomainDenial(allowed, urls, 'navigate', 'new_tab')).toMatch(/not on the allowed list/);
+  });
+
+  it('still allows a destination that passes', () => {
+    const urls = ['https://work.test/a', ...destinationUrls('navigate', { url: 'https://work.test/b' })];
+    expect(firstDomainDenial(allowed, urls, 'navigate', 'navigate')).toBeNull();
+  });
+});
+
+describe('approval is bound to the origin it was granted for', () => {
+  it('notices a page that moved while the user was deciding', () => {
+    // An approval can sit on screen for minutes and a page is free to redirect
+    // underneath it. Same origin is the test for "the answer still applies".
+    expect(originOf('https://shop.test/cart')).toBe(originOf('https://shop.test/checkout'));
+    expect(originOf('https://shop.test/cart')).not.toBe(originOf('https://attacker.test/'));
+    expect(originOf('not a url')).toBe('');
   });
 });

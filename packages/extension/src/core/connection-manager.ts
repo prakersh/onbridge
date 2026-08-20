@@ -82,7 +82,7 @@ interface Entry {
 
 export interface ManagerHooks {
   /** Ask the user to approve first contact with this agent. */
-  onPairRequest: (agent: AgentIdentity, port: number) => Promise<boolean>;
+  onPairRequest: (agent: AgentIdentity, port: number, opts: { wasPaired: boolean }) => Promise<boolean>;
   /** A command arrived from an agent that currently holds territory. */
   onCommand: (session: AgentSession, msg: ServerMessage) => void;
   /** Anything the panel should redraw for. */
@@ -183,11 +183,11 @@ export class ConnectionManager {
     };
 
     const client = new SecureClient(port, {
-      onPairRequest: (agent) => {
+      onPairRequest: (agent, opts) => {
         session.status = 'pending_approval';
         session.identity = agent;
         this.hooks.onChange();
-        return this.hooks.onPairRequest(agent, port);
+        return this.hooks.onPairRequest(agent, port, opts);
       },
       onIdentity: (agent) => {
         session.identity = agent;

@@ -1,6 +1,7 @@
 export type { DomNode, PageSnapshot, FindResult, ScrollState } from './dom-types.js';
 export type { ServerMessage, ExtensionMessage, CommandAction } from './protocol.js';
 export {
+  ALL_COMMAND_ACTIONS,
   WS_PORT,
   WS_PORT_RANGE,
   HEARTBEAT_INTERVAL_MS,

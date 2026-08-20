@@ -180,7 +180,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('get_url')) as { url: string; title: string };
-        return text(bridge, `${data.title}\n${data.url}`);
+        return pageText(bridge, `${data.title}\n${data.url}`, 'Page-reported title and URL:');
       } catch (err) {
         return error(err);
       }

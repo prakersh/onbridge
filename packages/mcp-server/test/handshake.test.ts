@@ -35,7 +35,8 @@ import {
 } from '@onbridge/shared';
 import type { AgentIdentity } from '@onbridge/shared';
 
-const EXT_ORIGIN = 'chrome-extension://testextensionid';
+const EXT_ID = 'testextensionid';
+const EXT_ORIGIN = `chrome-extension://${EXT_ID}`;
 const SERVER = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 
 let srv: ChildProcess;
@@ -243,7 +244,7 @@ function handshake(
         JSON.stringify({
           t: 'hello',
           v: HANDSHAKE_VERSION,
-          extId: 'testext',
+          extId: EXT_ID,
           ePub: kp.publicKeyB64,
           eNonce,
         }),

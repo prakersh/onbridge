@@ -22,7 +22,7 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
         const lines = data.map(
           (t) => `${t.active ? '→ ' : '  '}[${t.id}] ${t.title} (${t.url})`,
         );
-        return text(bridge, lines.join('\n'));
+        return pageText(bridge, lines.join('\n'), 'Open tabs. Titles and URLs are reported by the pages themselves:');
       } catch (err) {
         return error(err);
       }
@@ -41,7 +41,7 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('switch_tab', { tabId })) as { url: string; title: string };
-        return text(bridge, `Switched to: ${data.title} (${data.url})`);
+        return pageText(bridge, `${data.title}\n${data.url}`, 'Switched tab. Page-reported title and URL:');
       } catch (err) {
         return error(err);
       }
@@ -60,7 +60,7 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('new_tab', { url })) as { tabId: number; url: string; title: string };
-        return text(bridge, `Opened tab [${data.tabId}]: ${data.title} (${data.url})`);
+        return pageText(bridge, `${data.title}\n${data.url}`, `Opened tab [${data.tabId}]. Page-reported title and URL:`);
       } catch (err) {
         return error(err);
       }

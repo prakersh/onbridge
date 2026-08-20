@@ -12,6 +12,12 @@ const READ = new Set([
   'snapshot', 'find', 'get_text', 'get_url', 'screenshot', 'dom_query',
   'list_tabs', 'console_logs', 'activity_log', 'list_downloads', 'wait',
   'bridge_status', 'ask_user',
+  // Read-only, and previously in no set at all — so they fell through to the
+  // `write` default and asked for approval in strict mode. Prompting for a
+  // highlight is exactly the noise that teaches people to click Allow without
+  // reading, which costs more than it buys. `scope.test.ts` now checks that
+  // every action in ALL_COMMAND_ACTIONS lands in a set deliberately.
+  'extract_text', 'list_actions', 'highlight',
 ]);
 
 const NAVIGATE = new Set(['navigate', 'back', 'forward', 'reload', 'new_tab', 'switch_tab', 'close_tab']);
@@ -150,4 +156,47 @@ export function evaluatePolicy(
   }
 
   return { verdict: 'allow' };
+}
+
+/**
+ * URLs a command names as a destination, drawn from its own parameters.
+ *
+ * Kept separate from "where the browser currently is", because the two answer
+ * different questions and only one of them used to be asked. A `navigate` whose
+ * destination is never checked means a denylist cannot stop the agent reaching a
+ * site — only stop it acting once the page has already loaded and run.
+ */
+export function destinationUrls(action: string, params: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  // `navigate`, `new_tab` and `download_file` all carry their target here.
+  if (typeof params.url === 'string' && params.url) out.push(params.url);
+  return out;
+}
+
+/**
+ * First domain-list refusal across every URL in play, or null if all are fine.
+ *
+ * Domain lists are user configuration rather than a risk heuristic, so a single
+ * denied URL anywhere in the command's reach is enough to refuse it.
+ */
+export function firstDomainDenial(
+  policy: Policy,
+  urls: string[],
+  risk: RiskClass,
+  action: string,
+): string | null {
+  for (const url of urls) {
+    const d = evaluatePolicy(policy, risk, url, action);
+    if (d.verdict === 'deny') return d.reason;
+  }
+  return null;
+}
+
+/** Origin of a URL, or '' when it has none. Used to spot mid-approval drift. */
+export function originOf(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return '';
+  }
 }

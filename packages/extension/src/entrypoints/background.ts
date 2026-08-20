@@ -26,6 +26,9 @@ import * as trusted from '../core/trusted-input.js';
 import {
   classify,
   evaluatePolicy,
+  destinationUrls,
+  firstDomainDenial,
+  originOf,
   DEFAULT_POLICY,
   YOLO_TIMEOUT_MINUTES,
   type ApprovalMode,
@@ -66,6 +69,8 @@ export default defineBackground(() => {
         port: number;
         resolve: (ok: boolean) => void;
         timer: ReturnType<typeof setTimeout>;
+        /** This server forgot a pairing we still hold — see `onPairRequest`. */
+        wasPaired: boolean;
       }
     | null = null;
 
@@ -167,7 +172,7 @@ export default defineBackground(() => {
     }
 
     if (!scopeAllows(scope, tabId, windowId!)) {
-      throw new Error(
+      throw refusal(
         `Access denied: this agent controls ${describeScope(scope)} and tab ${tabId} is ` +
           'outside it. Another agent may be driving that window.',
       );
@@ -213,7 +218,11 @@ export default defineBackground(() => {
    * Surfaces the Allow/Deny prompt. Resolves false unless the user actively
    * allows — an unanswered prompt is a denial, never a default-yes.
    */
-  function requestPairing(agent: AgentIdentity, port: number): Promise<boolean> {
+  function requestPairing(
+    agent: AgentIdentity,
+    port: number,
+    opts: { wasPaired: boolean } = { wasPaired: false },
+  ): Promise<boolean> {
     if (Date.now() - controlEnabledAt > PAIR_WINDOW_MS) {
       pairBlocked = { name: agent.name, port, at: Date.now() };
       updateBadge('pair');
@@ -227,7 +236,7 @@ export default defineBackground(() => {
         resolve(false);
       }, PAIR_PROMPT_TTL_MS);
 
-      pairRequest = { agent, port, resolve, timer };
+      pairRequest = { agent, port, resolve, timer, wasPaired: opts.wasPaired };
       updateBadge('pair');
     });
   }
@@ -239,6 +248,50 @@ export default defineBackground(() => {
     pairRequest = null;
     resolve(allow);
   }
+
+  /**
+   * Tabs Chrome opened recently, so a command can be asked what it spawned.
+   *
+   * `window.open`, `target="_blank"` and a middle-click all put the new page in
+   * a *different* tab, which the navigation guard would otherwise never look at:
+   * the tab it was watching never moved. Bounded because this is appended to for
+   * the life of the service worker.
+   */
+  const recentlyOpenedTabs: Array<{ tabId: number; at: number }> = [];
+
+  chrome.tabs.onCreated.addListener((tab) => {
+    if (tab.id == null) return;
+    recentlyOpenedTabs.push({ tabId: tab.id, at: Date.now() });
+    if (recentlyOpenedTabs.length > 50) recentlyOpenedTabs.splice(0, recentlyOpenedTabs.length - 50);
+  });
+
+  /**
+   * Navigations the browser has *started*, whether or not they have committed.
+   *
+   * Reading the tab's URL after a command only sees navigations that already
+   * landed. `location.href = …` returns before anything commits, so a poll right
+   * after it still reports the old page and the guard waves it through — the
+   * blocked site then loads a moment later, unwatched. Recording intent as it is
+   * announced removes the race instead of trying to out-wait it.
+   */
+  const recentNavigations: Array<{ tabId: number; url: string; at: number }> = [];
+
+  chrome.webNavigation.onBeforeNavigate.addListener((d) => {
+    if (d.frameId !== 0) return; // sub-frame loads are not the tab moving
+    recentNavigations.push({ tabId: d.tabId, url: d.url, at: Date.now() });
+    if (recentNavigations.length > 100) recentNavigations.splice(0, recentNavigations.length - 100);
+  });
+
+  /**
+   * A refusal onbridge composed, as opposed to a failure carrying page text.
+   *
+   * The distinction is marked at the throw site and carried on the wire, because
+   * the alternative — recognising our own wording downstream — lets a page throw
+   * `new Error("Blocked by user policy: ...")` and be believed.
+   */
+  class TrustedError extends Error {}
+
+  const refusal = (msg: string): TrustedError => new TrustedError(msg);
 
   const manager = new ConnectionManager({
     onPairRequest: requestPairing,
@@ -277,7 +330,16 @@ export default defineBackground(() => {
     } catch (err) {
       const timing = Date.now() - cmdStart;
       const errorMsg = err instanceof Error ? err.message : String(err);
-      response = { type: 'result', id: msg.id, success: false, data: null, error: errorMsg, timing };
+      response = {
+        type: 'result',
+        id: msg.id,
+        success: false,
+        data: null,
+        error: errorMsg,
+        // Anything not deliberately marked is assumed to carry page text.
+        ...(err instanceof TrustedError ? { errorKind: 'trusted' as const } : {}),
+        timing,
+      };
       session.activityLog.unshift({
         action: msg.action,
         summary,
@@ -391,7 +453,7 @@ export default defineBackground(() => {
     }
 
     if (paused) {
-      throw new Error(
+      throw refusal(
         'Automation is paused by the user in the onbridge side panel. Ask them to resume before retrying.',
       );
     }
@@ -416,6 +478,123 @@ export default defineBackground(() => {
       frameId = localised.frameId;
     }
 
+    // Where the tab sat before this command ran.
+    //
+    // Checking the destination the agent *named* covers `navigate` and friends,
+    // and misses the commonest ways a browser actually moves: clicking a link,
+    // pressing Enter in a form, `evaluate` assigning `location`. The domain
+    // lists have to hold however the browser got somewhere, so the outcome is
+    // checked too — see `guardNavigationOutcome`.
+    const urlBefore = targetTabId
+      ? ((await chrome.tabs.get(targetTabId).catch(() => null))?.url ?? '')
+      : '';
+    const startedAt = Date.now();
+
+    try {
+      return await dispatchCommand(session, action, params, tabId, frameId);
+    } finally {
+      // Deliberately in `finally`: an action that navigated somewhere blocked
+      // and then failed for its own reasons still left the browser there, and a
+      // refusal is the more important of the two outcomes to report.
+      await guardNavigationOutcome(targetTabId, urlBefore, action, startedAt);
+    }
+  }
+
+  /**
+   * Refuses to hand back anything from a page the user blocked, however the
+   * browser came to be on it, and puts the tab back where it was.
+   *
+   * Reverting the agent's own navigation is the point: leaving the tab parked on
+   * a blocked page means every later command there is refused too, so the agent
+   * is stuck somewhere it was never allowed to be.
+   */
+  async function guardNavigationOutcome(
+    tabId: number | undefined,
+    urlBefore: string,
+    action: string,
+    startedAt: number,
+  ): Promise<void> {
+    // A page that opened somewhere blocked in a new tab is just as much a way
+    // past the domain lists as navigating this one, and leaves the blocked page
+    // sitting there afterwards. Checked first, because it is the case that
+    // leaves state behind.
+    await guardOpenedTabs(action, startedAt);
+
+    if (!tabId) return;
+
+    // `evaluate` and `press_key` can start a navigation and return before the
+    // browser has announced it — assigning `location`, or Enter submitting a
+    // form. Clicks already wait inside their own handler. Give those two a short
+    // window to declare themselves, exiting the moment one does, so the common
+    // case where nothing navigates costs almost nothing.
+    if (action === 'evaluate' || action === 'press_key') {
+      for (let i = 0; i < 8; i++) {
+        if (recentNavigations.some((n) => n.tabId === tabId && n.at >= startedAt)) break;
+        await new Promise((r) => setTimeout(r, 40));
+      }
+    }
+
+    // Where the tab went or is going: the committed URL, plus anything this
+    // command announced but has not finished loading.
+    const urlAfter = (await chrome.tabs.get(tabId).catch(() => null))?.url ?? '';
+    const started = recentNavigations
+      .filter((n) => n.tabId === tabId && n.at >= startedAt)
+      .map((n) => n.url);
+
+    const candidates = [...started, urlAfter].filter(
+      (u) => u && originOf(u) !== originOf(urlBefore),
+    );
+    if (candidates.length === 0) return;
+
+    const denial = firstDomainDenial(policy, candidates, 'navigate', action);
+    if (!denial) return;
+
+    await chrome.tabs.goBack(tabId).catch(() => {
+      /* no history to go back to; the refusal below still stands */
+    });
+
+    throw refusal(
+      `Blocked by user policy: ${denial} Running "${action}" moved the page there, ` +
+        'so nothing from it is being returned and the tab has been sent back. ' +
+        'Do not try to reach that site another way.',
+    );
+  }
+
+  /** Closes any tab this command opened onto a blocked site, and refuses. */
+  async function guardOpenedTabs(action: string, startedAt: number): Promise<void> {
+    const opened = recentlyOpenedTabs.filter((t) => t.at >= startedAt);
+    if (opened.length === 0) return;
+
+    for (const { tabId } of opened) {
+      // A brand new tab is about:blank for a moment; `pendingUrl` names where it
+      // is going before the load commits, which is what we want to judge.
+      let target = '';
+      for (let i = 0; i < 6 && !target; i++) {
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (!tab) break;
+        target = tab.pendingUrl || (tab.url && tab.url !== 'about:blank' ? tab.url : '');
+        if (!target) await new Promise((r) => setTimeout(r, 80));
+      }
+      if (!target) continue;
+
+      const denial = firstDomainDenial(policy, [target], 'navigate', action);
+      if (!denial) continue;
+
+      await chrome.tabs.remove(tabId).catch(() => {});
+      throw refusal(
+        `Blocked by user policy: ${denial} Running "${action}" opened it in a new tab, ` +
+          'which has been closed. Nothing from that page is being returned.',
+      );
+    }
+  }
+
+  async function dispatchCommand(
+    session: AgentSession,
+    action: string,
+    params: Record<string, unknown>,
+    tabId: number | undefined,
+    frameId: number,
+  ): Promise<unknown> {
     switch (action) {
       case 'snapshot':
         return handleSnapshot(params, tabId);
@@ -606,6 +785,33 @@ export default defineBackground(() => {
   }
 
   /**
+   * Every URL a command would act on or reach.
+   *
+   * The current tab is not the whole story. `navigate` is the case that matters:
+   * checking only where the browser already is means a denylisted site is
+   * reachable in one call — the page loads, its scripts run, and its content
+   * comes back to the agent. The lists then only govern acting *once there*,
+   * which is not what anyone setting a denylist believes they configured.
+   */
+  async function urlsInScopeOf(
+    action: string,
+    params: Record<string, unknown>,
+    currentUrl: string,
+  ): Promise<string[]> {
+    const urls = [currentUrl, ...destinationUrls(action, params)];
+
+    if (action === 'switch_tab' && typeof params.tabId === 'number') {
+      try {
+        urls.push((await chrome.tabs.get(params.tabId)).url ?? '');
+      } catch {
+        /* tab is gone; the handler will report that better than we can */
+      }
+    }
+
+    return urls.filter(Boolean);
+  }
+
+  /**
    * Classifies the command and blocks on the user when policy demands it.
    * Throws for a denial so the refusal travels back to the agent as a tool
    * error, with a reason it can act on rather than a bare failure.
@@ -620,10 +826,14 @@ export default defineBackground(() => {
 
     const label = targetTabId ? await labelForClick(action, params, targetTabId) : undefined;
     const risk = classify(action, label);
-    const decision = evaluatePolicy(policy, risk, url, action);
 
+    const urls = await urlsInScopeOf(action, params, url);
+    const denial = firstDomainDenial(policy, urls, risk, action);
+    if (denial) throw refusal(`Blocked by user policy: ${denial}`);
+
+    const decision = evaluatePolicy(policy, risk, url, action);
     if (decision.verdict === 'allow') return;
-    if (decision.verdict === 'deny') throw new Error(`Blocked by user policy: ${decision.reason}`);
+    if (decision.verdict === 'deny') throw refusal(`Blocked by user policy: ${decision.reason}`);
 
     const detail =
       action === 'navigate'
@@ -636,9 +846,31 @@ export default defineBackground(() => {
 
     const approved = await requestApproval(action, risk, decision.reason, detail, url);
     if (!approved) {
-      throw new Error(
+      throw refusal(
         `The user declined this action (${action}). Do not retry it; ask them what they would like instead.`,
       );
+    }
+
+    // An approval can sit on screen for minutes, and a page is free to redirect
+    // while it does. Without this re-check the user approves an action against
+    // one origin and it executes against another — and the domain decision above
+    // was made against a URL that no longer applies.
+    if (targetTabId) {
+      const nowUrl = (await chrome.tabs.get(targetTabId).catch(() => ({ url: '' })))?.url ?? '';
+      if (originOf(nowUrl) !== originOf(url)) {
+        throw refusal(
+          `The page moved from ${originOf(url) || 'about:blank'} to ${originOf(nowUrl) || 'about:blank'} ` +
+            'while the user was deciding, so the approval no longer applies. ' +
+            'Take a fresh snapshot and ask again if you still need this.',
+        );
+      }
+      const after = firstDomainDenial(
+        policy,
+        await urlsInScopeOf(action, params, nowUrl),
+        risk,
+        action,
+      );
+      if (after) throw refusal(`Blocked by user policy: ${after}`);
     }
   }
 
@@ -1028,7 +1260,7 @@ export default defineBackground(() => {
   ): Promise<{ tabId: number; url: string; title: string }> {
     const scope = session.scope;
     if (!scope || scope.kind === 'tab') {
-      throw new Error(
+      throw refusal(
         'Access denied: this agent controls a single tab, and a new tab would fall outside it. ' +
           'Ask the user to grant window-level control instead.',
       );
@@ -1363,6 +1595,7 @@ export default defineBackground(() => {
         pairRequest: pairRequest
           ? {
               port: pairRequest.port,
+              wasPaired: pairRequest.wasPaired,
               agent: {
                 name: pairRequest.agent.name,
                 version: pairRequest.agent.version,

@@ -36,6 +36,8 @@ const PAGE = `<!doctype html><html><body>
 <button id="btn">Click me</button>
 <button id="danger">Place order &middot; $249</button>
 <input id="inp" placeholder="type here">
+<a id="xlink" href="http://localhost:8932/frame">Go cross-site</a>
+<button id="popbtn" onclick="window.open('http://localhost:8932/frame')">Open cross-site popup</button>
 
 <my-widget></my-widget>
 <iframe id="frame" src="/frame" width="300" height="140"></iframe>
@@ -461,7 +463,100 @@ async function main() {
       ? ok('bypass mode still honours the domain denylist')
       : bad('bypass honours denylist', textOf(blocked).slice(0, 140));
 
+    // The denylist has to stop the agent *reaching* a site, not merely acting
+    // once it is there. Judging `navigate` by the tab's current URL let a
+    // blocked page load, run its scripts, and hand its content back — the
+    // refusal arrived after everything it was meant to prevent.
+    await send({ type: 'set_policy', policy: { denylist: ['localhost'] } });
+    const navBlocked = await call('navigate', { url: `http://localhost:8932/frame` });
+    /Blocked by user policy/.test(textOf(navBlocked))
+      ? ok('denylist blocks navigating to a blocked site')
+      : bad('denylist blocks navigation', textOf(navBlocked).slice(0, 140));
+
+    const stillHere = await call('get_url', {});
+    !/localhost:/.test(textOf(stillHere))
+      ? ok('the blocked navigation never happened')
+      : bad('blocked navigation did not happen', textOf(stillHere).slice(0, 140));
+
+    // A click on a link is how a browser usually moves, and the destination is
+    // nowhere in the command's parameters. Checking only what the agent names
+    // leaves the ordinary path wide open.
+    await send({ type: 'set_policy', policy: { denylist: ['localhost'] } });
+    const linkSnap = await call('find', { text: 'Go cross-site' });
+    const linkRef = /\[link:(\d+)\]/.exec(textOf(linkSnap))?.[1];
+    if (linkRef) {
+      const clicked = await call('click', { ref: Number(linkRef) });
+      /Blocked by user policy/.test(textOf(clicked))
+        ? ok('a click that lands on a blocked site is refused')
+        : bad('click onto blocked site refused', textOf(clicked).slice(0, 160));
+
+      !/localhost:8932/.test(textOf(clicked))
+        ? ok('no content from the blocked page reaches the agent')
+        : bad('blocked page content withheld', textOf(clicked).slice(0, 160));
+
+      await page.waitForTimeout(500);
+      const back = await call('get_url', {});
+      !/localhost:8932/.test(textOf(back))
+        ? ok('the tab is sent back off the blocked page')
+        : bad('tab returned from blocked page', textOf(back).slice(0, 160));
+    } else {
+      bad('found the cross-site link', textOf(linkSnap).slice(0, 160));
+    }
+
+    // The destination lives inside the script string, invisible to any check on
+    // parameters — and in bypass mode evaluate is not gated at all, so this is
+    // the path with the least standing between an agent and a blocked site.
+    const evalNav = await call('evaluate', {
+      script: `location.href = 'http://localhost:8932/frame'; 'went'`,
+    });
+    /Blocked by user policy/.test(textOf(evalNav))
+      ? ok('evaluate assigning location is caught by the domain lists')
+      : bad('evaluate location= blocked', textOf(evalNav).slice(0, 160));
+
+    await page.waitForTimeout(500);
+    const afterEval = await call('get_url', {});
+    !/localhost:8932/.test(textOf(afterEval))
+      ? ok('the tab is sent back after an evaluate navigation')
+      : bad('tab returned after evaluate nav', textOf(afterEval).slice(0, 160));
+
+    // Reverting an interrupted load can leave the tab on a chrome-error page,
+    // which no content script can reach. Restore a known page before continuing.
+    await page.goto(PAGE_URL);
+    await page.waitForTimeout(300);
+
+    // window.open puts the blocked page in a DIFFERENT tab, so the guard
+    // watching this one sees nothing move. Without the opened-tab check the
+    // blocked page simply sits there in the background.
+    const popSnap = await call('find', { text: 'Open cross-site popup' });
+    const popRef = /\[button:(\d+)\]/.exec(textOf(popSnap))?.[1];
+    if (popRef) {
+      const tabsBefore = textOf(await call('list_tabs', {}));
+      const popped = await call('click', { ref: Number(popRef) });
+      /Blocked by user policy/.test(textOf(popped))
+        ? ok('a popup onto a blocked site is refused')
+        : bad('popup onto blocked site refused', textOf(popped).slice(0, 160));
+
+      await page.waitForTimeout(600);
+      const tabsAfter = textOf(await call('list_tabs', {}));
+      !/localhost:8932/.test(tabsAfter)
+        ? ok('the blocked popup tab is closed, not left open')
+        : bad('blocked popup tab closed', tabsAfter.slice(0, 200));
+      void tabsBefore;
+    } else {
+      bad('found the popup button', textOf(popSnap).slice(0, 160));
+    }
+
     await send({ type: 'set_policy', policy: { denylist: [] } });
+    await page.goto(PAGE_URL);
+
+    // An allowlist has to bound destinations the same way.
+    await send({ type: 'set_policy', policy: { denylist: [], allowlist: ['127.0.0.1'] } });
+    const outside = await call('new_tab', { url: `http://localhost:8932/frame` });
+    /Blocked by user policy/.test(textOf(outside))
+      ? ok('allowlist bounds where a new tab may open')
+      : bad('allowlist bounds new_tab', textOf(outside).slice(0, 140));
+
+    await send({ type: 'set_policy', policy: { denylist: [], allowlist: [] } });
     await send({ type: 'set_approval_mode', mode: 'strict' });
 
     // ── strict mode gates an ordinary write ─────────────────────────

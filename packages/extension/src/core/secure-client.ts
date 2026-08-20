@@ -67,8 +67,18 @@ export type ClientState =
   | 'failed';
 
 export interface SecureClientHooks {
-  /** Resolve true to pair. The user must actively choose — never auto-resolve. */
-  onPairRequest: (agent: AgentIdentity) => Promise<boolean>;
+  /**
+   * Resolve true to pair. The user must actively choose — never auto-resolve.
+   *
+   * `wasPaired` means we still hold a secret for this server but it no longer
+   * recognises us. That is the visible trace of a pairing record being reset,
+   * which has an innocent cause (someone cleared `~/.onbridge`) and a hostile
+   * one (another local process claimed our extension id, reset the record and
+   * paired itself). The server cannot tell those apart — it has no way to see
+   * that a human approved anything — so the decision belongs here, in front of
+   * the person, with the anomaly stated rather than swallowed.
+   */
+  onPairRequest: (agent: AgentIdentity, opts: { wasPaired: boolean }) => Promise<boolean>;
   onMessage: (msg: ServerMessage) => void;
   onState: (state: ClientState, detail?: string) => void;
   /** Fired when the agent's identity first arrives, and again if it is refined. */
@@ -118,6 +128,8 @@ export class SecureClient {
   private serverId = '';
   private identity?: AgentIdentity;
   private pendingChallenge?: string;
+  /** See `onPairRequest`: this server forgot a pairing we still hold. */
+  private pairingWasReset = false;
 
   constructor(
     readonly port: number,
@@ -273,6 +285,9 @@ export class SecureClient {
         this.pairingSecret = stored;
         this.setState('authenticating');
       } else {
+        // We hold a secret for this server and it does not know us. Something
+        // dropped its record; the user is told so when we ask them to pair.
+        this.pairingWasReset = Boolean(stored);
         this.pairingSecret = pairingSecret;
         this.setState('pairing');
       }
@@ -301,7 +316,7 @@ export class SecureClient {
 
     if (hs.t === 'pair_required') {
       this.noteIdentity(hs.agent);
-      const allowed = await this.hooks.onPairRequest(hs.agent);
+      const allowed = await this.hooks.onPairRequest(hs.agent, { wasPaired: this.pairingWasReset });
       if (this.disposed) return;
       if (!allowed) {
         await this.sendSealed(ws, this.handshakeKey!, { t: 'pair_denied' });

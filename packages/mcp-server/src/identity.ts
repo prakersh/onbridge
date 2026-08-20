@@ -12,7 +12,7 @@
  * proof, and cannot derive the session key.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -44,9 +44,15 @@ function readJson<T>(path: string, fallback: T): T {
 
 function writeJsonPrivate(path: string, value: unknown): void {
   ensureDir();
-  // mode on writeFileSync only applies at creation, so chmod-on-write is implicit
-  // in the 0o600 flag here for new files; existing files keep their mode.
   writeFileSync(path, JSON.stringify(value, null, 2), { mode: 0o600 });
+  // `mode` on writeFileSync only applies when the file is created, so a file
+  // that already existed keeps whatever permissions it had — including
+  // world-readable ones from an older build. Re-assert them on every write.
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    /* best effort: a read-only home should not stop the server starting */
+  }
 }
 
 export function getServerId(): string {
@@ -159,6 +165,83 @@ function safeCwd(): string | undefined {
     // cwd can be gone if the directory was deleted out from under us.
     return undefined;
   }
+}
+
+/** The set of extension ids we have ever paired with. */
+export function knownExtensionIds(): string[] {
+  return Object.keys(readJson<Record<string, PeerRecord>>(PEERS_FILE, {}));
+}
+
+/** Ids configured explicitly. When present they, not trust-on-first-use, decide. */
+function explicitIds(): string[] {
+  return [
+    process.env.ONBRIDGE_EXTENSION_ID?.trim(),
+    ...(process.env.ONBRIDGE_DEV_EXTENSION_IDS ?? '').split(',').map((s) => s.trim()),
+  ]
+    .filter((v): v is string => Boolean(v))
+    .map((id) => id.replace(/^chrome-extension:\/\//, ''));
+}
+
+/** `chrome-extension://abcd…` -> `abcd…`. Anything else yields undefined. */
+export function extensionIdFromOrigin(origin?: string): string | undefined {
+  const m = /^chrome-extension:\/\/([a-z0-9]+)\/?$/i.exec(origin ?? '');
+  return m?.[1];
+}
+
+/**
+ * Decides whether a peer may speak for `extId`, given the Origin it connected
+ * from. Returns a refusal message, or null to allow.
+ *
+ * Two checks, because `extId` arrives inside the `hello` frame and is therefore
+ * whatever the peer says it is:
+ *
+ *  1. It must match the Origin header. Chrome sets that header itself for a real
+ *     extension, so this binds the claimed identity to the connection. Without
+ *     it any peer could claim the real extension's id — enough to have its
+ *     pairing record reset and taken over.
+ *  2. Trust on first use. Once we have paired with someone, a *different* id is
+ *     refused. The server cannot verify that a human approved a pairing (the
+ *     proof a peer sends is derived from the key exchange it just performed, so
+ *     it can always produce one); pinning the first id we saw is what stops a
+ *     second local process from silently enrolling itself later.
+ *
+ * TOFU applies only when no ids are configured explicitly. If the deployment
+ * names its extension, that list is the authority and pinning would only get in
+ * the way of a deliberate change.
+ */
+/** Recovery guidance for a refused peer. Too long for a close reason; logged. */
+export function peerRefusalHelp(extId: string): string {
+  return (
+    `To pair "${extId}" instead, remove ${PEERS_FILE} and pair again, ` +
+    'or list it in ONBRIDGE_DEV_EXTENSION_IDS.'
+  );
+}
+
+export function checkPeerIdentity(extId: string, origin?: string): string | null {
+  if (!extId) return 'hello did not name an extension';
+
+  const originId = extensionIdFromOrigin(origin);
+  if (!originId) {
+    // The upgrade check already demands a chrome-extension:// origin, so this is
+    // unreachable today. It stays because the two checks are separated by a lot
+    // of code, and a peer with no origin must never fall through to being
+    // trusted on the id it named for itself.
+    return 'connection has no usable chrome-extension:// origin';
+  }
+  if (extId !== originId) {
+    return `extension id "${extId}" does not match the connection origin (${originId})`;
+  }
+
+  if (explicitIds().length > 0) return null;
+
+  const known = knownExtensionIds();
+  if (known.length > 0 && !known.includes(extId)) {
+    // Kept short: this travels as a WebSocket close reason, which is capped at
+    // 123 bytes. The recovery instructions go to the log instead.
+    return `already paired with a different extension; refusing "${extId}"`;
+  }
+
+  return null;
 }
 
 /**

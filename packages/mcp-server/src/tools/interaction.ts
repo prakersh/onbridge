@@ -20,7 +20,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('click', { ref, button, doubleClick })) as PageSnapshot;
-        return text(bridge, serializeSnapshot(data));
+        return pageText(bridge, serializeSnapshot(data), 'Done. The page now reads:');
       } catch (err) {
         return error(err);
       }
@@ -125,7 +125,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('scroll', { direction, amount, ref })) as PageSnapshot;
-        return text(bridge, serializeSnapshot(data));
+        return pageText(bridge, serializeSnapshot(data), 'Done. The page now reads:');
       } catch (err) {
         return error(err);
       }
@@ -206,7 +206,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('click_by_text', { text: searchText, role, index })) as PageSnapshot;
-        return text(bridge, serializeSnapshot(data));
+        return pageText(bridge, serializeSnapshot(data), 'Done. The page now reads:');
       } catch (err) {
         return error(err);
       }
@@ -225,7 +225,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('dismiss_modal', { text: dismissText })) as PageSnapshot;
-        return text(bridge, serializeSnapshot(data));
+        return pageText(bridge, serializeSnapshot(data), 'Done. The page now reads:');
       } catch (err) {
         return error(err);
       }

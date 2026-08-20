@@ -18,7 +18,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('navigate', { url })) as PageSnapshot;
-        return text(bridge, serializeSnapshot(data));
+        return pageText(bridge, serializeSnapshot(data), `Navigated to ${url}.`);
       } catch (err) {
         return error(err);
       }
@@ -35,7 +35,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('back')) as { url: string; title: string };
-        return text(bridge, `Navigated back to: ${data.title} (${data.url})`);
+        return pageText(bridge, `${data.title}\n${data.url}`, 'Navigated back. Page-reported title and URL:');
       } catch (err) {
         return error(err);
       }
@@ -52,7 +52,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('forward')) as { url: string; title: string };
-        return text(bridge, `Navigated forward to: ${data.title} (${data.url})`);
+        return pageText(bridge, `${data.title}\n${data.url}`, 'Navigated forward. Page-reported title and URL:');
       } catch (err) {
         return error(err);
       }
@@ -71,7 +71,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('reload', { hard })) as { url: string; title: string };
-        return text(bridge, `Reloaded: ${data.title} (${data.url})`);
+        return pageText(bridge, `${data.title}\n${data.url}`, 'Reloaded. Page-reported title and URL:');
       } catch (err) {
         return error(err);
       }

@@ -28,7 +28,12 @@ import {
 } from '@onbridge/shared';
 import type { ExtensionMessage, ServerMessage } from '@onbridge/shared';
 
-export const EXT_ORIGIN = 'chrome-extension://testextensionid';
+/**
+ * The id and the origin must agree: the server binds the `extId` a peer claims
+ * in `hello` to the Origin header Chrome set for it. A mismatch is a refusal.
+ */
+export const EXT_ID = 'testextensionid';
+export const EXT_ORIGIN = `chrome-extension://${EXT_ID}`;
 const SERVER = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 
 /**
@@ -41,6 +46,18 @@ const SERVER = fileURLToPath(new URL('../dist/index.js', import.meta.url));
  * is not one.
  */
 let boundPort = 0;
+
+/**
+ * Pairing secrets this process has established, keyed by server id — the test
+ * stand-in for the extension's `chrome.storage.local`. Without it a reconnect
+ * derives a brand new secret and fails auth against the stored one.
+ */
+const pairings = new Map<string, Uint8Array>();
+
+/** Forgets stored pairings, so the next connection pairs from scratch. */
+export function resetPairings(): void {
+  pairings.clear();
+}
 
 export function getPort(): number {
   if (!boundPort) throw new Error('server has not reported a bound port yet');
@@ -165,7 +182,12 @@ export async function openSession(): Promise<Session> {
         st.sNonce = fromB64(frame.sNonce);
         const d = await deriveHandshakeKeys(st.shared, fromB64(eNonce), st.sNonce);
         st.hsKey = d.handshakeKey;
-        st.pair = d.pairingSecret;
+        st.serverId = frame.serverId;
+        // Mirrors the extension: a fresh secret when pairing, the stored one
+        // when re-authenticating. Deriving anew on a reconnect would fail auth,
+        // because the server checks against what it saved at pairing time.
+        st.derived = d.pairingSecret;
+        st.pair = pairings.get(frame.serverId) ?? d.pairingSecret;
         st.sessionId = await computeSessionId(kp.publicKeyB64, frame.sPub, eNonce, frame.sNonce);
         return;
       }
@@ -174,6 +196,8 @@ export async function openSession(): Promise<Session> {
       const inner = JSON.parse(await openFrame(st.ready ? st.sessionKey : st.hsKey, frame));
 
       if (inner.t === 'pair_required') {
+        st.pair = st.derived; // pairing always uses the freshly derived secret
+        pairings.set(st.serverId, st.pair);
         await sendSealed(st.hsKey, {
           t: 'pair_confirm',
           proof: await makeProof(st.pair, PROOF_PAIR, st.sessionId),
@@ -190,6 +214,17 @@ export async function openSession(): Promise<Session> {
           t: 'auth',
           proof: await makeProof(st.pair, PROOF_AUTH_EXT, st.sessionId, inner.nonce),
         });
+        return;
+      }
+
+      // Re-connecting to a server that already knows us. Resolving `ready` only
+      // on the pairing path meant a second openSession() against the same server
+      // hung forever, which reads as a server bug and is not one.
+      if (inner.t === 'auth_ok') {
+        st.sessionKey = await deriveSessionKey(st.shared, st.pair, fromB64(eNonce), st.sNonce);
+        st.ready = true;
+        tx = 0;
+        ready();
         return;
       }
 
@@ -211,12 +246,16 @@ export async function openSession(): Promise<Session> {
             timing: Date.now() - start,
           });
         } catch (e) {
+          // Mirrors the extension: only errors it composed itself are marked, so
+          // a handler can simulate a governance refusal as well as a page throw.
+          const trusted = Boolean((e as { onbridgeTrusted?: boolean }).onbridgeTrusted);
           await sendSealed(st.sessionKey, {
             type: 'result',
             id: msg.id,
             success: false,
             data: null,
             error: (e as Error).message,
+            ...(trusted ? { errorKind: 'trusted' as const } : {}),
             timing: Date.now() - start,
           });
         }
@@ -228,7 +267,7 @@ export async function openSession(): Promise<Session> {
     JSON.stringify({
       t: 'hello',
       v: HANDSHAKE_VERSION,
-      extId: 'testext',
+      extId: EXT_ID,
       ePub: kp.publicKeyB64,
       eNonce,
     }),

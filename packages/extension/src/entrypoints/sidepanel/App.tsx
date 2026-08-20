@@ -89,7 +89,7 @@ interface Status {
     url: string;
     askedAt: number;
   } | null;
-  pairRequest: { port: number; agent: AgentInfo } | null;
+  pairRequest: { port: number; wasPaired?: boolean; agent: AgentInfo } | null;
   pairBlocked: { name: string; port: number; at: number } | null;
   askRequest: { question: string; options?: string[]; askedAt: number } | null;
   lastAction: string;
@@ -200,6 +200,19 @@ export default function App() {
   const owner = status.sessions.find((s) => s.ownsThisWindow);
   const others = status.sessions.filter((s) => !s.ownsThisWindow && s.status !== 'failed');
 
+  /**
+   * Refusals worth showing, rather than the ordinary churn of probing ten ports.
+   *
+   * A rejected connection used to land nowhere: the reason was captured and
+   * dropped, so an agent locked out of the bridge looked exactly like an agent
+   * that was never started. "Another client is already connected" in particular
+   * is the one message that distinguishes something else holding the socket from
+   * nothing running at all — and that is the case a person most needs to see.
+   */
+  const refusals = status.sessions.filter(
+    (s) => s.status === 'failed' && s.detail && !/^(closed|disconnected|socket error)$/i.test(s.detail),
+  );
+
   const conn = owner
     ? { color: 'bg-emerald-400', label: owner.agent?.name ?? 'Connected' }
     : status.pairRequest
@@ -244,6 +257,20 @@ export default function App() {
               Pairing request
             </div>
             <AgentCard agent={status.pairRequest.agent} port={status.pairRequest.port} />
+            {status.pairRequest.wasPaired && (
+              <div className="mt-2 rounded-md border border-red-500/50 bg-red-500/10 p-2">
+                <div className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-red-300">
+                  <AlertIcon className="h-3.5 w-3.5" /> This agent was paired before
+                </div>
+                <p className="text-xs text-neutral-400">
+                  You have already paired with this server, but it no longer recognises this
+                  browser — its record was reset. That happens if you cleared{' '}
+                  <code className="text-neutral-300">~/.onbridge</code>, and it is also what
+                  another program on your machine would have to do to take this agent's place.
+                  Only allow this if you know why the record was reset.
+                </p>
+              </div>
+            )}
             <p className="mb-3 mt-2 text-xs text-neutral-400">
               Approve this once and it connects silently from then on. Check the project path
               above matches the session you just started.
@@ -283,6 +310,34 @@ export default function App() {
             >
               Accept new agents for 60s
             </button>
+          </div>
+        )}
+
+        {/* ── A connection the server turned away ── */}
+        {refusals.length > 0 && (
+          <div className="m-3 rounded-lg border border-red-500/40 bg-red-500/10 p-3">
+            <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-red-300">
+              <AlertIcon className="h-3.5 w-3.5" /> Connection refused
+            </div>
+            {refusals.map((s) => (
+              <p key={s.id} className="mb-1 text-xs text-neutral-400">
+                Port {s.port}: <span className="text-neutral-200">{s.detail}</span>
+              </p>
+            ))}
+            {refusals.some((s) => /auth|proof/i.test(s.detail)) ? (
+              <p className="mt-2 text-xs text-neutral-400">
+                This browser holds a pairing secret that the agent no longer accepts, which means
+                its record was replaced since you paired. Another program on your machine can do
+                that. Do not re-pair until you know what changed — remove{' '}
+                <code className="text-neutral-300">~/.onbridge/peers.json</code> deliberately if you
+                want to start over.
+              </p>
+            ) : (
+              <p className="mt-2 text-xs text-neutral-500">
+                If you did not expect this, something else on your machine may be holding the
+                bridge.
+              </p>
+            )}
           </div>
         )}
 

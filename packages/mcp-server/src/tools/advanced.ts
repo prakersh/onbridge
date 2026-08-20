@@ -20,7 +20,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       try {
         const data = (await bridge.sendCommand('evaluate', { script, ref })) as { result: unknown };
         const formatted = typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
-        return text(bridge, formatted);
+        return pageText(bridge, formatted, 'Result of evaluating your script in the page:');
       } catch (err) {
         return error(err);
       }
@@ -88,7 +88,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         });
         if (data.cookies.length > 50) lines.push(`... and ${data.cookies.length - 50} more`);
         if (data.note) lines.push('', data.note);
-        return text(bridge, lines.join('\n'));
+        return pageText(bridge, lines.join('\n'), 'Cookies for this page. Names and domains are set by the site:');
       } catch (err) {
         return error(err);
       }
@@ -132,7 +132,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         if (data.length === 0) return text(bridge, 'No console messages.');
         const lines = data.slice(0, 50).map((m) => `[${m.level}] ${m.text}`);
         if (data.length > 50) lines.push(`... and ${data.length - 50} more`);
-        return text(bridge, lines.join('\n'));
+        return pageText(bridge, lines.join('\n'), 'Console output. Any page can write whatever it likes here:');
       } catch (err) {
         return error(err);
       }
@@ -154,17 +154,17 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       try {
         const data = await bridge.sendCommand('dom_query', { selector, action, index });
         if (action === 'click') {
-          return text(bridge, serializeSnapshot(data as any));
+          return pageText(bridge, serializeSnapshot(data as any));
         }
         if (action === 'text') {
-          return text(bridge, (data as any).text ?? '');
+          return pageText(bridge, (data as any).text ?? '');
         }
         const result = data as { matches: number; results: Array<{ index: number; ref?: number; tag: string; text: string; id?: string }> };
         const lines = [`${result.matches} match${result.matches === 1 ? '' : 'es'}:`];
         for (const r of result.results) {
           lines.push(`  [${r.index}] <${r.tag}>${r.ref ? ` ref:${r.ref}` : ''}${r.id ? ` #${r.id}` : ''} "${r.text}"`);
         }
-        return text(bridge, lines.join('\n'));
+        return pageText(bridge, lines.join('\n'));
       } catch (err) {
         return error(err);
       }
@@ -184,7 +184,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = (await bridge.sendCommand('download_file', { url, ref })) as { filename: string; path: string };
-        return text(bridge, `Downloaded: ${data.filename}\nPath: ${data.path}`);
+        return pageText(bridge, `${data.filename}\n${data.path}`, 'Downloaded. Filename and path come from the remote server:');
       } catch (err) {
         return error(err);
       }
@@ -213,7 +213,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         const lines = data.map(
           (d) => `${d.state === 'complete' ? '✓' : '…'} ${d.filename} (${(d.size / 1024).toFixed(0)}KB) — ${d.path}`,
         );
-        return text(bridge, lines.join('\n'));
+        return pageText(bridge, lines.join('\n'), 'Downloads. Filenames come from the remote servers:');
       } catch (err) {
         return error(err);
       }
@@ -240,7 +240,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
           const err = e.error ? ` — ${e.error}` : '';
           lines.push(`${status} ${e.action} ${e.summary} (${e.timing}ms)${err}`);
         }
-        return text(bridge, lines.join('\n'));
+        return pageText(bridge, lines.join('\n'), 'Recent commands. Element labels in it are page text:');
       } catch (err) {
         return error(err);
       }

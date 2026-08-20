@@ -1,45 +1,56 @@
 import type { AgentIdentity } from './handshake.js';
 
-export type CommandAction =
-  | 'navigate'
-  | 'back'
-  | 'forward'
-  | 'reload'
-  | 'snapshot'
-  | 'find'
-  | 'screenshot'
-  | 'get_text'
-  | 'get_url'
-  | 'click'
-  | 'click_by_text'
-  | 'type'
-  | 'fill_form'
-  | 'select'
-  | 'hover'
-  | 'scroll'
-  | 'press_key'
-  | 'drag'
-  | 'upload'
-  | 'dismiss_modal'
-  | 'dom_query'
-  | 'list_tabs'
-  | 'switch_tab'
-  | 'new_tab'
-  | 'close_tab'
-  | 'evaluate'
-  | 'wait'
-  | 'get_cookies'
-  | 'set_cookie'
-  | 'console_logs'
-  | 'download_file'
-  | 'list_downloads'
-  | 'activity_log'
+/**
+ * Every action the bridge can carry, as a runtime list.
+ *
+ * A value, not just a type: `policy.ts` has to classify all of these, and a
+ * union alone gives a test no way to check that it did. Three read-only tools
+ * were silently falling through to the write default because nothing could
+ * enumerate them.
+ */
+export const ALL_COMMAND_ACTIONS = [
+  'navigate',
+  'back',
+  'forward',
+  'reload',
+  'snapshot',
+  'find',
+  'screenshot',
+  'get_text',
+  'get_url',
+  'click',
+  'click_by_text',
+  'type',
+  'fill_form',
+  'select',
+  'hover',
+  'scroll',
+  'press_key',
+  'drag',
+  'upload',
+  'dismiss_modal',
+  'dom_query',
+  'list_tabs',
+  'switch_tab',
+  'new_tab',
+  'close_tab',
+  'evaluate',
+  'wait',
+  'get_cookies',
+  'set_cookie',
+  'console_logs',
+  'download_file',
+  'list_downloads',
+  'activity_log',
   /** Poses a question in the side panel and blocks until the user answers. */
-  | 'ask_user'
-  | 'bridge_status'
-  | 'extract_text'
-  | 'list_actions'
-  | 'highlight';
+  'ask_user',
+  'bridge_status',
+  'extract_text',
+  'list_actions',
+  'highlight',
+] as const;
+
+export type CommandAction = (typeof ALL_COMMAND_ACTIONS)[number];
 
 // MCP Server → Extension
 export type ServerMessage =
@@ -57,7 +68,25 @@ export type ServerMessage =
 // Extension → MCP Server
 export type ExtensionMessage =
   | { type: 'ready'; version: string; controlMode: boolean }
-  | { type: 'result'; id: string; success: boolean; data: unknown; error?: string; timing: number }
+  | {
+      type: 'result';
+      id: string;
+      success: boolean;
+      data: unknown;
+      error?: string;
+      /**
+       * Marks an error onbridge composed itself — a policy refusal, a scope
+       * denial — as opposed to one carrying text from the page.
+       *
+       * Provenance has to travel with the message. Inferring it from the wording
+       * lets a page throw `new Error("Blocked by user policy: ...")` and have its
+       * text presented to the agent as an authoritative refusal. Absent means
+       * "assume the page had a hand in it", which is the safe default and what an
+       * older extension that does not send it will produce.
+       */
+      errorKind?: 'trusted';
+      timing: number;
+    }
   | {
       type: 'event';
       event:

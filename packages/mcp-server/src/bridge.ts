@@ -24,6 +24,8 @@ import {
 import type { ServerMessage, ExtensionMessage, CommandAction, HandshakeFrame } from '@onbridge/shared';
 import {
   buildAgentIdentity,
+  checkPeerIdentity,
+  peerRefusalHelp,
   forgetPeer,
   getPeer,
   getServerId,
@@ -42,6 +44,24 @@ type PendingCommand = {
 /** Generous, because first-run pairing waits on a human clicking Allow. */
 const HANDSHAKE_TIMEOUT_MS = 90_000;
 
+/** Ceiling on undelivered side-panel notes. See `handleMessage`. */
+const MAX_QUEUED_USER_MESSAGES = 20;
+
+/**
+ * Marks an error as composed by onbridge rather than carrying page text, so the
+ * reply builders can frame it authoritatively instead of fencing it.
+ */
+export function commandError(message: string, trusted: boolean): Error {
+  const err = new Error(message);
+  if (trusted) (err as Error & { onbridgeTrusted?: true }).onbridgeTrusted = true;
+  return err;
+}
+
+/** True only for errors this stack composed. Absent means assume page-derived. */
+export function isTrustedError(err: unknown): boolean {
+  return Boolean((err as { onbridgeTrusted?: boolean } | null)?.onbridgeTrusted);
+}
+
 type SessionState = 'hello' | 'pairing' | 'auth' | 'ready';
 
 interface Session {
@@ -57,6 +77,12 @@ interface Session {
   sNonce: Uint8Array;
   sessionKey?: CryptoKey;
   challengeNonce?: string;
+  /**
+   * Set when a peer asked to re-pair. The old record is only dropped once a new
+   * pairing actually completes, so a peer that asks and then vanishes cannot
+   * destroy a working pairing on its way out.
+   */
+  resetRequested?: boolean;
   txCounter: number;
   replay: ReplayGuard;
   timer: ReturnType<typeof setTimeout>;
@@ -164,7 +190,7 @@ export class Bridge {
   }
 
   private attachHandlers(): void {
-    this.wss!.on('connection', (ws) => {
+    this.wss!.on('connection', (ws, req) => {
       // Only ever evict a session whose socket is already gone. The extension's
       // service worker can be killed and restarted without a clean close, and it
       // must be able to reconnect. Evicting a *live* session would let anyone who
@@ -177,7 +203,9 @@ export class Bridge {
         ws.close(4000, 'Another client is already connected');
         return;
       }
-      this.handleConnection(ws);
+      // Chrome sets Origin itself, so it is the one part of a peer's claimed
+      // identity it does not get to choose. `hello` is checked against it.
+      this.handleConnection(ws, req.headers.origin);
     });
   }
 
@@ -187,7 +215,7 @@ export class Bridge {
    * immediately on open — arrived with no listener and was dropped, hanging the
    * handshake. The queue awaits `setup` instead, so frames are held, not lost.
    */
-  private handleConnection(ws: WebSocket): void {
+  private handleConnection(ws: WebSocket, origin?: string): void {
     const setup = (async () => ({
       kp: await generateEphemeralKeyPair(),
       sNonce: toB64(randomBytes(16)),
@@ -195,7 +223,7 @@ export class Bridge {
 
     const fail = (reason: string) => {
       this.log(`handshake failed: ${reason}`);
-      ws.close(4001, reason);
+      this.closeWithReason(ws, 4001, reason);
     };
 
     // Serialised for the same reason as on the client: `hello` derives the keys
@@ -227,6 +255,16 @@ export class Bridge {
                 `handshake version mismatch (extension speaks v${frame.v}, server speaks ` +
                   `v${HANDSHAKE_VERSION}) — update the ${who}`,
               );
+            }
+
+            // Binds the claimed extension id to the connection, and pins the
+            // first id we ever pair with. Without this the `pair_confirm` proof
+            // proves nothing about *who* is pairing: it is derived from the key
+            // exchange the peer just performed, so any peer can produce one.
+            const refusal = checkPeerIdentity(frame.extId, origin);
+            if (refusal) {
+              this.log(peerRefusalHelp(frame.extId));
+              return fail(refusal);
             }
 
             const shared = await deriveSharedSecret(kp.privateKey, frame.ePub);
@@ -292,7 +330,7 @@ export class Bridge {
       .catch((err: unknown) => {
         this.log(`frame handler error: ${(err as Error).message}`);
         try {
-          ws.close(4002, 'internal error');
+          this.closeWithReason(ws, 4002, 'internal error');
         } catch {
           /* already closed */
         }
@@ -308,7 +346,7 @@ export class Bridge {
     const s = this.session!;
     const fail = (reason: string) => {
       this.log(`session rejected: ${reason}`);
-      s.ws.close(4001, reason);
+      this.closeWithReason(s.ws, 4001, reason);
     };
 
     if (frame.t !== 'enc') return fail(`expected sealed frame, got ${frame.t}`);
@@ -334,6 +372,7 @@ export class Bridge {
       if (!(await verifyProof(s.pairingSecret, PROOF_PAIR, s.sessionId, '', hs.proof))) {
         return fail('invalid pairing proof');
       }
+      if (s.resetRequested) forgetPeer(s.extId);
       savePeer(s.extId, toB64(s.pairingSecret));
       this.log(`paired with extension ${s.extId}`);
       return this.promote(s);
@@ -343,7 +382,8 @@ export class Bridge {
       // Extension lost its secret (typically a reinstall). Drop our record and
       // fall back to a fresh pairing, which the user must still approve.
       if (hs.t === 'pair_reset') {
-        forgetPeer(s.extId);
+        // Deliberately does NOT drop the record yet — see `resetRequested`.
+        s.resetRequested = true;
         this.log(`peer ${s.extId} requested pairing reset`);
         const { pairingSecret } = await deriveHandshakeKeys(s.shared, s.eNonce, s.sNonce);
         s.pairingSecret = pairingSecret;
@@ -396,6 +436,29 @@ export class Bridge {
     this.startHeartbeat();
   }
 
+  /**
+   * Closes with a reason the wire can actually carry.
+   *
+   * A WebSocket close reason is capped at 123 *bytes*, and `ws` throws a
+   * RangeError past it rather than truncating. A refusal message that grew too
+   * explanatory therefore crashed the handler instead of rejecting the peer —
+   * turning a clean "no" into an internal error. The full text still goes to the
+   * log, which is where anyone debugging a refusal will look.
+   */
+  private closeWithReason(ws: WebSocket, code: number, reason: string): void {
+    const enc = new TextEncoder();
+    let wire = reason;
+    if (enc.encode(wire).length > 120) {
+      while (enc.encode(wire).length > 117 && wire.length > 0) wire = wire.slice(0, -1);
+      wire += '...';
+    }
+    try {
+      ws.close(code, wire);
+    } catch {
+      ws.terminate();
+    }
+  }
+
   private sendPlain(ws: WebSocket, frame: HandshakeFrame): void {
     ws.send(JSON.stringify(frame));
   }
@@ -414,7 +477,7 @@ export class Bridge {
     this.stopHeartbeat();
     this.log('extension disconnected');
     for (const [id, cmd] of this.pending) {
-      cmd.reject(new Error('Extension disconnected'));
+      cmd.reject(commandError('Extension disconnected', true));
       clearTimeout(cmd.timer);
       this.pending.delete(id);
     }
@@ -429,14 +492,17 @@ export class Bridge {
   }
 
   /**
-   * Drains queued side-panel notes. Called when building a tool result: MCP has
-   * no server-initiated channel into a running turn, so piggybacking on the next
-   * result is the only way an unsolicited note reaches the agent.
+   * Takes up to `limit` queued side-panel notes. Called when building a tool
+   * result: MCP has no server-initiated channel into a running turn, so
+   * piggybacking on the next result is the only way an unsolicited note reaches
+   * the agent.
+   *
+   * The remainder stays queued rather than being dropped. Draining the whole
+   * array and then truncating meant a sixth note the user genuinely typed was
+   * destroyed instead of arriving on the following result.
    */
-  takeUserMessages(): string[] {
-    const out = this.userMessages;
-    this.userMessages = [];
-    return out;
+  takeUserMessages(limit = 5): string[] {
+    return this.userMessages.splice(0, limit);
   }
 
   async sendCommand(
@@ -446,8 +512,9 @@ export class Bridge {
     timeoutMs: number = COMMAND_TIMEOUT_MS,
   ): Promise<unknown> {
     if (!this.isConnected()) {
-      throw new Error(
+      throw commandError(
         'Extension not connected. Enable control mode in the onbridge browser extension.',
+        true,
       );
     }
 
@@ -458,7 +525,7 @@ export class Bridge {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Command '${action}' timed out after ${timeoutMs}ms`));
+        reject(commandError(`Command '${action}' timed out after ${timeoutMs}ms`, true));
       }, timeoutMs);
 
       this.pending.set(id, { resolve, reject, timer });
@@ -478,14 +545,23 @@ export class Bridge {
         clearTimeout(cmd.timer);
         this.pending.delete(msg.id);
         if (msg.success) cmd.resolve(msg.data);
-        else cmd.reject(new Error(msg.error ?? 'Command failed'));
+        else cmd.reject(commandError(msg.error ?? 'Command failed', msg.errorKind === 'trusted'));
         break;
       }
 
       case 'event':
         if (msg.event === 'user_message') {
           const { text } = (msg.data ?? {}) as { text?: string };
-          if (text?.trim()) this.userMessages.push(text.trim());
+          // Bounded at the door, not only at delivery. If the agent is idle
+          // nothing drains this, so an unbounded push is a memory-growth
+          // primitive for whatever holds the socket. Oldest notes fall off,
+          // because the newest is the one still worth acting on.
+          if (text?.trim()) {
+            this.userMessages.push(text.trim());
+            if (this.userMessages.length > MAX_QUEUED_USER_MESSAGES) {
+              this.userMessages.splice(0, this.userMessages.length - MAX_QUEUED_USER_MESSAGES);
+            }
+          }
         }
         this.log(`event: ${msg.event}`);
         break;
