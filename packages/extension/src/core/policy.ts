@@ -108,6 +108,24 @@ function hostOf(url: string): string {
 }
 
 /** Suffix match on labels, so "example.com" covers "app.example.com". */
+/**
+ * The denylist as CDP `Network.setBlockedURLs` wildcard patterns.
+ *
+ * Mirrors `matchesDomain`'s host-or-subdomain rule: `evil.test` blocks
+ * `evil.test` and anything under it, on any scheme, path and port. Used to stop
+ * subresource requests — `fetch()` inside `evaluate` reaches a blocked host
+ * without navigating, so the navigation guards never see it.
+ */
+export function blockedUrlPatterns(policy: Policy): string[] {
+  const out: string[] = [];
+  for (const raw of policy.denylist) {
+    const p = raw.trim().toLowerCase().replace(/^\*\./, '');
+    if (!p) continue;
+    out.push(`*://${p}/*`, `*://*.${p}/*`);
+  }
+  return out;
+}
+
 function matchesDomain(host: string, patterns: string[]): boolean {
   return patterns.some((raw) => {
     const p = raw.trim().toLowerCase().replace(/^\*\./, '');

@@ -21,6 +21,7 @@ import {
   getConsole,
   clearConsole,
   enableConsoleCapture,
+  setBlockedUrlPatterns,
 } from '../core/cdp.js';
 import * as trusted from '../core/trusted-input.js';
 import {
@@ -28,6 +29,7 @@ import {
   evaluatePolicy,
   destinationUrls,
   firstDomainDenial,
+  blockedUrlPatterns,
   originOf,
   DEFAULT_POLICY,
   YOLO_TIMEOUT_MINUTES,
@@ -133,6 +135,7 @@ export default defineBackground(() => {
         // yolo never survives a restart. Leaving prompts disabled across sessions
         // because of a choice made days ago is exactly how people get surprised.
         if (policy.mode === 'yolo') policy.mode = 'auto';
+        setBlockedUrlPatterns(blockedUrlPatterns(policy));
       }
       if (result.controlMode) {
         controlMode = true;
@@ -1724,6 +1727,10 @@ export default defineBackground(() => {
     if (message?.type === 'set_policy') {
       policy = { ...policy, ...(message.policy as Partial<Policy>) };
       chrome.storage.local.set({ policy });
+      // Push the denylist down to the network layer too, so a blocked host
+      // cannot be reached by a subresource request the navigation guards never
+      // see (`fetch` inside `evaluate`).
+      setBlockedUrlPatterns(blockedUrlPatterns(policy));
       sendResponse({ ok: true, policy });
       return true;
     }

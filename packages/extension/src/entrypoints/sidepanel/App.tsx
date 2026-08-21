@@ -91,6 +91,8 @@ interface Status {
   } | null;
   pairRequest: { port: number; wasPaired?: boolean; agent: AgentInfo } | null;
   pairBlocked: { name: string; port: number; at: number } | null;
+  /** True while a newly started agent would be offered to the user. */
+  pairWindowOpen: boolean;
   askRequest: { question: string; options?: string[]; askedAt: number } | null;
   lastAction: string;
   activityLog: ActivityEntry[];
@@ -111,6 +113,7 @@ const EMPTY: Status = {
   approvalRequest: null,
   pairRequest: null,
   pairBlocked: null,
+  pairWindowOpen: false,
   askRequest: null,
   lastAction: '',
   activityLog: [],
@@ -307,9 +310,10 @@ export default function App() {
             </div>
             <p className="mb-3 text-xs text-neutral-400">
               <span className="font-medium text-neutral-200">{status.pairBlocked.name}</span> asked
-              to pair on port {status.pairBlocked.port}, but new agents are only accepted for a
-              short window after you turn Control Mode on — so nothing can nag you for access while
-              you are not looking. Accept new agents again if you started this one.
+              to pair on port {status.pairBlocked.port} {ago(status.pairBlocked.at)} ago, but new
+              agents are only accepted for a short window after you turn Control Mode on — so
+              nothing can nag you for access while you are not looking. Accept new agents again if
+              you started this one.
             </p>
             <button
               onClick={() => act({ type: 'arm_pairing' })}
@@ -317,6 +321,16 @@ export default function App() {
             >
               Accept new agents for 60s
             </button>
+          </div>
+        )}
+
+        {/* ── The window is open right now ── */}
+        {status.pairWindowOpen && !status.pairRequest && (
+          <div className="mx-3 mt-3 flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-2.5 text-xs text-emerald-200">
+            <ClockIcon className="h-3.5 w-3.5 shrink-0" />
+            {/* Whether a new agent would be let in is otherwise invisible, which
+                makes "why is my agent not connecting" unanswerable from the panel. */}
+            <span>Accepting new agents. A new agent starting now will ask to pair.</span>
           </div>
         )}
 
