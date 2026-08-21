@@ -8,7 +8,14 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { overlaps, scopeAllows, describeScope, type SessionScope } from '../src/core/connection-manager.js';
+import {
+  overlaps,
+  scopeAllows,
+  describeScope,
+  decideRestore,
+  type AgentSession,
+  type SessionScope,
+} from '../src/core/connection-manager.js';
 
 const tab = (tabId: number, windowId: number): SessionScope => ({ kind: 'tab', tabId, windowId });
 const win = (windowId: number): SessionScope => ({ kind: 'window', windowId });
@@ -66,5 +73,58 @@ describe('scope description', () => {
     expect(describeScope(all())).toBe('the whole browser');
     expect(describeScope(win(1))).toBe('this window');
     expect(describeScope(tab(1, 1))).toBe('a single tab');
+  });
+});
+
+describe('restoring territory across a reconnect', () => {
+  const session = (over: Partial<AgentSession>): AgentSession =>
+    ({
+      id: 'port:9877',
+      port: 9877,
+      status: 'active',
+      detail: '',
+      scope: null,
+      connectedAt: 0,
+      commandCount: 0,
+      lastAction: '',
+      activityLog: [],
+      attempts: 1,
+      ...over,
+    }) as AgentSession;
+
+  it('gives a restarted server its window back', () => {
+    // `npx` respawns servers constantly; re-granting every time is intolerable.
+    expect(decideRestore(win(1), 'srv-a', 'srv-a', []).restore).toBe(true);
+  });
+
+  it('refuses to hand a recycled port to a different agent', () => {
+    // A port is reused the moment its owner exits. Matching on port alone gave
+    // the newcomer the previous agent's window for free.
+    const v = decideRestore(win(1), 'srv-a', 'srv-b', []);
+    expect(v.restore).toBe(false);
+    expect(v.reason).toMatch(/different agent/i);
+  });
+
+  it('refuses when someone else was granted that scope meanwhile', () => {
+    // A failed session keeps its scope and activate() only compares against
+    // active ones, so the window could be given away and then silently reclaimed
+    // here — two agents driving one window.
+    const other = session({ id: 'port:9878', scope: win(1), identity: { name: 'Other' } as never });
+    const v = decideRestore(win(1), 'srv-a', 'srv-a', [other]);
+    expect(v.restore).toBe(false);
+    expect(v.reason).toMatch(/Other now controls/);
+  });
+
+  it('ignores a clash with a session that is not active', () => {
+    const idle = session({ id: 'port:9878', scope: win(1), status: 'on_hold' });
+    expect(decideRestore(win(1), 'srv-a', 'srv-a', [idle]).restore).toBe(true);
+  });
+
+  it('restores nothing when there was no grant to begin with', () => {
+    expect(decideRestore(null, 'srv-a', 'srv-a', []).restore).toBe(false);
+  });
+
+  it('refuses when the server did not identify itself', () => {
+    expect(decideRestore(win(1), 'srv-a', '', []).restore).toBe(false);
   });
 });

@@ -278,30 +278,19 @@ export class ConnectionManager {
       const serverId = client.getServerId();
       session.serverId = serverId || session.serverId;
 
-      // Restore territory only for the SAME server process coming back (matching
-      // serverId) and only if nothing has been granted an overlapping scope
-      // while it was gone. A different process on a recycled port, or a clash
-      // that appeared meanwhile, drops to on_hold so the user decides — an agent
-      // controls nothing it was not granted.
-      const sameServer = Boolean(serverId) && priorServerId === serverId;
-      const clash = priorScope
-        ? this.list().find(
-            (s) => s.id !== session.id && s.status === 'active' && s.scope && overlaps(s.scope, priorScope),
-          )
-        : undefined;
-
-      if (priorScope && sameServer && !clash) {
+      const verdict = decideRestore(
+        priorScope,
+        priorServerId,
+        serverId,
+        this.list().filter((s) => s.id !== session.id),
+      );
+      if (verdict.restore) {
         session.scope = priorScope;
         session.status = 'active';
         session.detail = '';
       } else {
         session.status = 'on_hold';
-        session.detail =
-          priorScope && !sameServer
-            ? 'A different agent now answers on this port. Grant control again if you want it to drive.'
-            : priorScope && clash
-              ? `${clash.identity?.name ?? 'Another agent'} now controls that scope. Grant control again to reassign.`
-              : '';
+        session.detail = verdict.reason;
       }
       this.hooks.log(
         `agent on :${port} ${session.status} — ${session.identity?.name ?? 'unidentified'}`,
@@ -469,6 +458,47 @@ export class ConnectionManager {
   hasActive(): boolean {
     return this.list().some((s) => s.status === 'active');
   }
+}
+
+/**
+ * Whether a reconnecting session may take back the territory it held.
+ *
+ * Two conditions, both load-bearing. The server must be the *same process* —
+ * `npx` respawns constantly and re-granting a window every time would be
+ * intolerable, but a port is recycled the moment its owner exits, so matching on
+ * port alone handed a brand-new agent the previous one's window. And nothing may
+ * have been granted an overlapping scope while it was away: a failed session
+ * keeps its scope, and `activate()` only compares against *active* ones, so the
+ * user could hand that window to someone else and have the original silently
+ * reclaim it on reconnect — two agents driving one window.
+ */
+export function decideRestore(
+  priorScope: SessionScope | null,
+  priorServerId: string | undefined,
+  serverId: string,
+  others: AgentSession[],
+): { restore: boolean; reason: string } {
+  if (!priorScope) return { restore: false, reason: '' };
+
+  if (!serverId || priorServerId !== serverId) {
+    return {
+      restore: false,
+      reason:
+        'A different agent now answers on this port. Grant control again if you want it to drive.',
+    };
+  }
+
+  const clash = others.find((s) => s.status === 'active' && s.scope && overlaps(s.scope, priorScope));
+  if (clash) {
+    return {
+      restore: false,
+      reason:
+        `${clash.identity?.name ?? 'Another agent'} now controls that scope. ` +
+        'Grant control again to reassign.',
+    };
+  }
+
+  return { restore: true, reason: '' };
 }
 
 /** Two grants overlap when either could reach the same tab. */
