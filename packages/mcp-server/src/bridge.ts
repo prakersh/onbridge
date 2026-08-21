@@ -85,12 +85,27 @@ interface Session {
   resetRequested?: boolean;
   txCounter: number;
   replay: ReplayGuard;
+  /**
+   * Serialises outbound frames. Counters are grabbed synchronously in call
+   * order, but `seal()` is async and gives no cross-call ordering guarantee — so
+   * without chaining, two overlapping sends (a heartbeat colliding with a
+   * command result) can put counter N+1 on the wire before N, and the peer's
+   * replay guard tears the channel down as out-of-order.
+   */
+  sendChain: Promise<void>;
   timer: ReturnType<typeof setTimeout>;
 }
 
 export class Bridge {
   private wss: WebSocketServer | null = null;
   private session: Session | null = null;
+  /**
+   * A socket that has been accepted and is mid-handshake but has not yet become
+   * `this.session`. Reserved synchronously at accept so a second connection
+   * cannot slip in and clobber an in-flight handshake before `hello` is
+   * processed. Cleared once the session is assigned, or the socket fails/closes.
+   */
+  private claiming: WebSocket | null = null;
   private pending = new Map<string, PendingCommand>();
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private cmdCounter = 0;
@@ -203,6 +218,17 @@ export class Bridge {
         ws.close(4000, 'Another client is already connected');
         return;
       }
+      // Reserve the slot synchronously, at accept, not when `hello` is finally
+      // processed. `this.session` is assigned only after an `await` inside the
+      // frame handler, so two connections arriving before the first `hello`
+      // lands both passed the check above; the second then overwrote the first's
+      // in-flight session, defeating the "never evict a live session" guard
+      // during the handshake window. `claiming` closes that race.
+      if (this.claiming && this.claiming.readyState === WebSocket.OPEN) {
+        ws.close(4000, 'Another client is already connecting');
+        return;
+      }
+      this.claiming = ws;
       // Chrome sets Origin itself, so it is the one part of a peer's claimed
       // identity it does not get to choose. `hello` is checked against it.
       this.handleConnection(ws, req.headers.origin);
@@ -223,6 +249,7 @@ export class Bridge {
 
     const fail = (reason: string) => {
       this.log(`handshake failed: ${reason}`);
+      if (this.claiming === ws) this.claiming = null;
       this.closeWithReason(ws, 4001, reason);
     };
 
@@ -291,8 +318,12 @@ export class Bridge {
               sNonce: fromB64(sNonce),
               txCounter: 0,
               replay: new ReplayGuard(),
+              sendChain: Promise.resolve(),
               timer: setTimeout(() => fail('handshake timed out'), HANDSHAKE_TIMEOUT_MS),
             };
+            // The slot is now held by a real session; release the accept-time
+            // reservation.
+            if (this.claiming === ws) this.claiming = null;
 
             this.sendPlain(ws, {
               t: 'hello_ack',
@@ -337,7 +368,14 @@ export class Bridge {
       });
     });
 
-    ws.on('close', () => this.teardown(ws));
+    ws.on('close', () => {
+      // A socket that closes mid-handshake never became `this.session`, so
+      // `teardown` is a no-op for it — but it must still release the accept-time
+      // reservation, or a peer that connects and drops before `hello` would lock
+      // out every later connection.
+      if (this.claiming === ws) this.claiming = null;
+      this.teardown(ws);
+    });
     ws.on('error', (err) => this.log(`socket error: ${err.message}`));
   }
 
@@ -463,11 +501,21 @@ export class Bridge {
     ws.send(JSON.stringify(frame));
   }
 
-  private async sendSealed(key: CryptoKey, payload: HandshakeFrame | ServerMessage): Promise<void> {
+  private sendSealed(key: CryptoKey, payload: HandshakeFrame | ServerMessage): Promise<void> {
     const s = this.session;
-    if (!s) return;
-    const sealed = await seal(key, s.txCounter++, JSON.stringify(payload));
-    s.ws.send(JSON.stringify({ t: 'enc', ...sealed }));
+    if (!s) return Promise.resolve();
+    // Grab the counter synchronously so frames are numbered in call order, then
+    // chain the async seal+send so they also reach the wire in that order.
+    const counter = s.txCounter++;
+    const data = JSON.stringify(payload);
+    s.sendChain = s.sendChain.then(async () => {
+      const sealed = await seal(key, counter, data);
+      // The session may have been replaced or closed while this waited its turn.
+      if (this.session === s && s.ws.readyState === WebSocket.OPEN) {
+        s.ws.send(JSON.stringify({ t: 'enc', ...sealed }));
+      }
+    });
+    return s.sendChain;
   }
 
   private teardown(ws: WebSocket): void {

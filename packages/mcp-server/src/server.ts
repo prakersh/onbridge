@@ -32,6 +32,30 @@ export function createServer(): McpServer {
   // depend on this firing, because some clients never send the notification.
   server.server.oninitialized = () => bridge.refreshIdentity();
 
+  // Tear the bridge down when the agent goes away, or the WebSocketServer keeps
+  // the event loop alive and the process lingers forever holding its port — a
+  // zombie the extension keeps rediscovering as a live-looking session that
+  // never answers. `npx onbridge` respawns constantly, so this is the common
+  // path, not an edge case: without it, ten exited runs exhaust the whole port
+  // range and onbridge stops working entirely.
+  //
+  // Two independent triggers because neither alone is reliable: the SDK's stdio
+  // transport only listens for stdin 'data'/'error', so a clean pipe close
+  // (stdin 'end') never reaches `server.server.onclose`; and a kill signal never
+  // touches stdin at all.
+  let closed = false;
+  const shutdown = (code = 0) => {
+    if (closed) return;
+    closed = true;
+    bridge.close();
+    process.exit(code);
+  };
+  server.server.onclose = () => shutdown(0);
+  process.stdin.once('end', () => shutdown(0));
+  process.stdin.once('close', () => shutdown(0));
+  process.once('SIGINT', () => shutdown(0));
+  process.once('SIGTERM', () => shutdown(0));
+
   registerNavigationTools(server, bridge);
   registerObservationTools(server, bridge);
   registerInteractionTools(server, bridge);

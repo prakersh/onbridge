@@ -1,6 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { serializeSnapshot } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';
 import { text, pageText, image, error, notConnected } from './reply.js';
 
@@ -142,20 +141,17 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
     'dom_query',
     {
-      description: 'Query the DOM using a CSS selector. Works without eval (CSP-safe). Actions: "list" returns matching elements, "click" clicks the nth match, "text" returns full text of nth match.',
+      description: 'Query the DOM using a CSS selector (read-only, CSP-safe, no eval). Actions: "list" returns matching elements, "text" returns full text of the nth match. To click a match, use the "click" tool with a ref from a snapshot, or "click_by_text".',
       inputSchema: z.object({
         selector: z.string().describe('CSS selector (e.g., "#add-to-cart-button", ".price", "button[type=submit]")'),
-        action: z.enum(['list', 'click', 'text']).optional().describe('What to do with matches (default: list)'),
-        index: z.number().optional().describe('Which match to target for click/text (default: 0 = first)'),
+        action: z.enum(['list', 'text']).optional().describe('What to do with matches (default: list)'),
+        index: z.number().optional().describe('Which match to read for "text" (default: 0 = first)'),
       }),
     },
     async ({ selector, action, index }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
         const data = await bridge.sendCommand('dom_query', { selector, action, index });
-        if (action === 'click') {
-          return pageText(bridge, serializeSnapshot(data as any));
-        }
         if (action === 'text') {
           return pageText(bridge, (data as any).text ?? '');
         }

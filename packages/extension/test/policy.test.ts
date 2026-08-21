@@ -220,6 +220,23 @@ describe('domain lists cover where a command goes, not just where it starts', ()
     const urls = ['https://work.test/a', ...destinationUrls('navigate', { url: 'https://work.test/b' })];
     expect(firstDomainDenial(allowed, urls, 'navigate', 'navigate')).toBeNull();
   });
+
+  it('covers the domain a cookie command targets, not just the current tab', () => {
+    // get_cookies/set_cookie name a domain, not a URL. Without pulling it into
+    // the checked set, an agent could read a denylisted bank's cookies (or write
+    // a session-fixation cookie) with no domain block — and in bypass mode no
+    // prompt either.
+    expect(destinationUrls('get_cookies', { domain: 'bank.test' })).toEqual(['https://bank.test/']);
+    expect(destinationUrls('set_cookie', { domain: '.bank.test' })).toEqual(['https://bank.test/']);
+
+    const denyBank: Policy = { ...DEFAULT_POLICY, denylist: ['bank.test'] };
+    const urls = ['https://work.test/', ...destinationUrls('get_cookies', { domain: 'bank.test' })];
+    expect(firstDomainDenial(denyBank, urls, 'sensitive', 'get_cookies')).toMatch(/blocked list/);
+
+    const allowWork: Policy = { ...DEFAULT_POLICY, allowlist: ['work.test'] };
+    const urls2 = ['https://work.test/', ...destinationUrls('set_cookie', { domain: 'bank.test' })];
+    expect(firstDomainDenial(allowWork, urls2, 'sensitive', 'set_cookie')).toMatch(/not on the allowed list/);
+  });
 });
 
 describe('approval is bound to the origin it was granted for', () => {

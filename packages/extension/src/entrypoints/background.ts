@@ -123,20 +123,36 @@ export default defineBackground(() => {
   type ScopeKind = 'tab' | 'window' | 'all';
   let preferredScope: ScopeKind = 'window';
 
-  chrome.storage.local.get(['controlMode', 'preferredScope', 'policy'], (result) => {
-    if (result.preferredScope) preferredScope = result.preferredScope as ScopeKind;
-    if (result.policy) {
-      policy = { ...DEFAULT_POLICY, ...(result.policy as Policy) };
-      // yolo never survives a restart. Leaving prompts disabled across sessions
-      // because of a choice made days ago is exactly how people get surprised.
-      if (policy.mode === 'yolo') policy.mode = 'auto';
-    }
-    if (result.controlMode) {
-      controlMode = true;
-      controlEnabledAt = Date.now();
-      manager.start();
-    }
-  });
+  chrome.storage.local.get(
+    ['controlMode', 'preferredScope', 'policy', 'controlEnabledAt', 'pairBlocked', 'lastCommandAt'],
+    (result) => {
+      if (result.preferredScope) preferredScope = result.preferredScope as ScopeKind;
+      if (typeof result.lastCommandAt === 'number') lastCommandAt = result.lastCommandAt;
+      if (result.policy) {
+        policy = { ...DEFAULT_POLICY, ...(result.policy as Policy) };
+        // yolo never survives a restart. Leaving prompts disabled across sessions
+        // because of a choice made days ago is exactly how people get surprised.
+        if (policy.mode === 'yolo') policy.mode = 'auto';
+      }
+      if (result.controlMode) {
+        controlMode = true;
+        // Restored, never reset to "now". MV3 suspends this worker ~30s after the
+        // last event whenever no socket is open, and any browser event restarts
+        // it — so stamping the current time here re-opened the 60s pairing window
+        // on essentially every wake, and a local process wanting a pairing prompt
+        // only had to wait for one. The window has to measure from when the user
+        // actually enabled control mode.
+        controlEnabledAt = typeof result.controlEnabledAt === 'number' ? result.controlEnabledAt : 0;
+        pairBlocked = (result.pairBlocked as typeof pairBlocked) ?? null;
+        manager.start();
+      }
+    },
+  );
+
+  /** Keeps the pairing-window state on disk, so a worker restart cannot widen it. */
+  function rememberPairingWindow(): void {
+    chrome.storage.local.set({ controlEnabledAt, pairBlocked });
+  }
 
   /** Builds a concrete grant from the user's preference and a given window. */
   async function buildScope(kind: ScopeKind, windowId?: number): Promise<SessionScope> {
@@ -225,6 +241,7 @@ export default defineBackground(() => {
   ): Promise<boolean> {
     if (Date.now() - controlEnabledAt > PAIR_WINDOW_MS) {
       pairBlocked = { name: agent.name, port, at: Date.now() };
+      rememberPairingWindow();
       updateBadge('pair');
       return Promise.resolve(false);
     }
@@ -257,11 +274,15 @@ export default defineBackground(() => {
    * the tab it was watching never moved. Bounded because this is appended to for
    * the life of the service worker.
    */
-  const recentlyOpenedTabs: Array<{ tabId: number; at: number }> = [];
+  const recentlyOpenedTabs: Array<{ tabId: number; at: number; openerTabId?: number }> = [];
 
   chrome.tabs.onCreated.addListener((tab) => {
     if (tab.id == null) return;
-    recentlyOpenedTabs.push({ tabId: tab.id, at: Date.now() });
+    // `openerTabId` is the tab that spawned this one — set by `window.open`,
+    // `target="_blank"` and middle-clicks. It is how an opened tab is attributed
+    // back to the command that opened it, so one agent's navigation guard does
+    // not close (and fail on) a tab another agent just opened in its own window.
+    recentlyOpenedTabs.push({ tabId: tab.id, at: Date.now(), openerTabId: tab.openerTabId });
     if (recentlyOpenedTabs.length > 50) recentlyOpenedTabs.splice(0, recentlyOpenedTabs.length - 50);
   });
 
@@ -295,6 +316,11 @@ export default defineBackground(() => {
 
   const manager = new ConnectionManager({
     onPairRequest: requestPairing,
+    onPairObsolete: (port) => {
+      // The peer this prompt belongs to has gone; stop showing an Allow/Deny for
+      // a dead socket. Resolving false denies, which is the safe direction.
+      if (pairRequest?.port === port) resolvePairing(false);
+    },
     onCommand: (session, msg) => void onServerMessage(session, msg),
     onChange: () => {
       updateBadge(manager.hasActive() ? 'on' : controlMode ? 'off' : 'disabled');
@@ -424,6 +450,16 @@ export default defineBackground(() => {
     const { action, params: rawParams } = msg;
     let params = rawParams;
 
+    // Any command is activity, including the meta ones below. Counting only
+    // "real" commands let an agent held in an ask_user exchange or polling
+    // bridge_status look idle, so the idle-revoke timer would pull control out
+    // from under a session that was actively working. Persisted because the
+    // worker is suspended and restarted constantly, and an in-memory-only
+    // timestamp resets to "now" on every wake — which would keep pushing the
+    // idle deadline out and stop the revoke from ever firing.
+    lastCommandAt = Date.now();
+    chrome.storage.local.set({ lastCommandAt });
+
     // ask_user and bridge_status are meta-commands: they must work even while
     // automation is paused, since answering is exactly how a user unblocks it.
     if (action === 'ask_user') {
@@ -458,18 +494,21 @@ export default defineBackground(() => {
       );
     }
 
-    lastCommandAt = Date.now();
-
     // Resolve the target tab once, against *this session's* grant, and use it
     // for everything downstream. Letting each handler fall back to Chrome's
     // "current window" independently is wrong as soon as two agents drive two
     // windows — whichever window was focused last would win.
     const tabId = msg.tabId ?? (await defaultTabFor(session));
     if (tabId != null) await enforceScope(session, tabId);
-    await enforcePolicy(action, params, tabId);
 
-    // Translate global refs down to per-frame refs before dispatch. Everything
-    // below this point works in the target frame's own ref space.
+    // Translate global refs down to per-frame refs *before* policy, not after.
+    // The destructive-label lookup reads the element by its ref, and a ref
+    // inside a cross-origin iframe has no match in the top frame — so labelling
+    // it against frame 0 silently failed and an embedded checkout's "Place
+    // order · $249" button was classified as a plain write, not destructive, and
+    // slipped through auto mode without a prompt. Localising first lets the
+    // lookup route to the ref's own frame. Everything below works in that frame's
+    // ref space.
     const targetTabId = tabId;
     let frameId = 0;
     if (targetTabId) {
@@ -477,6 +516,8 @@ export default defineBackground(() => {
       params = localised.params;
       frameId = localised.frameId;
     }
+
+    await enforcePolicy(action, params, tabId, frameId);
 
     // Where the tab sat before this command ran.
     //
@@ -517,8 +558,9 @@ export default defineBackground(() => {
     // A page that opened somewhere blocked in a new tab is just as much a way
     // past the domain lists as navigating this one, and leaves the blocked page
     // sitting there afterwards. Checked first, because it is the case that
-    // leaves state behind.
-    await guardOpenedTabs(action, startedAt);
+    // leaves state behind. Scoped to tabs THIS command's tab opened, so a
+    // concurrent agent's new tab is never caught here.
+    await guardOpenedTabs(action, startedAt, tabId);
 
     if (!tabId) return;
 
@@ -561,8 +603,21 @@ export default defineBackground(() => {
   }
 
   /** Closes any tab this command opened onto a blocked site, and refuses. */
-  async function guardOpenedTabs(action: string, startedAt: number): Promise<void> {
-    const opened = recentlyOpenedTabs.filter((t) => t.at >= startedAt);
+  async function guardOpenedTabs(
+    action: string,
+    startedAt: number,
+    targetTabId?: number,
+  ): Promise<void> {
+    const opened = recentlyOpenedTabs.filter(
+      (t) =>
+        t.at >= startedAt &&
+        // Only tabs THIS command's tab spawned. Attributing by opener keeps a
+        // concurrent agent's freshly opened tab from being closed here and
+        // failing the wrong command. A tab with no recorded opener (rare for
+        // command-driven opens) is only judged when we have no target to scope
+        // against, so an unattributable blocked popup is still caught.
+        (t.openerTabId === targetTabId || (t.openerTabId == null && targetTabId == null)),
+    );
     if (opened.length === 0) return;
 
     for (const { tabId } of opened) {
@@ -742,6 +797,12 @@ export default defineBackground(() => {
       if (frame.frameId === 0) continue;
       // about:blank and data: frames have no content script and no useful content.
       if (!/^https?:/i.test(frame.url)) continue;
+      // A subframe pointed at a blocked host is another way past the domain
+      // lists: the top-frame guards never see it (they watch frame 0 only), so
+      // its DOM would come back in the snapshot — the agent reading a blocked
+      // site it never "navigated" to. Skip capturing any denied frame, so no
+      // content and no refs into it are ever handed back.
+      if (firstDomainDenial(policy, [frame.url], 'navigate', 'snapshot')) continue;
       try {
         const sub = (await routeToContentScript(
           'snapshot',
@@ -771,11 +832,16 @@ export default defineBackground(() => {
     action: string,
     params: Record<string, unknown>,
     tabId: number,
+    frameId: number,
   ): Promise<string | undefined> {
     if (action === 'click_by_text') return String(params.text ?? '');
     if (params.ref == null) return undefined;
     try {
-      const res = (await routeToContentScript('get_text', { ref: params.ref }, tabId)) as {
+      // Read the element in the frame it actually lives in. `params.ref` is
+      // already the frame-local ref (refs are localised before policy runs), so
+      // the lookup must target the same frame or an iframe element reads as
+      // "not found" and its destructive label is lost.
+      const res = (await routeToContentScript('get_text', { ref: params.ref }, tabId, frameId)) as {
         text?: string;
       };
       return res?.text?.slice(0, 200);
@@ -820,11 +886,12 @@ export default defineBackground(() => {
     action: string,
     params: Record<string, unknown>,
     tabId?: number,
+    frameId = 0,
   ): Promise<void> {
     const targetTabId = tabId;
     const url = targetTabId ? ((await chrome.tabs.get(targetTabId)).url ?? '') : '';
 
-    const label = targetTabId ? await labelForClick(action, params, targetTabId) : undefined;
+    const label = targetTabId ? await labelForClick(action, params, targetTabId, frameId) : undefined;
     const risk = classify(action, label);
 
     const urls = await urlsInScopeOf(action, params, url);
@@ -1752,6 +1819,10 @@ export default defineBackground(() => {
     if (message?.type === 'arm_pairing') {
       controlEnabledAt = Date.now();
       pairBlocked = null;
+      rememberPairingWindow();
+      // Clear the refusal backoffs too: an agent turned away while the window
+      // was shut is precisely the one the user is now inviting in.
+      manager.rearm();
       updateBadge(controlMode ? 'on' : 'off');
       sendResponse({ ok: true });
       return true;
@@ -1766,6 +1837,17 @@ export default defineBackground(() => {
     if (message?.type === 'clear_pairings') {
       clearPairings().then(() => {
         disconnect();
+        // `disconnect()` stops the sweep, so without restarting it the panel
+        // would sit on "Looking for agents…" with nothing actually looking.
+        // Re-arm discovery if control mode is still on; agents will have to be
+        // paired again, which is the point of clearing.
+        if (controlMode) {
+          controlEnabledAt = Date.now();
+          pairBlocked = null;
+          rememberPairingWindow();
+          manager.start();
+          updateBadge('off');
+        }
         sendResponse({ ok: true });
       });
       return true;
@@ -1777,8 +1859,12 @@ export default defineBackground(() => {
       if (controlMode) {
         controlEnabledAt = Date.now();
         pairBlocked = null;
+        rememberPairingWindow();
         manager.start();
       } else {
+        controlEnabledAt = 0;
+        pairBlocked = null;
+        rememberPairingWindow();
         disconnect();
       }
       sendResponse({ ok: true });
@@ -1833,13 +1919,23 @@ export default defineBackground(() => {
    * been idle past the configured window, revoke access rather than leaving the
    * browser indefinitely drivable because someone left a tab open days ago.
    */
-  setInterval(() => {
+  // An alarm rather than setInterval: MV3 suspends this worker whenever nothing
+  // holds it open, which silently kills every timer — so on a quiet browser the
+  // revoke could simply never fire. Alarms survive suspension and wake the
+  // worker to run.
+  const IDLE_ALARM = 'onbridge-idle-revoke';
+  chrome.alarms?.create(IDLE_ALARM, { periodInMinutes: 1 });
+  chrome.alarms?.onAlarm.addListener((alarm) => {
+    if (alarm.name !== IDLE_ALARM) return;
     if (!controlMode || !policy.idleRevokeMinutes) return;
     const idleMs = Date.now() - lastCommandAt;
     if (idleMs < policy.idleRevokeMinutes * 60_000) return;
 
     controlMode = false;
     chrome.storage.local.set({ controlMode: false });
+    controlEnabledAt = 0;
+    pairBlocked = null;
+    rememberPairingWindow();
     disconnect();
     void chrome.notifications
       ?.create({
@@ -1850,7 +1946,7 @@ export default defineBackground(() => {
         priority: 1,
       })
       .catch(() => {});
-  }, 60_000);
+  });
 
   // A completed navigation is a natural moment to retry CDP: whatever blocked
   // attach (usually DevTools being open) may since have gone away, and without

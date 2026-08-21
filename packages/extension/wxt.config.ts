@@ -18,6 +18,9 @@ export default defineConfig({
       'notifications',
       // Enumerating frames is how a snapshot reaches inside iframes.
       'webNavigation',
+      // Timers do not survive MV3 worker suspension; alarms do. Idle-revoke and
+      // agent discovery both depend on still running on a quiet browser.
+      'alarms',
     ],
     host_permissions: ['<all_urls>'],
     side_panel: { default_path: 'sidepanel.html' },

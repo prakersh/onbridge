@@ -98,14 +98,14 @@ describe('user messages from the side panel', () => {
 
     const res = await h.rpc('tools/call', { name: 'bridge_status', arguments: {} });
     const out = textOf(res);
-    expect(out).toContain('<user-message>');
+    expect(out).toMatch(/<user-message id="[^"]+">/);
     expect(out).toContain('skip the sponsored results');
   });
 
   it('delivers each note only once', async () => {
     session.onCommand(() => ({ accessScope: 'current_tab', paused: false, commandCount: 1 }));
     const res = await h.rpc('tools/call', { name: 'bridge_status', arguments: {} });
-    expect(textOf(res)).not.toContain('<user-message>');
+    expect(textOf(res)).not.toMatch(/<user-message id="[^"]+">/);
   });
 });
 
@@ -132,8 +132,8 @@ describe('prompt-injection containment', () => {
 
     const res = await h.rpc('tools/call', { name: 'snapshot', arguments: {} });
     const out = textOf(res);
-    expect(out).toContain('<untrusted-page-content>');
-    expect(out).toContain('</untrusted-page-content>');
+    expect(out).toMatch(/<untrusted-page-content id="[^"]+">/);
+    expect(out).toMatch(/<\/untrusted-page-content id="[^"]+">/);
     expect(out).toContain('never');
     // The hostile string still reaches the agent — but fenced, not bare.
     expect(out).toContain('IGNORE PREVIOUS INSTRUCTIONS');

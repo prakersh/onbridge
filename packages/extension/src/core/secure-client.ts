@@ -106,6 +106,16 @@ export async function clearPairings(): Promise<void> {
 
 export class SecureClient {
   private ws: WebSocket | null = null;
+  /**
+   * The socket while the handshake is still in flight. `ws` is assigned only
+   * once the session is ready (so `isReady` stays honest), which left
+   * `disconnect()` unable to close a socket mid-handshake: toggling control mode
+   * off during a pairing prompt disposed the client but left its socket OPEN
+   * until the 90s timeout, and the server pins one client — so every redial in
+   * that window was refused as "Another client is already connected". Tracking
+   * the pending socket lets `disconnect()` close it immediately.
+   */
+  private pendingWs: WebSocket | null = null;
   private state: ClientState = 'idle';
   private txCounter = 0;
   private replay = new ReplayGuard();
@@ -174,11 +184,13 @@ export class SecureClient {
       } catch (err) {
         return reject(err as Error);
       }
+      this.pendingWs = ws;
 
       const giveUp = (why: string) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (this.pendingWs === ws) this.pendingWs = null;
         try {
           ws.close();
         } catch {
@@ -217,6 +229,7 @@ export class SecureClient {
               settled = true;
               clearTimeout(timer);
               this.ws = ws;
+              this.pendingWs = null;
               resolve();
             }
           } catch (err) {
@@ -318,6 +331,13 @@ export class SecureClient {
       this.noteIdentity(hs.agent);
       const allowed = await this.hooks.onPairRequest(hs.agent, { wasPaired: this.pairingWasReset });
       if (this.disposed) return;
+      // The prompt can sit on screen for up to a minute; the server may have gone
+      // in the meantime. Confirming on a dead socket used to still run
+      // `savePairing`, storing a secret the server never received — so the next
+      // contact looked like the server had reset our pairing, firing the "another
+      // program took this agent's place" alarm for an innocent cause. Only pair
+      // if the socket the prompt belongs to is still open.
+      if (ws.readyState !== WebSocket.OPEN) throw new Error('closed');
       if (!allowed) {
         await this.sendSealed(ws, this.handshakeKey!, { t: 'pair_denied' });
         throw new Error('pairing denied');
@@ -392,16 +412,22 @@ export class SecureClient {
    */
   disconnect(): void {
     this.disposed = true;
-    const ws = this.ws;
+    // Close whichever socket exists — the ready one, or one still mid-handshake.
+    // Leaving a handshake socket open holds the server's single-client slot and
+    // locks out every redial until its 90s timeout fires.
+    const sockets = [this.ws, this.pendingWs];
     this.ws = null;
+    this.pendingWs = null;
     this.sessionKey = undefined;
     this.pairingSecret = undefined;
     this.shared = undefined;
     this.state = 'idle';
-    try {
-      ws?.close();
-    } catch {
-      /* already closed */
+    for (const ws of sockets) {
+      try {
+        ws?.close();
+      } catch {
+        /* already closed */
+      }
     }
   }
 }

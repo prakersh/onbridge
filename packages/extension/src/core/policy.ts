@@ -170,6 +170,20 @@ export function destinationUrls(action: string, params: Record<string, unknown>)
   const out: string[] = [];
   // `navigate`, `new_tab` and `download_file` all carry their target here.
   if (typeof params.url === 'string' && params.url) out.push(params.url);
+  // Cookie reads and writes name a domain, not a URL, and that domain is a
+  // destination the lists must cover: without this an agent restricted to an
+  // allowlist (or with a bank on the denylist) could read or write that bank's
+  // cookies — credential theft or session fixation — with no domain block, and
+  // in bypass mode no prompt either. Synthesise a URL so `firstDomainDenial`
+  // sees the host.
+  if (
+    (action === 'get_cookies' || action === 'set_cookie') &&
+    typeof params.domain === 'string' &&
+    params.domain
+  ) {
+    const host = params.domain.replace(/^\./, '');
+    out.push(`https://${host}/`);
+  }
   return out;
 }
 

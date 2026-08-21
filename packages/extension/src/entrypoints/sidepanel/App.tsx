@@ -210,7 +210,14 @@ export default function App() {
    * nothing running at all — and that is the case a person most needs to see.
    */
   const refusals = status.sessions.filter(
-    (s) => s.status === 'failed' && s.detail && !/^(closed|disconnected|socket error)$/i.test(s.detail),
+    (s) =>
+      s.status === 'failed' &&
+      s.detail &&
+      // Ordinary probe churn, not something the user needs to see: a dead port,
+      // or a non-onbridge service answering on one of the ports we scan.
+      !/^(closed|disconnected|socket error|no onbridge server on this port|handshake timed out)$/i.test(
+        s.detail,
+      ),
   );
 
   const conn = owner

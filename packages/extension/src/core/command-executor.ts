@@ -308,11 +308,16 @@ export class CommandExecutor {
     }
 
     if (action === 'click') {
-      const target = elements[Math.min(index, elements.length - 1)] as HTMLElement;
-      target.scrollIntoView({ behavior: 'instant', block: 'center' });
-      target.click();
-      await this.settle();
-      return captureSnapshot();
+      // dom_query is read-only. Clicking here dispatched an untrusted
+      // `element.click()` in the page and, because the tool was classified
+      // read-only, skipped risk approval entirely — a "Place order" button
+      // pressed with no prompt. Clicks must go through the `click` tool, which
+      // uses trusted CDP input and is classified (and destructive-labelled)
+      // like the interaction it is.
+      throw new Error(
+        'dom_query does not click. Use the "click" tool with a ref from a snapshot, ' +
+          'or "click_by_text", so the action is approved and dispatched as trusted input.',
+      );
     }
 
     if (action === 'text') {
