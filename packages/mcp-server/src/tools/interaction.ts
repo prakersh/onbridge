@@ -69,7 +69,9 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
   server.registerTool(
     'fill_form',
     {
-      description: 'Fill multiple form fields at once. Each field identified by ref number and value. Major token saver vs individual type calls.',
+      description:
+        'Fill multiple form fields at once. Each field identified by ref number and value. Major token saver vs ' +
+        'individual type calls. Reports whether submitting navigated the page.',
       inputSchema: z.object({
         fields: z.array(z.object({
           ref: z.number().describe('Element ref number'),
@@ -81,8 +83,16 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
     async ({ fields, submit }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
-        const data = (await bridge.sendCommand('fill_form', { fields, submit })) as { filled: number };
-        return text(bridge, `Filled ${data.filled} field${data.filled === 1 ? '' : 's'}.`);
+        const data = (await bridge.sendCommand('fill_form', { fields, submit })) as {
+          filled: number;
+        } & Partial<ActionResult>;
+        const filled = `Filled ${data.filled} field${data.filled === 1 ? '' : 's'}.`;
+        // Submitting a login form navigates, and the agent had no way to learn
+        // that from "Filled 2 fields."
+        if (data.navigated) {
+          return actionReply(bridge, { ...(data as ActionResult), ok: true, action: 'fill_form' }, filled);
+        }
+        return text(bridge, filled);
       } catch (err) {
         return error(err);
       }

@@ -784,6 +784,19 @@ export default defineBackground(() => {
         return performPageAction(action, params, tabId, frameId);
       // Refs leaving the content script are frame-local; the agent only ever
       // sees global ones.
+      // Submitting a filled form is a navigation with no destination in the
+      // parameters, exactly like Enter in a search box.
+      case 'fill_form': {
+        if (!tabId) throw new Error('No active tab found');
+        const before = (await chrome.tabs.get(tabId).catch(() => null))?.url ?? '';
+        const at = Date.now();
+        const res = (await routeToContentScript(action, params, tabId, frameId)) as Record<
+          string,
+          unknown
+        >;
+        if (!params.submit) return res;
+        return reportNavigation(tabId, before, at, res);
+      }
       case 'find':
       case 'list_actions':
       case 'dom_query':
@@ -1153,8 +1166,30 @@ export default defineBackground(() => {
   /**
    * Actions that routinely submit a form and therefore move the page, without
    * any destination appearing in their parameters.
+   *
+   * Enter in a search box, or a filled login form, is a navigation the agent
+   * has no other way to learn about: the result used to be a bare "Typed
+   * successfully" while the browser was already on a different page.
    */
-  const MAY_SUBMIT = new Set(['type', 'press_key']);
+  const MAY_SUBMIT = new Set(['type', 'press_key', 'fill_form']);
+
+  /** Attaches where the page ended up, for an action that may have submitted. */
+  async function reportNavigation(
+    tabId: number,
+    urlBefore: string,
+    startedAt: number,
+    res: Record<string, unknown>,
+  ): Promise<unknown> {
+    const navigated = await awaitNavigationSettled(tabId, urlBefore, startedAt);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    return {
+      ...res,
+      navigated,
+      url: tab?.url ?? urlBefore,
+      title: tab?.title ?? '',
+      ...(navigated ? { from: urlBefore } : {}),
+    };
+  }
 
   async function handleTrustedAction(
     action: string,
@@ -1165,25 +1200,14 @@ export default defineBackground(() => {
     const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab found');
 
-    // Enter in a search box is a navigation the agent has no other way to
-    // learn about: the result used to be a bare "Typed successfully" while the
-    // browser was already on a different page.
     const urlBefore = MAY_SUBMIT.has(action)
       ? ((await chrome.tabs.get(targetTabId).catch(() => null))?.url ?? '')
       : '';
     const startedAt = Date.now();
-    const withNav = async (res: Record<string, unknown>): Promise<unknown> => {
-      if (!MAY_SUBMIT.has(action)) return res;
-      const navigated = await awaitNavigationSettled(targetTabId, urlBefore, startedAt);
-      const tab = await chrome.tabs.get(targetTabId).catch(() => null);
-      return {
-        ...res,
-        navigated,
-        url: tab?.url ?? urlBefore,
-        title: tab?.title ?? '',
-        ...(navigated ? { from: urlBefore } : {}),
-      };
-    };
+    const withNav = async (res: Record<string, unknown>): Promise<unknown> =>
+      MAY_SUBMIT.has(action)
+        ? reportNavigation(targetTabId, urlBefore, startedAt, res)
+        : res;
 
     try {
       switch (action) {
