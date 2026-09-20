@@ -10,7 +10,11 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
     'snapshot',
     {
       description:
-        'Capture a compact DOM tree of the current page. Interactive elements get numeric refs (use with click/type/fill_form/etc). Use target ref to scope to a subtree, depth to limit nesting. This is the primary way to see what is on the page.',
+        'Capture a compact DOM tree of the current page. Interactive elements get numeric refs (use with ' +
+        'click/type/fill_form/etc). Use target ref to scope to a subtree, depth to limit nesting. ' +
+        'This is the tool for ACTING on a page — it is also the most expensive one here, because most of what it ' +
+        'returns is structure. If you only need to read the page, use extract_text; if you know what you are ' +
+        'looking for, use find. Reach for those first and snapshot when you need refs.',
       inputSchema: z.object({
         target: z.number().optional().describe('Ref number to scope snapshot to a subtree'),
         depth: z.number().optional().describe('Max nesting depth to capture'),

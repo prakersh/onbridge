@@ -57,8 +57,13 @@ const PAGE = `<!doctype html><html><body>
      this and report the element as empty. -->
 <my-article></my-article>
 
+<!-- The three href forms an agent will meet. A relative one must come back
+     resolved (a relative URL handed to navigate goes nowhere), an absolute one
+     unchanged, and a javascript: target must report as having no destination
+     rather than tempting a navigate to it. -->
 <a class="result" href="/next?id=1">Result one</a>
-<a class="result" href="/next?id=2">Result two</a>
+<a class="result" href="http://127.0.0.1:8931/next?id=2">Result two</a>
+<a class="result" href="javascript:void(0)">Result three</a>
 
 <my-widget></my-widget>
 <iframe id="frame" src="/frame" width="300" height="140"></iframe>
@@ -744,6 +749,22 @@ async function main() {
     /\/next\?id=2/.test(attrs)
       ? ok('dom_query can read an attribute across matches')
       : bad('dom_query attr', attrs.slice(0, 220));
+
+    // A relative href handed straight to navigate goes nowhere, so it has to
+    // come back resolved.
+    /http:\/\/127\.0\.0\.1:8931\/next\?id=1/.test(attrs)
+      ? ok('a relative href comes back absolute')
+      : bad('relative href resolved', attrs.slice(0, 220));
+
+    // And a javascript: target reports as no destination, the same answer find
+    // and dom_query list give — the three must not disagree.
+    !/javascript:/.test(attrs) && /\(none\)/.test(attrs)
+      ? ok('a javascript: href reports as no destination')
+      : bad('javascript: href suppressed', attrs.slice(0, 220));
+
+    !/javascript:/.test(linkResults)
+      ? ok('find omits javascript: targets too')
+      : bad('find omits javascript: hrefs', linkResults.slice(0, 220));
 
     // ── navigate without paying for a snapshot ──────────────────────
     // On a real results page the snapshot is almost the entire cost of the

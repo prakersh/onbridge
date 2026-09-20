@@ -10,6 +10,9 @@ gaps as https://github.com/prakersh/onbridge/issues/2.
 **All of these are fixed in v0.4.0.** A "Resolution" line follows each one. The attached
 screen recording was reference material only and is not in the repository.
 
+Commits: `74fb17b` (the bulk), `d48c842` (`fill_form` submits), `HEAD` (DOM-quiet settle,
+href forms, tool-description steering).
+
 ---
 
 ## Bug 1 — Stale extension-side pairing secret is an unrecoverable dead end
@@ -23,7 +26,7 @@ recovery guidance ("remove `~/.onbridge/peers.json`") is a trap if followed part
 because TOFU then refuses the very extension being fixed, and the panel asserts the record
 "was replaced" as fact when the server holds the `peers.json` mtime that disproves it.
 
-**Resolution.** Root cause was Bug 6 (below), plus a second identity race nobody had spotted:
+**Resolution** (`74fb17b`). Root cause was Bug 6 (below), plus a second identity race nobody had spotted:
 `getServerId()` re-read `server-key.json` on every call, so two servers starting together each
 generated an id and each overwrote the other's file — a process could announce id X in
 `hello_ack` and then save the pairing record under the *other* process's id Y. It is now read
@@ -85,7 +88,7 @@ iteration then throws and masks the successful click.
 still return action success plus the new URL, e.g. `{ ok: true, navigated: true, url }`.
 Never report a performed action as a failure.
 
-**Resolution — FIXED in v0.4.0.** Diagnosis confirmed, and there was a second cause: the
+**Resolution — FIXED in v0.4.0** (`74fb17b`). Diagnosis confirmed, and there was a second cause: the
 extension slept a flat 300ms after a click and compared URLs, so a navigation that committed
 at 400-600ms was recorded as "did not navigate" *and* then failed snapshotting a document
 being torn down — which is the non-determinism reported here. `click`, `click_by_text`,
@@ -122,7 +125,7 @@ A following `get_url` succeeded and showed the new page had in fact loaded, and 
 **Suggested fix:** detect the disconnected content script and either wait for re-injection
 or return a typed, retryable error rather than a raw Chrome messaging string.
 
-**Resolution — FIXED in v0.4.0.** Both. `routeToContentScript` re-delivers across the
+**Resolution — FIXED in v0.4.0** (`74fb17b`). Both. `routeToContentScript` re-delivers across the
 navigation window (up to three attempts, waiting for the tab to go quiet between them) and, if
 it persists, throws a `RetryableError` carrying `errorCode: 'navigating'` and `retryAfterMs` on
 the wire. The agent sees `[retryable: navigating] Nothing was changed by this call — making it
@@ -149,7 +152,7 @@ Empty is indistinguishable from "this element genuinely has no text", so an agen
 a wrong conclusion rather than retry. Returning an error when the ref resolves to nothing
 readable would be safer than returning `""`.
 
-**Resolution — FIXED in v0.4.0.** `extract_text` now returns three distinguishable answers:
+**Resolution — FIXED in v0.4.0** (`74fb17b`). `extract_text` now returns three distinguishable answers:
 `{ error: 'ref-not-found' }`, `{ text: '', empty: true }`, or the text. The tool renders each
 as different prose, so a bare `""` can no longer reach the agent. The structured walk also
 falls back to `innerText`/`textContent` when it produces nothing, so a container whose text
@@ -173,7 +176,7 @@ An immediate retry of a similar DuckDuckGo URL worked normally.
 explain it entirely. Not reproduced. Needs a second sighting before it is worth acting on —
 noted so that if anyone else sees it there is a prior report.
 
-**Resolution — MADE VISIBLE in v0.4.0.** Not investigated further, as agreed. `navigate` now
+**Resolution — MADE VISIBLE in v0.4.0** (`74fb17b`). Not investigated further, as agreed. `navigate` now
 compares the origin it landed on with the one that was asked for and sets `redirectedFrom` when
 they differ; the reply tells the agent plainly that this is not the origin it requested. So a
 hijacked or human-interrupted navigation shows up in the result instead of silently returning
@@ -284,7 +287,7 @@ one — which is a shame, because Bug 1's message asserts a claim that this fiel
    it and surface it in the panel, rather than letting the count grow silently.
 4. **Update `lastSeen`** on every successful authentication.
 
-**Resolution — FIXED in v0.4.0**, all four, plus the identity race described under Bug 1.
+**Resolution — FIXED in v0.4.0** (`74fb17b`), all four, plus the identity race described under Bug 1.
 
 1. `peers.json` is v2: keyed by `(extensionId, serverId)`, written under an advisory directory
    lock with stale-lock breaking. A v1 flat map is migrated on read and only rewritten on the

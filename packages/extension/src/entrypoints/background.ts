@@ -1326,6 +1326,18 @@ export default defineBackground(() => {
   /** Hard cap on waiting for a started navigation to finish loading. */
   const NAV_COMPLETE_BUDGET_MS = 10_000;
   const NAV_POLL_MS = 40;
+  /**
+   * Hard cap on waiting for the DOM to stop moving after a load completes.
+   *
+   * A tab reports `complete` when the *document* finished loading, which on a
+   * client-rendered page is before any of the content the agent came for
+   * exists. Snapshotting there returns an empty shell, and an empty shell reads
+   * to an agent as "this page has nothing on it" — a wrong answer delivered
+   * with no error. Short and capped, because the alternative failure is paying
+   * this on every action.
+   */
+  const DOM_QUIET_BUDGET_MS = 1_500;
+  const DOM_QUIET_SAMPLE_MS = 150;
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -1370,7 +1382,29 @@ export default defineBackground(() => {
     // the tab reports 'complete'. Snapshotting inside that gap is exactly how
     // "Receiving end does not exist" used to reach the agent.
     await sleep(150);
+    await settleDom(tabId);
     return true;
+  }
+
+  /**
+   * Waits for two consecutive identical DOM readings, or gives up.
+   *
+   * Returns the moment the page stops changing, so a static page costs one
+   * sample and a React app that renders after `load` is not photographed
+   * mid-build. Unmeasurable is not a reason to wait: if the signature cannot be
+   * read at all — no content script, a restricted page — spending the budget
+   * buys nothing.
+   */
+  async function settleDom(tabId: number): Promise<void> {
+    const deadline = Date.now() + DOM_QUIET_BUDGET_MS;
+    let previous = await domSignature(tabId);
+    if (previous == null) return;
+    while (Date.now() < deadline) {
+      await sleep(DOM_QUIET_SAMPLE_MS);
+      const current = await domSignature(tabId);
+      if (current == null || current === previous) return;
+      previous = current;
+    }
   }
 
   /**

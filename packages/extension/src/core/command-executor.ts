@@ -378,8 +378,13 @@ export class CommandExecutor {
         // attribute is often relative, and a relative URL handed to `navigate`
         // goes nowhere.
         value:
+          // `href` is resolved, and a `javascript:` target reports as absent —
+          // the same answer `find` and `list` give, so the three surfaces
+          // cannot disagree about whether a link has somewhere to go. Handing
+          // back `javascript:void(0)` would read as a destination and invite a
+          // `navigate` to it.
           attr === 'href' && (el.tagName === 'A' || el.tagName === 'AREA')
-            ? (absoluteHref(el) ?? el.getAttribute('href') ?? null)
+            ? (absoluteHref(el) ?? null)
             : attr === 'src' && 'src' in el
               ? ((el as HTMLImageElement).src || el.getAttribute('src') || null)
               : el.getAttribute(attr),
