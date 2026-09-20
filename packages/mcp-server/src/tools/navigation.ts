@@ -1,24 +1,41 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { serializeSnapshot } from '@onbridge/shared';
-import type { PageSnapshot } from '@onbridge/shared';
+import type { ActionResult } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';
-import { text, pageText, image, error, notConnected } from './reply.js';
+import { pageText, error, notConnected, actionReply } from './reply.js';
 
 export function registerNavigationTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
     'navigate',
     {
-      description: 'Navigate to a URL in the browser. Waits for page load and returns a compact page snapshot with interactive element refs.',
+      description:
+        'Navigate to a URL. Waits for the page to load, then returns where it ended up plus a page snapshot with ' +
+        'interactive element refs. On a heavy page that snapshot is most of the cost of the call: if you only need ' +
+        'to READ the page, pass snapshot:false and follow with extract_text or find, which is far cheaper. ' +
+        'Use compact/depth to trim the snapshot the same way the snapshot tool does.',
       inputSchema: z.object({
         url: z.string().describe('The URL to navigate to'),
+        snapshot: z
+          .boolean()
+          .optional()
+          .describe('Return a page snapshot (default true). Set false for just the URL and title.'),
+        compact: z
+          .boolean()
+          .optional()
+          .describe('Compact snapshot: skip nav/footer/ads. Reduces size by ~70% on e-commerce sites.'),
+        depth: z.number().optional().describe('Max nesting depth to capture in the snapshot'),
       }),
     },
-    async ({ url }) => {
+    async ({ url, snapshot, compact, depth }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
-        const data = (await bridge.sendCommand('navigate', { url })) as PageSnapshot;
-        return pageText(bridge, serializeSnapshot(data), `Navigated to ${url}.`);
+        const data = (await bridge.sendCommand('navigate', {
+          url,
+          snapshot,
+          compact,
+          depth,
+        })) as ActionResult;
+        return actionReply(bridge, data, `Navigated to ${url}.`);
       } catch (err) {
         return error(err);
       }

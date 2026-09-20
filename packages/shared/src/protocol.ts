@@ -39,6 +39,15 @@ export const ALL_COMMAND_ACTIONS = [
   'get_cookies',
   'set_cookie',
   'console_logs',
+  /** Recent network activity for the tab. Header values arrive redacted. */
+  'network_requests',
+  /**
+   * One response body, fetched on demand. Deliberately separate from
+   * `network_requests`: a body can carry credentials and personal data, so it
+   * is classified higher and asked for explicitly rather than riding along with
+   * every listing.
+   */
+  'network_request_body',
   'download_file',
   'list_downloads',
   'activity_log',
@@ -66,6 +75,13 @@ export type ServerMessage =
   | { type: 'ping' };
 
 // Extension → MCP Server
+/** One console line, as it crosses the wire. */
+export interface ConsoleDeltaEntry {
+  level: string;
+  text: string;
+  timestamp: number;
+}
+
 export type ExtensionMessage =
   | { type: 'ready'; version: string; controlMode: boolean }
   | {
@@ -85,6 +101,33 @@ export type ExtensionMessage =
        * older extension that does not send it will produce.
        */
       errorKind?: 'trusted';
+      /**
+       * A machine-readable name for the failure, so the agent can act on the
+       * *kind* of error rather than pattern-matching English.
+       *
+       * `navigating` is the one that matters: a content script is torn down and
+       * re-injected on every page load, and a command that lands in that window
+       * used to surface Chrome's raw "Could not establish connection. Receiving
+       * end does not exist." — indistinguishable, to an agent, from the page
+       * genuinely not having the element. It is a retry, not a failure.
+       *
+       * Only ever set alongside `errorKind: 'trusted'`: a code is a claim about
+       * provenance, and a page-derived error must not be able to present itself
+       * as a well-known onbridge condition.
+       */
+      errorCode?: 'navigating' | 'no-content-script' | 'ref-not-found';
+      /** How long to wait before retrying, for a retryable `errorCode`. */
+      retryAfterMs?: number;
+      /**
+       * Console output the page produced *while this command ran*.
+       *
+       * Carried on the result rather than fetched separately so a failure is
+       * legible at the moment it happens: a form submit that threw used to
+       * return a bare "Typed successfully" and the explanation sat in the
+       * console until the agent thought to go looking for it. Page-controlled,
+       * so it is fenced like any other page text.
+       */
+      consoleDelta?: ConsoleDeltaEntry[];
       timing: number;
     }
   | {

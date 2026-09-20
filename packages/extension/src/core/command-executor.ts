@@ -1,5 +1,20 @@
-import { getElementByRef, captureSnapshot, getRefMap } from './dom-capture.js';
-import type { PageSnapshot } from '@onbridge/shared';
+import { getElementByRef, captureSnapshot, getRefMap, absoluteHref } from './dom-capture.js';
+import type { ExtractTextResult } from '@onbridge/shared';
+
+/**
+ * What an in-page action reports back.
+ *
+ * Deliberately *not* a snapshot. The background script builds the post-action
+ * snapshot, because only it can tell whether the page navigated and wait for
+ * the new document — a content script that navigated itself away is gone before
+ * it could capture anything, which is how a completed click came back to the
+ * agent as `snapshot.tree is not iterable`.
+ */
+interface ActionAck {
+  success: true;
+  /** Synthetic events, i.e. the CDP path was unavailable. */
+  trusted?: false;
+}
 
 export class CommandExecutor {
   async execute(action: string, params: Record<string, unknown>): Promise<unknown> {
@@ -90,12 +105,19 @@ export class CommandExecutor {
    * markdown. A snapshot is the right tool for *acting* on a page; for reading
    * an article or a results table it wastes most of its tokens on structure.
    */
-  private extractText(params: Record<string, unknown>): {
-    text: string;
-    truncated: boolean;
-    chars: number;
-  } {
-    const root = params.ref != null ? (this.getEl(params.ref as number) as HTMLElement) : document.body;
+  private extractText(params: Record<string, unknown>): ExtractTextResult {
+    let root: HTMLElement;
+    if (params.ref != null) {
+      // Reported as a typed outcome rather than thrown. A ref that no longer
+      // resolves and an element that is genuinely blank are different answers,
+      // and both used to arrive as the same bare `""` — which reads as "this
+      // section of the page is empty" and is acted on as fact.
+      const found = getElementByRef(params.ref as number) as HTMLElement | undefined;
+      if (!found) return { text: '', truncated: false, chars: 0, error: 'ref-not-found' };
+      root = found;
+    } else {
+      root = document.body;
+    }
     const maxChars = (params.maxChars as number) ?? 20_000;
 
     const parts: string[] = [];
@@ -136,11 +158,26 @@ export class CommandExecutor {
 
     walk(root);
 
-    const full = parts.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    let full = parts.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+
+    // The structured walk is an optimisation, not the source of truth. It skips
+    // anything it judges invisible and descends only through element children
+    // and open shadow roots, so a container whose text lives somewhere it does
+    // not look comes back blank while the text is plainly there. Falling back to
+    // the element's own text means the worst case is unformatted output, not a
+    // confident wrong answer that the section is empty.
+    if (!full) {
+      const fallback = (root.innerText ?? root.textContent ?? '').replace(/[ \t]+/g, ' ').trim();
+      if (fallback) full = fallback;
+    }
+
     return {
       text: full.slice(0, maxChars),
       truncated: full.length > maxChars,
       chars: full.length,
+      // Said explicitly, because "" and "I could not read it" are different
+      // answers and the agent must not have to guess which one it got.
+      ...(full.length === 0 ? { empty: true as const } : {}),
     };
   }
 
@@ -184,6 +221,7 @@ export class CommandExecutor {
         type: (el as HTMLInputElement).type || undefined,
         disabled: (el as HTMLInputElement).disabled || undefined,
         inViewport: rect.top >= 0 && rect.top < window.innerHeight,
+        href: absoluteHref(el),
       });
     }
     return { actions };
@@ -216,7 +254,7 @@ export class CommandExecutor {
     return { text: el.textContent?.trim() ?? '' };
   }
 
-  private async click(params: Record<string, unknown>): Promise<PageSnapshot> {
+  private async click(params: Record<string, unknown>): Promise<ActionAck> {
     const el = this.getEl(params.ref as number) as HTMLElement;
     const button = (params.button as string) ?? 'left';
     const buttonNum = button === 'right' ? 2 : button === 'middle' ? 1 : 0;
@@ -244,10 +282,12 @@ export class CommandExecutor {
       }
     }
 
-    return captureSnapshot();
+    // No snapshot from here: this page may already be on its way out. The
+    // background waits for whatever happens next and captures it there.
+    return { success: true, trusted: false };
   }
 
-  private async clickByText(params: Record<string, unknown>): Promise<PageSnapshot> {
+  private async clickByText(params: Record<string, unknown>): Promise<ActionAck> {
     const text = String(params.text ?? '');
     const role = params.role as string | undefined;
     const index = (params.index as number) ?? 0;
@@ -294,7 +334,7 @@ export class CommandExecutor {
     target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
 
     await this.settle();
-    return captureSnapshot();
+    return { success: true, trusted: false };
   }
 
   private async domQuery(params: Record<string, unknown>): Promise<unknown> {
@@ -325,6 +365,29 @@ export class CommandExecutor {
       return { text: target.textContent?.trim() ?? '' };
     }
 
+    if (action === 'attr') {
+      // Reading an attribute — `href` above all — is what lets the agent follow
+      // a link with `navigate` instead of clicking it. Without it the only way
+      // to reach a search result was a navigating click, which is the single
+      // most failure-prone thing the bridge does.
+      const attr = String(params.attr ?? 'href');
+      const values = elements.slice(0, 50).map((el, i) => ({
+        index: i,
+        tag: el.tagName.toLowerCase(),
+        // For href/src the resolved property is the useful answer: the raw
+        // attribute is often relative, and a relative URL handed to `navigate`
+        // goes nowhere.
+        value:
+          attr === 'href' && (el.tagName === 'A' || el.tagName === 'AREA')
+            ? (absoluteHref(el) ?? el.getAttribute('href') ?? null)
+            : attr === 'src' && 'src' in el
+              ? ((el as HTMLImageElement).src || el.getAttribute('src') || null)
+              : el.getAttribute(attr),
+        text: (el.textContent?.trim() ?? '').slice(0, 60),
+      }));
+      return { matches: elements.length, attr, values };
+    }
+
     // action === 'list'
     const map = getRefMap();
     const results = elements.slice(0, 20).map((el, i) => {
@@ -338,13 +401,14 @@ export class CommandExecutor {
         tag: el.tagName.toLowerCase(),
         text: (el.textContent?.trim() ?? '').slice(0, 80),
         id: el.id || undefined,
+        href: absoluteHref(el),
       };
     });
 
     return { matches: elements.length, results };
   }
 
-  private async dismissModal(params: Record<string, unknown>): Promise<PageSnapshot> {
+  private async dismissModal(params: Record<string, unknown>): Promise<ActionAck> {
     const searchText = params.text as string | undefined;
 
     const dismissPatterns = [
@@ -487,7 +551,10 @@ export class CommandExecutor {
     target.scrollIntoView({ behavior: 'instant', block: 'center' });
     target.click();
     await this.settle();
-    return captureSnapshot();
+    // Dismissing a banner frequently navigates ("Continue to site"), so this
+    // reports only that the click landed; the background decides what the page
+    // became.
+    return { success: true, trusted: false };
   }
 
   private async typeText(params: Record<string, unknown>): Promise<{ success: boolean }> {
@@ -585,7 +652,7 @@ export class CommandExecutor {
     return { success: true };
   }
 
-  private async scroll(params: Record<string, unknown>): Promise<PageSnapshot> {
+  private async scroll(params: Record<string, unknown>): Promise<ActionAck> {
     const direction = params.direction as string;
     const amount = params.amount ?? 'page';
     const ref = params.ref as number | undefined;
@@ -617,7 +684,7 @@ export class CommandExecutor {
     }
 
     await this.settle();
-    return captureSnapshot();
+    return { success: true, trusted: false };
   }
 
   private pressKey(params: Record<string, unknown>): { success: boolean } {

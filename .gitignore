@@ -40,3 +40,13 @@ artifacts/
 
 # Gemini
 .gemini/
+
+# Research notes — local only, deliberately not checked in
+RESEARCH-*.md
+
+# Local capture material from bug investigations — screen recordings and panel
+# stills. Never committed: a raw capture is hundreds of megabytes (GitHub's hard
+# limit is 100MB), and even the re-encoded ones are reference material for one
+# investigation, not part of the project. Describe what a capture showed in the
+# bug log instead.
+docs/evidence/

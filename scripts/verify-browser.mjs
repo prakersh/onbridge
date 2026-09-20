@@ -39,6 +39,27 @@ const PAGE = `<!doctype html><html><body>
 <a id="xlink" href="http://localhost:8932/frame">Go cross-site</a>
 <button id="popbtn" onclick="window.open('http://localhost:8932/frame')">Open cross-site popup</button>
 
+<!-- A same-site link, for the case that broke: a click that navigates. -->
+<a id="samelink" href="/next">Go to the next page</a>
+
+<!-- A container that HAS text, reachable only by ref. tabindex is what makes
+     it interactive enough to be given one, the same way a real results grid
+     earns one from a jsaction or a pointer cursor. -->
+<div id="results" tabindex="0">
+  <div class="row"><span>Widget A</span> <span>Rs 2,400</span></div>
+  <div class="row"><span>Widget B</span> <span>Rs 3,100</span></div>
+</div>
+
+<!-- A container that genuinely has none. Must read differently from the above. -->
+<div id="emptybox" tabindex="0"></div>
+
+<!-- Text that lives in a shadow root: the walker used to miss content like
+     this and report the element as empty. -->
+<my-article></my-article>
+
+<a class="result" href="/next?id=1">Result one</a>
+<a class="result" href="/next?id=2">Result two</a>
+
 <my-widget></my-widget>
 <iframe id="frame" src="/frame" width="300" height="140"></iframe>
 <iframe id="xframe" src="http://localhost:8932/frame" width="300" height="140"></iframe>
@@ -52,6 +73,13 @@ const PAGE = `<!doctype html><html><body>
 <script>
   // A web component with an OPEN shadow root: its content is invisible to a
   // flat querySelectorAll, which is exactly the gap being tested.
+  customElements.define('my-article', class extends HTMLElement {
+    constructor() {
+      super();
+      this.attachShadow({ mode: 'open' }).innerHTML =
+        '<p>Shadow article body about SIP gateways.</p>';
+    }
+  });
   customElements.define('my-widget', class extends HTMLElement {
     constructor() {
       super();
@@ -85,7 +113,26 @@ async function main() {
   // ── static test page ────────────────────────────────────────────────
   const http = createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/html' });
-    res.end(req.url === '/frame' ? FRAME('same-origin') : PAGE);
+    if (req.url === '/frame') return void res.end(FRAME('same-origin'));
+    // The destination of the same-site link, so a navigating click has
+    // somewhere real to land.
+    //
+    // Deliberately slow. The bug being guarded against was a fixed 300ms sleep
+    // after a click: on a heavy site the navigation committed later than that,
+    // the extension concluded nothing had happened, and then failed
+    // snapshotting a document that was being torn down. An instant local page
+    // would never have caught it.
+    if (req.url?.startsWith('/next')) {
+      return void setTimeout(
+        () =>
+          res.end(
+            '<!doctype html><html><head><title>Next page</title></head><body>' +
+              '<h1>You have arrived</h1><button id="nextbtn">On the next page</button></body></html>',
+          ),
+        700,
+      );
+    }
+    res.end(PAGE);
   });
   await new Promise((r) => http.listen(8931, '127.0.0.1', r));
   const PAGE_URL = 'http://127.0.0.1:8931/';
@@ -576,6 +623,146 @@ async function main() {
       : bad('strict mode allows reads', textOf(strictRead).slice(0, 120));
 
     await send({ type: 'set_approval_mode', mode: 'auto' });
+
+    // ── the result shape of an action that moves the page ───────────
+    // The defect this covers: a click that navigated tore down the content
+    // script, the post-click snapshot could not be built, and the whole call
+    // came back as `snapshot.tree is not iterable` — reporting a click that
+    // had already happened as a failure, which invites a retry.
+    await page.goto(PAGE_URL);
+    await page.waitForTimeout(300);
+
+    const linkFind = textOf(await call('find', { selector: '#samelink' }));
+    const navRef = /\[link:(\d+)\]/.exec(linkFind)?.[1];
+    if (!navRef) {
+      bad('found the same-site link', linkFind.slice(0, 200));
+    } else {
+      // A ref straight out of `find`, never through a snapshot. `find` used to
+      // return the content script's own frame-local refs while `snapshot`
+      // returned global ones, so the two numbering schemes were mixed in one
+      // namespace and a `find` ref was translated into a different element.
+      const navRes = await call('click', { ref: Number(navRef) });
+      const navText = textOf(navRes);
+      await page.waitForTimeout(400);
+
+      !navRes.result?.isError
+        ? ok('a click that navigates is not reported as a failure')
+        : bad('navigating click succeeds', navText.slice(0, 220));
+
+      /not iterable/.test(navText)
+        ? bad('no snapshot.tree crash', navText.slice(0, 220))
+        : ok('no snapshot.tree crash on a navigating click');
+
+      /navigated/i.test(navText) && navText.includes('/next')
+        ? ok('a navigating click reports where the page went')
+        : bad('navigating click reports the new URL', navText.slice(0, 220));
+
+      navText.includes('You have arrived')
+        ? ok('a navigating click returns a snapshot of the NEW page')
+        : bad('navigating click snapshots the new page', navText.slice(0, 220));
+
+      const landed = textOf(await call('get_url', {}));
+      landed.includes('/next')
+        ? ok('the click actually navigated')
+        : bad('click navigated', landed.slice(0, 160));
+    }
+
+    await page.goto(PAGE_URL);
+    await page.waitForTimeout(300);
+
+    // A click that does NOT navigate must say so, and say whether anything
+    // moved — "clicked into the void" is how an agent ends up confidently
+    // continuing down a dead path.
+    const staticFind = textOf(await call('find', { selector: '#btn' }));
+    const staticRef = /\[button:(\d+)\]/.exec(staticFind)?.[1];
+    if (staticRef) {
+      const staticRes = await call('click', { ref: Number(staticRef) });
+      const staticText = textOf(staticRes);
+      !staticRes.result?.isError && !/navigated/i.test(staticText.split('\n')[0])
+        ? ok('a click that stays put reports no navigation')
+        : bad('non-navigating click', staticText.slice(0, 200));
+
+      // …and it landed on the element `find` named, which is the ref-namespace
+      // check: a mistranslated ref clicks something else entirely.
+      const clicks = (await page.evaluate(() => window.__log)).filter((e) => e.t === 'click');
+      clicks.length > 0
+        ? ok('a ref from find clicks the element find named')
+        : bad('find ref clicks the right element', 'no click event on #btn');
+    } else {
+      bad('found the plain button by selector', staticFind.slice(0, 160));
+    }
+
+    // ── extract_text with a ref ─────────────────────────────────────
+    // It used to return a bare "" for a populated container, which is
+    // indistinguishable from "this section is empty" and is acted on as fact.
+    const resultsFind = textOf(await call('find', { selector: '#results' }));
+    const resultsRef = /:(\d+)\]/.exec(resultsFind)?.[1];
+    if (!resultsRef) {
+      bad('results container has a ref', resultsFind.slice(0, 200));
+    } else {
+      const scoped = textOf(await call('extract_text', { ref: Number(resultsRef) }));
+      scoped.includes('Widget A') && scoped.includes('Rs 3,100')
+        ? ok('extract_text scoped to a ref returns that section')
+        : bad('extract_text with a ref', scoped.slice(0, 220));
+
+      const whole = textOf(await call('extract_text', {}));
+      whole.includes('Widget A')
+        ? ok('extract_text without a ref still reads the page')
+        : bad('extract_text unscoped', whole.slice(0, 200));
+    }
+
+    const emptyFind = textOf(await call('find', { selector: '#emptybox' }));
+    const emptyRef = /:(\d+)\]/.exec(emptyFind)?.[1];
+    if (emptyRef) {
+      const emptyText = textOf(await call('extract_text', { ref: Number(emptyRef) }));
+      /no readable text/i.test(emptyText)
+        ? ok('a genuinely empty element says so instead of returning nothing')
+        : bad('empty element reported', emptyText.slice(0, 200));
+    } else {
+      bad('empty container has a ref', emptyFind.slice(0, 160));
+    }
+
+    const goneText = textOf(await call('extract_text', { ref: 999999 }));
+    /no element with ref/i.test(goneText)
+      ? ok('a ref that resolves to nothing is reported, not answered with ""')
+      : bad('dead ref reported', goneText.slice(0, 200));
+
+    // Text inside a shadow root is the walker's blind spot, and the likeliest
+    // cause of a populated container reading as empty.
+    const shadowText = textOf(await call('extract_text', {}));
+    shadowText.includes('Shadow article body')
+      ? ok('extract_text reaches text inside a shadow root')
+      : bad('extract_text reads shadow DOM', shadowText.slice(0, 200));
+
+    // ── reading link destinations instead of clicking them ──────────
+    const linkResults = textOf(await call('find', { selector: 'a.result' }));
+    /\/next\?id=1/.test(linkResults)
+      ? ok('find reports absolute hrefs for links')
+      : bad('find reports hrefs', linkResults.slice(0, 220));
+
+    const attrs = textOf(await call('dom_query', { selector: 'a.result', action: 'attr', attr: 'href' }));
+    /\/next\?id=2/.test(attrs)
+      ? ok('dom_query can read an attribute across matches')
+      : bad('dom_query attr', attrs.slice(0, 220));
+
+    // ── navigate without paying for a snapshot ──────────────────────
+    // On a real results page the snapshot is almost the entire cost of the
+    // call, and there was no way to decline it.
+    await call('navigate', { url: `${PAGE_URL}next` });
+    const quietText = textOf(await call('navigate', { url: PAGE_URL, snapshot: false }));
+    await call('navigate', { url: `${PAGE_URL}next` });
+    const loudText = textOf(await call('navigate', { url: PAGE_URL }));
+
+    quietText.includes(PAGE_URL) && !/\[button:/.test(quietText)
+      ? ok('navigate with snapshot:false returns the URL and no page tree')
+      : bad('navigate snapshot:false', quietText.slice(0, 220));
+
+    /\[button:/.test(loudText) && loudText.length > quietText.length * 3
+      ? ok('the snapshot is what costs, and it is now optional', `${quietText.length} vs ${loudText.length} chars`)
+      : bad('navigate snapshot cost', `${quietText.length} vs ${loudText.length} chars`);
+
+    await page.goto(PAGE_URL);
+    await page.waitForTimeout(300);
 
     // ── ask_user round trip through the real panel ──────────────────
     const askPromise = call('ask_user', { question: 'Proceed?', options: ['yes', 'no'] });

@@ -36,6 +36,7 @@ import type {
   AgentIdentity,
   ExtensionMessage,
   HandshakeFrame,
+  PairingEvidence,
   ServerMessage,
 } from '@onbridge/shared';
 
@@ -104,6 +105,34 @@ export async function clearPairings(): Promise<void> {
   await chrome.storage.local.remove(PAIRINGS_KEY);
 }
 
+/**
+ * Drops the secret for one server and leaves the rest alone.
+ *
+ * This is the missing exit from the dead end: when the browser holds a secret
+ * the server no longer accepts, there was nothing in the UI that could fix it —
+ * the only way out was hand-editing a file in `~/.onbridge`. Forgetting just
+ * this one puts the handshake back on the `pair_reset` path, where the server
+ * drops its record and the user is asked to approve a fresh pairing, with the
+ * anomaly named. `clearPairings` is the blunt version and throws away working
+ * pairings with the broken one.
+ */
+export async function forgetPairing(serverId: string): Promise<boolean> {
+  const all =
+    ((await chrome.storage.local.get(PAIRINGS_KEY))[PAIRINGS_KEY] as Record<string, string>) ?? {};
+  if (!(serverId in all)) return false;
+  delete all[serverId];
+  await chrome.storage.local.set({ [PAIRINGS_KEY]: all });
+  return true;
+}
+
+/** Server ids this browser holds a secret for. Values never leave this module. */
+export async function knownPairings(): Promise<string[]> {
+  const all = (await chrome.storage.local.get(PAIRINGS_KEY))[PAIRINGS_KEY] as
+    | Record<string, string>
+    | undefined;
+  return Object.keys(all ?? {});
+}
+
 export class SecureClient {
   private ws: WebSocket | null = null;
   /**
@@ -140,6 +169,21 @@ export class SecureClient {
   private pendingChallenge?: string;
   /** See `onPairRequest`: this server forgot a pairing we still hold. */
   private pairingWasReset = false;
+  /**
+   * The two candidate secrets, both known from `hello_ack` onwards.
+   *
+   * Which one is correct is decided by the *next* frame, not by
+   * `hello_ack.paired`. Several agent processes share one server identity, so a
+   * server that saw no pairing record when it answered `hello` may find one a
+   * moment later — written by a sibling that was mid-pairing — and send a
+   * `challenge` where it had implied `pair_required`. Committing to a secret at
+   * `hello_ack` is what made those handshakes answer with the wrong one and
+   * dead-end at `invalid auth proof`.
+   */
+  private derivedSecret?: Uint8Array;
+  private storedSecret?: Uint8Array;
+  /** What the server said when it refused us, with whatever it could prove. */
+  private failure?: { reason: string; evidence?: PairingEvidence };
 
   constructor(
     readonly port: number,
@@ -160,6 +204,17 @@ export class SecureClient {
 
   getIdentity(): AgentIdentity | undefined {
     return this.identity;
+  }
+
+  /**
+   * Why the server turned us away, and what it could show for it.
+   *
+   * Kept so the panel can stop guessing at the cause. `invalid auth proof` has
+   * an innocent explanation and a hostile one, and the timestamps the server
+   * reports are the only thing that tells them apart.
+   */
+  getFailure(): { reason: string; evidence?: PairingEvidence } | undefined {
+    return this.failure;
   }
 
   private setState(s: ClientState, detail?: string): void {
@@ -288,6 +343,9 @@ export class SecureClient {
       this.sessionId = await computeSessionId(this.ePub, frame.sPub, this.eNonce, frame.sNonce);
 
       const stored = await loadPairing(frame.serverId);
+      this.storedSecret = stored;
+      this.derivedSecret = pairingSecret;
+
       if (frame.paired) {
         if (!stored) {
           // Server remembers us but we lost the secret (reinstall). Ask it to
@@ -300,8 +358,9 @@ export class SecureClient {
       } else {
         // We hold a secret for this server and it does not know us. Something
         // dropped its record; the user is told so when we ask them to pair.
+        // The secret itself is chosen when the branching frame arrives — see
+        // `derivedSecret`.
         this.pairingWasReset = Boolean(stored);
-        this.pairingSecret = pairingSecret;
         this.setState('pairing');
       }
       return;
@@ -329,6 +388,10 @@ export class SecureClient {
 
     if (hs.t === 'pair_required') {
       this.noteIdentity(hs.agent);
+      // A pairing always uses the freshly derived secret; the server derived
+      // the same one from the same exchange and neither side transmitted it.
+      this.pairingSecret = this.derivedSecret;
+      this.setState('pairing');
       const allowed = await this.hooks.onPairRequest(hs.agent, { wasPaired: this.pairingWasReset });
       if (this.disposed) return;
       // The prompt can sit on screen for up to a minute; the server may have gone
@@ -353,6 +416,18 @@ export class SecureClient {
 
     if (hs.t === 'challenge') {
       this.noteIdentity(hs.agent);
+      // A challenge means the server holds a record — even if `hello_ack` said
+      // otherwise, because a sibling process may have paired in between. Answer
+      // with the stored secret, which is what that record was written from.
+      if (!this.pairingSecret) this.pairingSecret = this.storedSecret;
+      if (!this.pairingSecret) {
+        // It has a record we cannot match. Rather than answering with a secret
+        // we know is wrong and dead-ending at `invalid auth proof`, ask it to
+        // drop the record so a fresh pairing can be approved.
+        await this.sendSealed(ws, this.handshakeKey!, { t: 'pair_reset' });
+        return;
+      }
+      this.setState('authenticating');
       await this.sendSealed(ws, this.handshakeKey!, {
         t: 'auth',
         proof: await makeProof(this.pairingSecret!, PROOF_AUTH_EXT, this.sessionId, hs.nonce),
@@ -377,7 +452,10 @@ export class SecureClient {
       return;
     }
 
-    if (hs.t === 'auth_fail') throw new Error(hs.reason);
+    if (hs.t === 'auth_fail') {
+      this.failure = { reason: hs.reason, evidence: hs.evidence };
+      throw new Error(hs.reason);
+    }
   }
 
   private async promote(): Promise<void> {
@@ -420,6 +498,8 @@ export class SecureClient {
     this.pendingWs = null;
     this.sessionKey = undefined;
     this.pairingSecret = undefined;
+    this.derivedSecret = undefined;
+    this.storedSecret = undefined;
     this.shared = undefined;
     this.state = 'idle';
     for (const ws of sockets) {

@@ -1,7 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import { serializeSnapshot, serializeFindResults } from '@onbridge/shared';
-import type { PageSnapshot, FindResult } from '@onbridge/shared';
+import type { PageSnapshot, FindResult, ExtractTextResult } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';
 import { text, pageText, image, error, notConnected } from './reply.js';
 
@@ -32,7 +32,9 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
     'find',
     {
       description:
-        'Search the page for elements matching text, role, or CSS selector. Returns matching elements with ref numbers and surrounding context. More token-efficient than a full snapshot when you know what you are looking for.',
+        'Search the page for elements matching text, role, or CSS selector. Returns matching elements with ref numbers, ' +
+        'surrounding context, and — for links — the absolute href, so you can navigate straight to a result instead of ' +
+        'clicking through it. More token-efficient than a full snapshot when you know what you are looking for.',
       inputSchema: z.object({
         text: z.string().optional().describe('Text to search for (case-insensitive substring match)'),
         role: z.string().optional().describe('Filter by element role (button, link, textbox, etc)'),
@@ -103,11 +105,29 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
     async ({ ref, maxChars }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
-        const data = (await bridge.sendCommand('extract_text', { ref, maxChars })) as {
-          text: string;
-          truncated: boolean;
-          chars: number;
-        };
+        const data = (await bridge.sendCommand('extract_text', { ref, maxChars })) as ExtractTextResult;
+
+        // A bare "" used to cover three different answers — the element has no
+        // text, the ref names nothing, and the reader failed — and an agent
+        // reasonably reads all three as "this section of the page is empty".
+        // Each says what it is now.
+        if (data.error === 'ref-not-found') {
+          return text(
+            bridge,
+            `No element with ref ${ref} is on the page any more. Take a fresh snapshot or find, ` +
+              'then read the new ref.',
+          );
+        }
+        if (data.empty) {
+          return text(
+            bridge,
+            ref != null
+              ? `Element ${ref} is on the page but has no readable text. It may be an image, an ` +
+                  'icon, or a container whose content has not loaded. Read a parent, or snapshot it.'
+              : 'The page has no readable text yet.',
+          );
+        }
+
         const suffix = data.truncated
           ? `\n\n[truncated — ${data.chars} characters total; re-read a specific section with ref]`
           : '';
@@ -137,6 +157,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
           const bits = [
             `[${a.tag}${a.type ? `:${a.type}` : ''}:${a.ref}]`,
             a.label ? `"${a.label}"` : '',
+            a.href ? `→ ${a.href}` : '',
             a.disabled ? '(disabled)' : '',
             a.inViewport ? '' : '(off-screen)',
           ].filter(Boolean);

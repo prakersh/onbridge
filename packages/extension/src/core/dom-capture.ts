@@ -451,10 +451,34 @@ export function findElements(query: string, role?: string, selector?: string): F
       }
     }
 
-    results.push({ ref, role: elRole, name: name || truncate(el.textContent?.trim() ?? ''), context });
+    results.push({
+      ref,
+      role: elRole,
+      name: name || truncate(el.textContent?.trim() ?? ''),
+      context,
+      ...(absoluteHref(el) ? { href: absoluteHref(el) } : {}),
+    });
   }
 
   return results;
+}
+
+/**
+ * The full destination of a link, resolved against the document.
+ *
+ * Deliberately *not* the truncated, query-stripped form the snapshot shows:
+ * that one is for a human skim-reading structure, this one is meant to be fed
+ * straight back to `navigate`, so losing the query string would send the agent
+ * to the wrong page. `javascript:` targets are omitted — there is nothing to
+ * navigate to, and offering one invites the agent to try.
+ */
+export function absoluteHref(el: Element): string | undefined {
+  if (el.tagName !== 'A' && el.tagName !== 'AREA') return undefined;
+  const raw = el.getAttribute('href');
+  if (!raw) return undefined;
+  const resolved = (el as HTMLAnchorElement).href;
+  if (!resolved || /^javascript:/i.test(resolved)) return undefined;
+  return resolved;
 }
 
 export function getRefMap(): Map<number, Element> {

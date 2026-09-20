@@ -12,6 +12,10 @@ const READ = new Set([
   'snapshot', 'find', 'get_text', 'get_url', 'screenshot', 'dom_query',
   'list_tabs', 'console_logs', 'activity_log', 'list_downloads', 'wait',
   'bridge_status', 'ask_user',
+  // Metadata only — URLs, methods, statuses, sizes, and headers whose sensitive
+  // values the extension redacts before they are ever buffered. Response
+  // *bodies* are a different question and are classified `sensitive` below.
+  'network_requests',
   // Read-only, and previously in no set at all — so they fell through to the
   // `write` default and asked for approval in strict mode. Prompting for a
   // highlight is exactly the noise that teaches people to click Allow without
@@ -27,7 +31,13 @@ const NAVIGATE = new Set(['navigate', 'back', 'forward', 'reload', 'new_tab', 's
  * primitives a prompt-injected agent would reach for, so they are gated by
  * default however innocuous the immediate call looks.
  */
-const SENSITIVE = new Set(['get_cookies', 'set_cookie', 'evaluate', 'upload', 'download_file']);
+const SENSITIVE = new Set([
+  'get_cookies', 'set_cookie', 'evaluate', 'upload', 'download_file',
+  // A response body is the least predictable thing on this list: session
+  // tokens, personal data and whole API payloads all arrive through it. Listing
+  // requests is a read; reading what came back is not.
+  'network_request_body',
+]);
 
 const WRITE = new Set([
   'click', 'click_by_text', 'type', 'fill_form', 'select', 'hover', 'scroll',

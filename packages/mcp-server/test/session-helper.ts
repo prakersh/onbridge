@@ -249,6 +249,11 @@ export async function openSession(): Promise<Session> {
           // Mirrors the extension: only errors it composed itself are marked, so
           // a handler can simulate a governance refusal as well as a page throw.
           const trusted = Boolean((e as { onbridgeTrusted?: boolean }).onbridgeTrusted);
+          // A retryable condition travels as a code, not as English — see
+          // `errorCode` in the protocol. Mirrored here so a handler can
+          // simulate "the page was navigating" the way the extension sends it.
+          const code = (e as { onbridgeCode?: string }).onbridgeCode;
+          const retryAfterMs = (e as { onbridgeRetryAfterMs?: number }).onbridgeRetryAfterMs;
           await sendSealed(st.sessionKey, {
             type: 'result',
             id: msg.id,
@@ -256,6 +261,7 @@ export async function openSession(): Promise<Session> {
             data: null,
             error: (e as Error).message,
             ...(trusted ? { errorKind: 'trusted' as const } : {}),
+            ...(trusted && code ? { errorCode: code as never, retryAfterMs } : {}),
             timing: Date.now() - start,
           });
         }
@@ -290,6 +296,24 @@ export async function openSession(): Promise<Session> {
       await new Promise((r) => setTimeout(r, 150));
     },
   };
+}
+
+/**
+ * Waits until the server considers the encrypted channel usable.
+ *
+ * `openSession` resolves as soon as it has *sent* `pair_confirm`; the server
+ * only becomes connected once it has processed that frame and derived the
+ * session key. A tool called in that gap comes back "Extension not connected",
+ * which looks like a tool bug and is a harness race.
+ */
+export async function waitForBridge(h: Harness): Promise<void> {
+  for (let i = 0; i < 60; i++) {
+    const res = await h.rpc('tools/call', { name: 'bridge_status', arguments: {} });
+    const body = (res.result?.content ?? []).map((c: any) => c.text ?? '').join('');
+    if (!/not connected/i.test(body)) return;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error('bridge never reported a live session');
 }
 
 export async function waitForListening(): Promise<void> {

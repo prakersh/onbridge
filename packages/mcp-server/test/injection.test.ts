@@ -86,6 +86,18 @@ const CASES: Array<[string, Record<string, unknown>, unknown]> = [
   ['download_file', { url: 'https://evil.test/f' }, { filename: PAYLOAD, path: '/tmp/x' }],
   ['activity_log', {}, { entries: [{ action: 'click', summary: PAYLOAD, success: true, timing: 1, timestamp: 0 }], totalCommands: 1 }],
   ['dom_query', { selector: 'p', action: 'text' }, { text: PAYLOAD }],
+  // Network metadata is chosen end to end by pages and servers: the payload can
+  // ride in a URL the page requested or in a header value a server minted.
+  ['network_requests', {}, {
+    entries: [{ requestId: 'r1', url: `https://evil.test/?q=${PAYLOAD}`, method: 'GET', status: 200, startedAt: 0 }],
+    total: 1,
+  }],
+  ['network_requests', { urlFilter: 'evil' }, {
+    entries: [{ requestId: 'r2', url: 'https://evil.test/', method: 'GET', status: 200, responseHeaders: { 'x-greeting': PAYLOAD }, startedAt: 0 }],
+    total: 1,
+  }],
+  // A response body is the most page-controlled output there is.
+  ['network_request_body', { requestId: 'r1' }, { body: PAYLOAD, base64Encoded: false, mimeType: 'text/html' }],
 ];
 
 describe('page-derived content is fenced', () => {
@@ -119,6 +131,24 @@ describe('page-derived content is fenced', () => {
     // The override text stays inside the fence: the real close comes after it.
     const realClose = out.indexOf(closeMatch![0]);
     expect(realClose).toBeGreaterThan(out.indexOf('Operator override'));
+  });
+
+  it('keeps the body-unavailable notice unfenced and caps huge bodies', async () => {
+    // "No longer available" is our own wording, so fencing it would teach the
+    // agent to second-guess it; and a multi-megabyte body must not land in the
+    // context whole.
+    const gone = await call('network_request_body', { requestId: 'r-gone' }, null);
+    expect(gone).not.toMatch(OPEN);
+    expect(gone).toMatch(/no longer available/);
+
+    const huge = await call(
+      'network_request_body',
+      { requestId: 'r-big' },
+      { body: 'A'.repeat(25_000), base64Encoded: false },
+    );
+    expect(huge).toMatch(OPEN);
+    expect(huge).toContain('truncated to 20000 of 25000 chars');
+    expect(huge.length).toBeLessThan(22_000);
   });
 
   it('keeps the servers own confirmations unfenced', async () => {

@@ -1,5 +1,17 @@
-export type { DomNode, PageSnapshot, FindResult, ScrollState } from './dom-types.js';
-export type { ServerMessage, ExtensionMessage, CommandAction } from './protocol.js';
+export type {
+  DomNode,
+  PageSnapshot,
+  FindResult,
+  ScrollState,
+  ActionResult,
+  ExtractTextResult,
+} from './dom-types.js';
+export type {
+  ServerMessage,
+  ExtensionMessage,
+  CommandAction,
+  ConsoleDeltaEntry,
+} from './protocol.js';
 export {
   ALL_COMMAND_ACTIONS,
   WS_PORT,
@@ -26,7 +38,7 @@ export {
   fingerprint,
 } from './crypto.js';
 
-export type { HandshakeFrame, AgentIdentity } from './handshake.js';
+export type { HandshakeFrame, AgentIdentity, PairingEvidence } from './handshake.js';
 export {
   HANDSHAKE_VERSION,
   PROOF_PAIR,

@@ -209,18 +209,51 @@ export interface ConsoleEntry {
 const consoleByTab = new Map<number, ConsoleEntry[]>();
 const CONSOLE_LIMIT = 200;
 
+/**
+ * Entries evicted (or cleared) per tab, ever. Cursors are absolute positions in
+ * the tab's full history — `dropped + buffer length` — so they stay valid while
+ * the capped buffer shifts underneath them.
+ */
+const consoleDropped = new Map<number, number>();
+
 export function getConsole(tabId: number): ConsoleEntry[] {
   return consoleByTab.get(tabId) ?? [];
 }
 
 export function clearConsole(tabId: number): void {
+  // Cleared entries count as dropped: a cursor taken before the clear must keep
+  // meaning "everything after that point", not resurrect pre-clear positions.
+  const list = consoleByTab.get(tabId);
+  if (list) consoleDropped.set(tabId, (consoleDropped.get(tabId) ?? 0) + list.length);
   consoleByTab.delete(tabId);
+}
+
+/** Current position in this tab's console log — an opaque cursor. */
+export function consoleCursor(tabId: number): number {
+  return (consoleDropped.get(tabId) ?? 0) + (consoleByTab.get(tabId)?.length ?? 0);
+}
+
+/**
+ * Console entries recorded after `cursor`.
+ *
+ * The buffer is capped, so a cursor can point at entries already evicted. That
+ * gap is unreportable — the entries are gone — so this returns everything that
+ * remains rather than throwing or pretending nothing happened. The caller sees
+ * at most CONSOLE_LIMIT entries either way.
+ */
+export function consoleSince(tabId: number, cursor: number): ConsoleEntry[] {
+  const list = consoleByTab.get(tabId) ?? [];
+  return list.slice(Math.max(0, cursor - (consoleDropped.get(tabId) ?? 0)));
 }
 
 function record(tabId: number, entry: ConsoleEntry): void {
   const list = consoleByTab.get(tabId) ?? [];
   list.push(entry);
-  if (list.length > CONSOLE_LIMIT) list.splice(0, list.length - CONSOLE_LIMIT);
+  if (list.length > CONSOLE_LIMIT) {
+    const excess = list.length - CONSOLE_LIMIT;
+    list.splice(0, excess);
+    consoleDropped.set(tabId, (consoleDropped.get(tabId) ?? 0) + excess);
+  }
   consoleByTab.set(tabId, list);
 }
 
@@ -230,6 +263,109 @@ export async function enableConsoleCapture(tabId: number): Promise<void> {
   // page itself never sees.
   await attach(tabId);
   await send(tabId, 'Log.enable').catch(() => {});
+}
+
+export interface NetworkEntry {
+  requestId: string;
+  url: string;
+  method: string;
+  resourceType?: string;
+  status?: number;
+  statusText?: string;
+  mimeType?: string;
+  /** Redacted — see below. */
+  requestHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string>;
+  encodedDataLength?: number;
+  startedAt: number;
+  endedAt?: number;
+  /** Set when the request failed; the CDP error text. */
+  failed?: string;
+  fromCache?: boolean;
+}
+
+/**
+ * Network activity, captured per tab and correlated by requestId.
+ *
+ * A Map keyed by requestId doubles as the ordered buffer: insertion order is
+ * request-start order, and late events (response, completion) mutate their
+ * entry in place without reordering it.
+ */
+const networkByTab = new Map<number, Map<string, NetworkEntry>>();
+const NETWORK_LIMIT = 200;
+
+/**
+ * Headers whose values never enter the buffer. Everything stored here flows
+ * verbatim into the agent's context, and downstream layers cannot un-leak a
+ * bearer token they were handed — so credentials are dropped at record time,
+ * unconditionally, in the extension. The header *name* is kept: "there was an
+ * Authorization header" is useful and harmless; its value is neither.
+ */
+const REDACTED_HEADERS = new Set([
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'proxy-authorization',
+  'x-api-key',
+]);
+
+function redactHeaders(headers: unknown): Record<string, string> | undefined {
+  if (!headers || typeof headers !== 'object') return undefined;
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers as Record<string, unknown>)) {
+    out[name] = REDACTED_HEADERS.has(name.toLowerCase()) ? '[redacted]' : String(value);
+  }
+  return out;
+}
+
+/** Idempotent; safe to call on an already-capturing tab. */
+export async function enableNetworkCapture(tabId: number): Promise<void> {
+  // Network may already be enabled by the denylist (`applyBlockedUrls`); CDP
+  // treats a repeat `Network.enable` as a no-op, and it does not disturb the
+  // blocked-URL patterns already set on the session.
+  await attach(tabId);
+  await send(tabId, 'Network.enable').catch(() => {});
+}
+
+export function getNetwork(tabId: number): NetworkEntry[] {
+  return [...(networkByTab.get(tabId)?.values() ?? [])];
+}
+
+export function clearNetwork(tabId: number): void {
+  networkByTab.delete(tabId);
+}
+
+/** Null when the body is unavailable (evicted, no body, or tab gone). */
+export async function getResponseBody(
+  tabId: number,
+  requestId: string,
+): Promise<{ body: string; base64Encoded: boolean } | null> {
+  try {
+    const r = await send<{ body: string; base64Encoded: boolean }>(
+      tabId,
+      'Network.getResponseBody',
+      { requestId },
+    );
+    return { body: r.body, base64Encoded: r.base64Encoded };
+  } catch {
+    // CDP evicts bodies from its own buffer, some responses have none, and the
+    // tab may have detached — all routine, none worth surfacing as a throw.
+    return null;
+  }
+}
+
+function recordRequest(tabId: number, entry: NetworkEntry): void {
+  const map = networkByTab.get(tabId) ?? new Map<string, NetworkEntry>();
+  map.set(entry.requestId, entry);
+  // Every page load appends here; without a cap this is a memory-growth
+  // primitive. Oldest first, same bound as the console buffer.
+  if (map.size > NETWORK_LIMIT) {
+    for (const key of map.keys()) {
+      map.delete(key);
+      if (map.size <= NETWORK_LIMIT) break;
+    }
+  }
+  networkByTab.set(tabId, map);
 }
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
@@ -266,6 +402,53 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     return;
   }
 
+  if (method === 'Network.requestWillBeSent') {
+    // A redirect re-sends the same requestId; keeping the original start time
+    // makes the entry describe the whole chain, ending at the final URL.
+    const prior = networkByTab.get(tabId)?.get(p.requestId);
+    recordRequest(tabId, {
+      requestId: p.requestId,
+      url: p.request?.url ?? '',
+      method: p.request?.method ?? 'GET',
+      resourceType: p.type,
+      requestHeaders: redactHeaders(p.request?.headers),
+      startedAt: prior?.startedAt ?? Date.now(),
+    });
+    return;
+  }
+  if (method === 'Network.responseReceived') {
+    const e = networkByTab.get(tabId)?.get(p.requestId);
+    if (!e) return;
+    e.status = p.response?.status;
+    e.statusText = p.response?.statusText;
+    e.mimeType = p.response?.mimeType;
+    e.responseHeaders = redactHeaders(p.response?.headers);
+    // The response event carries the headers as actually sent on the wire,
+    // which includes what the browser added after requestWillBeSent.
+    if (p.response?.requestHeaders) e.requestHeaders = redactHeaders(p.response.requestHeaders);
+    if (p.response?.fromDiskCache || p.response?.fromPrefetchCache) e.fromCache = true;
+    return;
+  }
+  if (method === 'Network.loadingFinished') {
+    const e = networkByTab.get(tabId)?.get(p.requestId);
+    if (!e) return;
+    e.endedAt = Date.now();
+    e.encodedDataLength = p.encodedDataLength;
+    return;
+  }
+  if (method === 'Network.loadingFailed') {
+    const e = networkByTab.get(tabId)?.get(p.requestId);
+    if (!e) return;
+    e.endedAt = Date.now();
+    e.failed = p.errorText || 'failed';
+    return;
+  }
+  if (method === 'Network.requestServedFromCache') {
+    const e = networkByTab.get(tabId)?.get(p.requestId);
+    if (e) e.fromCache = true;
+    return;
+  }
+
   if (method === 'Runtime.consoleAPICalled') {
     record(tabId, {
       level: p.type ?? 'log',
@@ -299,11 +482,22 @@ chrome.debugger.onDetach.addListener((source) => {
   if (source.tabId == null) return;
   attached.delete(source.tabId);
   worldsByTab.delete(source.tabId);
+  networkByTab.delete(source.tabId);
+});
+
+// The network log describes one page, so it resets when the tab leaves it.
+// onBeforeNavigate rather than a CDP signal, because it fires before the new
+// document's own request starts — clearing on `executionContextsCleared` would
+// arrive after that request and silently drop the new page's first entry.
+chrome.webNavigation.onBeforeNavigate.addListener((details) => {
+  if (details.frameId === 0) networkByTab.delete(details.tabId);
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   attached.delete(tabId);
   refused.delete(tabId);
   consoleByTab.delete(tabId);
+  consoleDropped.delete(tabId);
+  networkByTab.delete(tabId);
   worldsByTab.delete(tabId);
 });

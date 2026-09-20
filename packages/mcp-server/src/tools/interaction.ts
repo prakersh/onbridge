@@ -1,15 +1,17 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { serializeSnapshot } from '@onbridge/shared';
-import type { PageSnapshot } from '@onbridge/shared';
+import type { ActionResult } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';
-import { text, pageText, image, error, notConnected } from './reply.js';
+import { text, error, notConnected, actionReply } from './reply.js';
 
 export function registerInteractionTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
     'click',
     {
-      description: 'Click an element by ref number (from snapshot/find). Returns updated page snapshot.',
+      description:
+        'Click an element by ref number (from snapshot/find). Reports whether the page navigated, where it ended up, ' +
+        'and the updated snapshot. If the click ran but the page could not be captured afterwards the call still succeeds ' +
+        'and says so — it never reports a click that happened as a failure, so do not re-click on an error.',
       inputSchema: z.object({
         ref: z.number().describe('Element ref number from snapshot or find'),
         button: z.enum(['left', 'right', 'middle']).optional().describe('Mouse button'),
@@ -19,8 +21,8 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
     async ({ ref, button, doubleClick }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
-        const data = (await bridge.sendCommand('click', { ref, button, doubleClick })) as PageSnapshot;
-        return pageText(bridge, serializeSnapshot(data), 'Done. The page now reads:');
+        const data = (await bridge.sendCommand('click', { ref, button, doubleClick })) as ActionResult;
+        return actionReply(bridge, data, 'Clicked.');
       } catch (err) {
         return error(err);
       }
@@ -30,7 +32,9 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
   server.registerTool(
     'type',
     {
-      description: 'Type text into an input element by ref. Set clear to erase existing text first. Set submit to press Enter after typing.',
+      description:
+        'Type text into an input element by ref. Set clear to erase existing text first. Set submit to press Enter after typing. ' +
+        'Reports whether submitting navigated the page.',
       inputSchema: z.object({
         ref: z.number().describe('Element ref number'),
         text: z.string().describe('Text to type'),
@@ -41,7 +45,20 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
     async ({ ref, text: inputText, clear, submit }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
-        await bridge.sendCommand('type', { ref, text: inputText, clear, submit });
+        const data = (await bridge.sendCommand('type', { ref, text: inputText, clear, submit })) as
+          | Partial<ActionResult>
+          | undefined;
+        // Enter in a search box is a navigation with no destination anywhere in
+        // the parameters. Reporting a bare "Typed successfully" while the
+        // browser was already on a different page left the agent acting on a
+        // page it did not know it had left.
+        if (data?.navigated) {
+          return actionReply(
+            bridge,
+            { ...(data as ActionResult), ok: true, action: 'type' },
+            'Typed.',
+          );
+        }
         return text(bridge, 'Typed successfully.');
       } catch (err) {
         return error(err);
@@ -114,7 +131,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
   server.registerTool(
     'scroll',
     {
-      description: 'Scroll the page or a specific element. Returns updated page snapshot.',
+      description: 'Scroll the page or a specific element. Returns where the page is now and an updated snapshot.',
       inputSchema: z.object({
         direction: z.enum(['up', 'down', 'left', 'right']).describe('Scroll direction'),
         amount: z.union([z.literal('page'), z.literal('half'), z.number()]).optional().describe('Scroll amount: "page", "half", or pixels'),
@@ -124,8 +141,8 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
     async ({ direction, amount, ref }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
-        const data = (await bridge.sendCommand('scroll', { direction, amount, ref })) as PageSnapshot;
-        return pageText(bridge, serializeSnapshot(data), 'Done. The page now reads:');
+        const data = (await bridge.sendCommand('scroll', { direction, amount, ref })) as ActionResult;
+        return actionReply(bridge, data, 'Scrolled.');
       } catch (err) {
         return error(err);
       }
@@ -144,8 +161,14 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
     async ({ key, modifiers }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
-        await bridge.sendCommand('press_key', { key, modifiers });
-        return text(bridge, `Pressed ${modifiers?.length ? modifiers.join('+') + '+' : ''}${key}.`);
+        const data = (await bridge.sendCommand('press_key', { key, modifiers })) as
+          | Partial<ActionResult>
+          | undefined;
+        const pressed = `Pressed ${modifiers?.length ? modifiers.join('+') + '+' : ''}${key}.`;
+        if (data?.navigated) {
+          return actionReply(bridge, { ...(data as ActionResult), ok: true, action: 'press_key' }, pressed);
+        }
+        return text(bridge, pressed);
       } catch (err) {
         return error(err);
       }
@@ -195,7 +218,9 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
   server.registerTool(
     'click_by_text',
     {
-      description: 'Click an element by its visible text content. No prior snapshot needed — finds and clicks in one call. Returns updated snapshot.',
+      description:
+        'Click an element by its visible text content. No prior snapshot needed — finds and clicks in one call. ' +
+        'Reports whether the page navigated, where it ended up, and the updated snapshot.',
       inputSchema: z.object({
         text: z.string().describe('Text to search for (case-insensitive)'),
         role: z.string().optional().describe('Filter by element role (button, link, etc)'),
@@ -205,8 +230,8 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
     async ({ text: searchText, role, index }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
-        const data = (await bridge.sendCommand('click_by_text', { text: searchText, role, index })) as PageSnapshot;
-        return pageText(bridge, serializeSnapshot(data), 'Done. The page now reads:');
+        const data = (await bridge.sendCommand('click_by_text', { text: searchText, role, index })) as ActionResult;
+        return actionReply(bridge, data, 'Clicked.');
       } catch (err) {
         return error(err);
       }
@@ -224,8 +249,8 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
     async ({ text: dismissText }) => {
       if (!bridge.isConnected()) return notConnected();
       try {
-        const data = (await bridge.sendCommand('dismiss_modal', { text: dismissText })) as PageSnapshot;
-        return pageText(bridge, serializeSnapshot(data), 'Done. The page now reads:');
+        const data = (await bridge.sendCommand('dismiss_modal', { text: dismissText })) as ActionResult;
+        return actionReply(bridge, data, 'Dismissed.');
       } catch (err) {
         return error(err);
       }

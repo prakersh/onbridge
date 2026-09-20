@@ -58,9 +58,24 @@ afterAll(() => h?.stop());
 
 const settle = () => new Promise((r) => setTimeout(r, 500));
 
+/**
+ * The peer store, flattened to one record per extension id.
+ *
+ * On disk it is keyed by extension id *and* server id, so that a single
+ * pairing can be forgotten without taking the others with it. These tests are
+ * about "is there a record for this extension, and did it change", so they read
+ * through that second level rather than restating it in every assertion.
+ */
 function peers(): Record<string, { pairingSecret: string }> {
   try {
-    return JSON.parse(readFileSync(join(h.home, 'peers.json'), 'utf8'));
+    const raw = JSON.parse(readFileSync(join(h.home, 'peers.json'), 'utf8'));
+    if (raw?.version !== 2) return raw ?? {};
+    const out: Record<string, { pairingSecret: string }> = {};
+    for (const [extId, byServer] of Object.entries(raw.peers ?? {})) {
+      const record = Object.values(byServer as Record<string, { pairingSecret: string }>)[0];
+      if (record) out[extId] = record;
+    }
+    return out;
   } catch {
     return {};
   }

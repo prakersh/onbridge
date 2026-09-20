@@ -29,11 +29,21 @@
  *    │ ─────────────────────────────────────────────────────>│
  *    │  auth_ok      {proof}   ← extension verifies this too │
  *    │ <─────────────────────────────────────────────────────│
+ *    │        …or auth_fail {reason, evidence}               │
  *    │                                                       │
  *    │  ── all further frames sealed under sessionKey ──     │
  *
  * The pairing secret is *derived* on both sides from the same ECDH output. It is
  * never transmitted, and it never enters the agent's context.
+ *
+ * Which branch runs is decided by the frame the server sends *after* `hello_ack`
+ * — `pair_required` or `challenge` — not by `hello_ack.paired`. Those can
+ * disagree: several agent processes share one `~/.onbridge`, so a server that
+ * saw no pairing record when it answered `hello` may find one moments later,
+ * written by a sibling that was mid-pairing. `hello_ack.paired` is therefore a
+ * hint for the UI, and the branching frame is the authority. Choosing the secret
+ * at `hello_ack` is what made concurrent first-runs clobber one another and
+ * dead-end at `invalid auth proof`.
  */
 
 import {
@@ -46,11 +56,19 @@ import {
 } from './crypto.js';
 
 /**
- * Bumped to 2 for the agent-identity fields. A mismatched peer is rejected with
- * a message telling the user to update, which is far better than the silent
- * misbehaviour you get from changing frame shapes in place.
+ * Bumped to 3: the server may now answer `hello_ack {paired:false}` with a
+ * `challenge` rather than `pair_required`, when a sibling server process
+ * finishes pairing while this handshake is waiting on the cross-process pairing
+ * lock. An older extension chooses its secret at `hello_ack` and would answer
+ * that challenge with the wrong one — failing as `invalid auth proof`, which is
+ * exactly the dead end this release removes. A version check turns that into
+ * "update the browser extension", which is actionable.
+ *
+ * (2 added the agent-identity fields.) A mismatched peer is rejected with a
+ * message telling the user which side to update, which is far better than the
+ * silent misbehaviour you get from changing frame shapes in place.
  */
-export const HANDSHAKE_VERSION = 2;
+export const HANDSHAKE_VERSION = 3;
 
 /** Domain-separation labels. Distinct per direction to prevent proof reflection. */
 export const PROOF_PAIR = 'onbridge/pair/ext';
@@ -102,8 +120,33 @@ export type HandshakeFrame =
   | { t: 'challenge'; nonce: string; agent: AgentIdentity }
   | { t: 'auth'; proof: string }
   | { t: 'auth_ok'; proof: string }
-  | { t: 'auth_fail'; reason: string }
+  | { t: 'auth_fail'; reason: string; evidence?: PairingEvidence }
   | ({ t: 'enc' } & SealedFrame);
+
+/**
+ * What the server actually knows about the record a failed proof was checked
+ * against.
+ *
+ * A stale local secret and a hostile takeover produce the identical symptom —
+ * `invalid auth proof` — but leave very different traces, and the server is
+ * holding the trace that separates them. Asserting "its record was replaced" as
+ * fact, as the panel used to, sent people hunting for an intruder when the peer
+ * record had not been touched in a month. Reporting the timestamps lets the
+ * panel say what is known and let the human draw the conclusion.
+ *
+ * Not a security claim: a peer that can reach this far can say anything. It is
+ * diagnostic text for a person, exactly like `AgentIdentity`.
+ */
+export interface PairingEvidence {
+  /** When the record being checked against was first created. */
+  pairedAt?: number;
+  /** Last successful authentication against it. */
+  lastSeen?: number;
+  /** mtime of the peer store. Equal to `pairedAt` means nothing rewrote it. */
+  storeWrittenAt?: number;
+  /** How many onbridge servers are listening on the loopback range right now. */
+  siblingServers?: number;
+}
 
 /**
  * Binds every value both sides agreed on. Computed independently — never sent —

@@ -12,16 +12,36 @@
  * proof, and cannot derive the session key.
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import type { AgentIdentity } from '@onbridge/shared';
+import { connect } from 'node:net';
+import { WS_PORT_RANGE } from '@onbridge/shared';
+import type { AgentIdentity, PairingEvidence } from '@onbridge/shared';
 
-/** ONBRIDGE_HOME lets tests point at a scratch dir instead of the real one. */
-const DIR = process.env.ONBRIDGE_HOME || join(homedir(), '.onbridge');
-const KEY_FILE = join(DIR, 'server-key.json');
-const PEERS_FILE = join(DIR, 'peers.json');
+/**
+ * ONBRIDGE_HOME lets tests point at a scratch dir instead of the real one.
+ *
+ * Resolved on every call rather than once at import. A module-level constant is
+ * captured the instant anything imports this file, so a test that sets the
+ * variable afterwards writes into the user's real `~/.onbridge` — which is how a
+ * fixture extension id ended up in a real peer store, and how that store then
+ * turned trust-on-first-use against the user's actual extension.
+ */
+function dir(): string {
+  return process.env.ONBRIDGE_HOME || join(homedir(), '.onbridge');
+}
+const keyFile = () => join(dir(), 'server-key.json');
+const peersFile = () => join(dir(), 'peers.json');
 
 export interface PeerRecord {
   /** base64, 32 bytes. Derived during pairing, never transmitted. */
@@ -30,8 +50,24 @@ export interface PeerRecord {
   lastSeen: number;
 }
 
+/**
+ * The on-disk peer store.
+ *
+ * Keyed by extension id *and* server id. One `~/.onbridge` holds one server id
+ * today, so the second level usually has a single entry — but a flat
+ * `{extId: record}` map made "which pairing is this?" unanswerable, and
+ * `forgetPeer` an all-or-nothing operation. The panel's "forget this agent and
+ * re-pair" has to drop exactly one pairing and leave the others alone, and that
+ * needs a key that names one.
+ */
+interface PeerStore {
+  version: 2;
+  peers: Record<string, Record<string, PeerRecord>>;
+}
+
 function ensureDir(): void {
-  if (!existsSync(DIR)) mkdirSync(DIR, { recursive: true, mode: 0o700 });
+  const d = dir();
+  if (!existsSync(d)) mkdirSync(d, { recursive: true, mode: 0o700 });
 }
 
 function readJson<T>(path: string, fallback: T): T {
@@ -55,37 +91,325 @@ function writeJsonPrivate(path: string, value: unknown): void {
   }
 }
 
-export function getServerId(): string {
-  ensureDir();
-  const existing = readJson<{ serverId?: string }>(KEY_FILE, {});
-  if (existing.serverId) return existing.serverId;
+/**
+ * Cached for the life of the process, keyed by the directory it came from.
+ *
+ * Re-reading it per call was a live hazard, not an inefficiency. Two servers
+ * starting together both found no key file, both generated an id, and both
+ * wrote — so one process announced id X in its `hello_ack` and then, moments
+ * later, read the *other* process's id back off disk and saved the pairing
+ * record under that. The browser filed its secret under X and the record
+ * existed under Y: an identity that changes mid-handshake produces exactly the
+ * orphaned pairing this release is about. It must be read once and never move.
+ */
+let cachedServerId: string | undefined;
+let cachedServerIdHome: string | undefined;
 
-  const serverId = randomBytes(16).toString('base64');
-  writeJsonPrivate(KEY_FILE, { serverId, createdAt: Date.now() });
+export function getServerId(): string {
+  const home = dir();
+  if (cachedServerId && cachedServerIdHome === home) return cachedServerId;
+
+  // Created under a lock so concurrent first-runs converge on one id instead of
+  // generating one each and letting the last write win.
+  const serverId = withLock('server-key', () => {
+    const existing = readJson<{ serverId?: string }>(keyFile(), {});
+    if (existing.serverId) return existing.serverId;
+    const fresh = randomBytes(16).toString('base64');
+    writeJsonPrivate(keyFile(), { serverId: fresh, createdAt: Date.now() });
+    return fresh;
+  });
+
+  cachedServerId = serverId;
+  cachedServerIdHome = home;
   return serverId;
 }
 
-export function getPeer(extId: string): PeerRecord | undefined {
-  return readJson<Record<string, PeerRecord>>(PEERS_FILE, {})[extId];
+/**
+ * Reads the store, upgrading a v1 file in memory.
+ *
+ * v1 was `{extId: PeerRecord}`. Every record in such a file was necessarily
+ * paired with the one server id this directory has ever had, so it is filed
+ * under the current one. Nothing is rewritten on read: an upgrade only reaches
+ * disk on the next write, so a v1 file that is never written stays readable by
+ * an older build.
+ */
+function readStore(): PeerStore {
+  const raw = readJson<Record<string, unknown>>(peersFile(), {});
+  if (raw && (raw as { version?: number }).version === 2) {
+    const store = raw as unknown as PeerStore;
+    return { version: 2, peers: store.peers ?? {} };
+  }
+
+  const migrated: PeerStore = { version: 2, peers: {} };
+  const legacyServerId = readJson<{ serverId?: string }>(keyFile(), {}).serverId;
+  for (const [extId, value] of Object.entries(raw)) {
+    const rec = value as PeerRecord;
+    if (!rec || typeof rec.pairingSecret !== 'string') continue;
+    migrated.peers[extId] = { [legacyServerId ?? 'legacy']: rec };
+  }
+  return migrated;
 }
 
-export function savePeer(extId: string, pairingSecret: string): void {
-  const peers = readJson<Record<string, PeerRecord>>(PEERS_FILE, {});
-  peers[extId] = { pairingSecret, pairedAt: Date.now(), lastSeen: Date.now() };
-  writeJsonPrivate(PEERS_FILE, peers);
+function writeStore(store: PeerStore): void {
+  writeJsonPrivate(peersFile(), store);
 }
 
-export function touchPeer(extId: string): void {
-  const peers = readJson<Record<string, PeerRecord>>(PEERS_FILE, {});
-  if (!peers[extId]) return;
-  peers[extId].lastSeen = Date.now();
-  writeJsonPrivate(PEERS_FILE, peers);
+/**
+ * Serialises read-modify-write on the peer store across processes.
+ *
+ * Every agent session spawns its own server, all of them sharing one
+ * `~/.onbridge`, and a plain read-then-write loses whichever write landed
+ * first. The lock is a directory, because `mkdir` is atomic on every filesystem
+ * that matters and needs no dependency.
+ *
+ * Synchronous on purpose. The critical section is one small file write, the
+ * callers are on the handshake path where ordering is what we are buying, and
+ * making them async would spread `await` through code whose whole point is that
+ * nothing interleaves. The wait is bounded and a stale lock is broken, so the
+ * worst case is a few hundred milliseconds once, not a hang.
+ */
+const STORE_LOCK_WAIT_MS = 2_000;
+const STORE_LOCK_STALE_MS = 10_000;
+
+function sleepSync(ms: number): void {
+  // `Atomics.wait` is the only way to block without spinning the CPU. A shared
+  // buffer nobody else touches never has a value to wake on, so this always
+  // runs the full timeout.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-export function forgetPeer(extId: string): void {
-  const peers = readJson<Record<string, PeerRecord>>(PEERS_FILE, {});
-  delete peers[extId];
-  writeJsonPrivate(PEERS_FILE, peers);
+function lockPath(name: string): string {
+  return join(dir(), `.${name.replace(/[^a-z0-9_-]/gi, '_')}.lock`);
+}
+
+function tryLock(path: string): boolean {
+  ensureDir();
+  try {
+    mkdirSync(path);
+    writeFileSync(join(path, 'owner'), JSON.stringify({ pid: process.pid, at: Date.now() }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** True if the holder is gone or has held it implausibly long. */
+function lockIsStale(path: string, staleMs: number): boolean {
+  try {
+    const owner = readJson<{ pid?: number; at?: number }>(join(path, 'owner'), {});
+    if (owner.at && Date.now() - owner.at > staleMs) return true;
+    if (typeof owner.pid === 'number' && owner.pid !== process.pid) {
+      try {
+        // Signal 0 tests for existence without delivering anything.
+        process.kill(owner.pid, 0);
+      } catch {
+        return true; // holder exited without releasing
+      }
+    }
+    const age = Date.now() - statSync(path).mtimeMs;
+    return age > staleMs;
+  } catch {
+    return true;
+  }
+}
+
+function unlock(path: string): void {
+  try {
+    rmSync(path, { recursive: true, force: true });
+  } catch {
+    /* already gone */
+  }
+}
+
+function withLock<T>(name: string, fn: () => T): T {
+  const path = lockPath(name);
+  const deadline = Date.now() + STORE_LOCK_WAIT_MS;
+  let held = tryLock(path);
+  while (!held && Date.now() < deadline) {
+    if (lockIsStale(path, STORE_LOCK_STALE_MS)) unlock(path);
+    sleepSync(25);
+    held = tryLock(path);
+  }
+  // Losing the lock must not lose the write: a dropped `savePeer` is a pairing
+  // that exists on the extension side and nowhere else, which is the exact
+  // inconsistency this whole mechanism exists to prevent.
+  if (!held) unlock(path);
+  try {
+    return fn();
+  } finally {
+    unlock(path);
+  }
+}
+
+const withStoreLock = <T,>(fn: () => T): T => withLock('peers', fn);
+
+export function getPeer(extId: string, serverId: string): PeerRecord | undefined {
+  return readStore().peers[extId]?.[serverId];
+}
+
+export function savePeer(extId: string, serverId: string, pairingSecret: string): void {
+  withStoreLock(() => {
+    const store = readStore();
+    const now = Date.now();
+    store.peers[extId] = { ...(store.peers[extId] ?? {}), [serverId]: { pairingSecret, pairedAt: now, lastSeen: now } };
+    writeStore(store);
+  });
+}
+
+/**
+ * Records that this pairing was just used.
+ *
+ * `lastSeen` is the only thing that distinguishes a live pairing from one left
+ * behind by a session that ended months ago, so it has to move on more than the
+ * moment of pairing — where it sat before, permanently equal to `pairedAt`.
+ * Throttled because it is also called from the heartbeat, and a file write
+ * every fifteen seconds for the life of a session is not a trade worth making
+ * for minute-resolution freshness.
+ */
+const TOUCH_INTERVAL_MS = 60_000;
+const lastTouch = new Map<string, number>();
+
+export function touchPeer(extId: string, serverId: string, force = false): void {
+  const key = `${extId}|${serverId}`;
+  const previous = lastTouch.get(key) ?? 0;
+  if (!force && Date.now() - previous < TOUCH_INTERVAL_MS) return;
+  lastTouch.set(key, Date.now());
+
+  withStoreLock(() => {
+    const store = readStore();
+    const rec = store.peers[extId]?.[serverId];
+    if (!rec) return;
+    rec.lastSeen = Date.now();
+    writeStore(store);
+  });
+}
+
+export function forgetPeer(extId: string, serverId: string): void {
+  withStoreLock(() => {
+    const store = readStore();
+    const byServer = store.peers[extId];
+    if (!byServer) return;
+    delete byServer[serverId];
+    if (Object.keys(byServer).length === 0) delete store.peers[extId];
+    writeStore(store);
+  });
+}
+
+/**
+ * What the server can actually say about a pairing whose proof just failed.
+ *
+ * A stale local secret and a hostile takeover look identical from the browser
+ * — both are `invalid auth proof` — and the panel used to assert the hostile
+ * reading as fact. The timestamps separate them: a record that was never
+ * rewritten since it was created was not replaced by anything. Handing the
+ * facts to the panel is what lets it stop guessing.
+ */
+export function pairingEvidence(extId: string, serverId: string): PairingEvidence {
+  const rec = getPeer(extId, serverId);
+  let storeWrittenAt: number | undefined;
+  try {
+    storeWrittenAt = Math.round(statSync(peersFile()).mtimeMs);
+  } catch {
+    /* no store yet */
+  }
+  return { pairedAt: rec?.pairedAt, lastSeen: rec?.lastSeen, storeWrittenAt };
+}
+
+/**
+ * Claims the right to run a pairing prompt for `extId`, or waits for the
+ * sibling process that is already running one.
+ *
+ * This is the fix for the defect that produced both the prompt storm and the
+ * unrecoverable `invalid auth proof`. A user-scope MCP install spawns one
+ * server per editor session — six were live on the machine that reported it —
+ * and all of them share one `~/.onbridge`. Started together against an empty
+ * store, each saw no record, each asked the user to pair, each derived a
+ * *different* secret, and the last writer on each side won independently. The
+ * extension ended up holding one secret and the store another, which is a dead
+ * end that no amount of reconnecting fixes.
+ *
+ * With this, exactly one of them prompts. The others wait, find the record the
+ * winner wrote, and authenticate with it — so N concurrent agents cost one
+ * approval and all of them end up working.
+ */
+export interface PairingClaim {
+  /** Run the pairing prompt; call `release` once it has resolved either way. */
+  pair: boolean;
+  record?: PeerRecord;
+  release: () => void;
+  /** A sibling was pairing and we waited for it. Worth logging. */
+  waited: boolean;
+}
+
+const PAIRING_LOCK_STALE_MS = 120_000; // must outlast the 90s handshake budget
+
+export async function claimPairing(
+  extId: string,
+  serverId: string,
+  budgetMs: number,
+): Promise<PairingClaim> {
+  const path = lockPath(`pairing-${extId}`);
+  const noop = () => {};
+  const deadline = Date.now() + budgetMs;
+  let waited = false;
+
+  for (let breaks = 0; ; ) {
+    const existing = getPeer(extId, serverId);
+    if (existing) return { pair: false, record: existing, release: noop, waited };
+
+    if (tryLock(path)) {
+      // Re-read under the lock: the sibling may have finished in the gap
+      // between our check above and our acquire.
+      const again = getPeer(extId, serverId);
+      if (again) {
+        unlock(path);
+        return { pair: false, record: again, release: noop, waited };
+      }
+      return { pair: true, release: () => unlock(path), waited };
+    }
+
+    if (lockIsStale(path, PAIRING_LOCK_STALE_MS) && breaks < 3) {
+      breaks++;
+      unlock(path);
+      continue;
+    }
+
+    if (Date.now() >= deadline) {
+      // The sibling is still holding a prompt open. Pairing anyway would
+      // recreate the clobber, so refuse this handshake instead and let the
+      // extension redial once the other one has settled.
+      return { pair: false, release: noop, waited: true };
+    }
+
+    waited = true;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+/**
+ * How many onbridge servers are listening on the loopback range right now.
+ *
+ * One user-scope MCP install silently turns "one agent" into "one agent per
+ * terminal tab", and ten of those exhaust the range. The count is the only
+ * cheap signal that this is what is happening, so it is logged at startup and
+ * shown to the user rather than left to be inferred from a port number.
+ */
+export async function countListeningServers(): Promise<number> {
+  const probes = WS_PORT_RANGE.map(
+    (port) =>
+      new Promise<boolean>((resolve) => {
+        const socket = connect({ port, host: '127.0.0.1' });
+        const done = (open: boolean) => {
+          socket.destroy();
+          resolve(open);
+        };
+        socket.setTimeout(250);
+        socket.once('connect', () => done(true));
+        socket.once('timeout', () => done(false));
+        socket.once('error', () => done(false));
+      }),
+  );
+  return (await Promise.all(probes)).filter(Boolean).length;
 }
 
 /**
@@ -169,7 +493,9 @@ function safeCwd(): string | undefined {
 
 /** The set of extension ids we have ever paired with. */
 export function knownExtensionIds(): string[] {
-  return Object.keys(readJson<Record<string, PeerRecord>>(PEERS_FILE, {}));
+  return Object.entries(readStore().peers)
+    .filter(([, byServer]) => Object.keys(byServer ?? {}).length > 0)
+    .map(([extId]) => extId);
 }
 
 /** Ids configured explicitly. When present they, not trust-on-first-use, decide. */
@@ -209,11 +535,21 @@ export function extensionIdFromOrigin(origin?: string): string | undefined {
  * names its extension, that list is the authority and pinning would only get in
  * the way of a deliberate change.
  */
-/** Recovery guidance for a refused peer. Too long for a close reason; logged. */
+/**
+ * Recovery guidance for a refused peer. Too long for a close reason; logged.
+ *
+ * It says *all of it* deliberately. The obvious careful thing to do with a file
+ * that holds several entries is to remove only your own — and that is the one
+ * action that makes this worse: any surviving entry keeps trust-on-first-use
+ * armed, so the very extension you are trying to pair is then refused with a
+ * message about a different problem entirely. Removing one key is only correct
+ * when it is the last key.
+ */
 export function peerRefusalHelp(extId: string): string {
   return (
-    `To pair "${extId}" instead, remove ${PEERS_FILE} and pair again, ` +
-    'or list it in ONBRIDGE_DEV_EXTENSION_IDS.'
+    `To pair "${extId}" instead, delete the whole of ${peersFile()} — not just one ` +
+    'entry, since any entry left behind keeps refusing new extensions — and pair ' +
+    'again, or list it in ONBRIDGE_DEV_EXTENSION_IDS.'
   );
 }
 

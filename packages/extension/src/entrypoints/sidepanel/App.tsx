@@ -15,6 +15,10 @@ import {
   SendIcon,
   TrashIcon,
 } from './icons.js';
+// Type-only on purpose: the panel never touches the secret store itself. Add
+// and delete go through the background worker, and get_status returns records
+// that carry no value — so nothing here can render one even by accident.
+import type { SecretRecord } from '../../core/secrets.js';
 
 interface ActivityEntry {
   action: string;
@@ -50,6 +54,25 @@ interface SessionView {
   connectedAt: number;
   ownsThisWindow: boolean;
   agent: AgentInfo | null;
+  serverId?: string;
+  /**
+   * Why the server refused, and what it could prove about its own record.
+   *
+   * The panel used to state the alarming reading of `invalid auth proof` as
+   * fact — "its record was replaced… another program on your machine can do
+   * that" — when the commonest cause is a secret left over from an abandoned
+   * dev session and the peer file has not been touched in a month. These
+   * timestamps are what tells the two apart.
+   */
+  failure?: {
+    reason: string;
+    evidence?: {
+      pairedAt?: number;
+      lastSeen?: number;
+      storeWrittenAt?: number;
+      siblingServers?: number;
+    };
+  };
 }
 
 const MODES: { value: ApprovalMode; label: string; blurb: string }[] = [
@@ -94,6 +117,7 @@ interface Status {
   /** True while a newly started agent would be offered to the user. */
   pairWindowOpen: boolean;
   askRequest: { question: string; options?: string[]; askedAt: number } | null;
+  secrets: SecretRecord[];
   lastAction: string;
   activityLog: ActivityEntry[];
   commandCount: number;
@@ -115,6 +139,7 @@ const EMPTY: Status = {
   pairBlocked: null,
   pairWindowOpen: false,
   askRequest: null,
+  secrets: [],
   lastAction: '',
   activityLog: [],
   commandCount: 0,
@@ -129,6 +154,14 @@ const safeHost = (url: string): string => {
   } catch {
     return url.slice(0, 60);
   }
+};
+
+const ago = (ts: number) => {
+  const d = Math.floor((Date.now() - ts) / 1000);
+  if (d < 5) return 'now';
+  if (d < 60) return `${d}s`;
+  if (d < 3600) return `${Math.floor(d / 60)}m`;
+  return `${Math.floor(d / 3600)}h`;
 };
 
 /** Long paths are unreadable in a 320px panel; the tail is the informative part. */
@@ -184,6 +217,7 @@ export default function App() {
       setTimeout(() => setNotice(''), 6000);
     }
     refresh();
+    return res;
   };
 
   const submit = async (textOverride?: string) => {
@@ -223,6 +257,16 @@ export default function App() {
       ),
   );
 
+  /** Refusals with a real recovery: the browser's stored secret is not accepted. */
+  const authRefusals = refusals.filter((s) => /auth|proof/i.test(s.detail) && s.serverId);
+
+  /**
+   * One MCP entry at user scope becomes one server per editor session, and ten
+   * of them exhaust the port range — at which point onbridge simply stops
+   * working with no error that points at the cause.
+   */
+  const crowded = status.sessions.length >= 3;
+
   const conn = owner
     ? { color: 'bg-emerald-400', label: owner.agent?.name ?? 'Connected' }
     : status.pairRequest
@@ -232,13 +276,6 @@ export default function App() {
         : { color: 'bg-neutral-600', label: 'Off' };
 
   const fmt = (ms: number) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
-  const ago = (ts: number) => {
-    const d = Math.floor((Date.now() - ts) / 1000);
-    if (d < 5) return 'now';
-    if (d < 60) return `${d}s`;
-    if (d < 3600) return `${Math.floor(d / 60)}m`;
-    return `${Math.floor(d / 3600)}h`;
-  };
 
   return (
     <div className="flex h-screen flex-col bg-neutral-900 text-neutral-100 font-sans text-sm">
@@ -345,20 +382,28 @@ export default function App() {
                 Port {s.port}: <span className="text-neutral-200">{s.detail}</span>
               </p>
             ))}
-            {refusals.some((s) => /auth|proof/i.test(s.detail)) ? (
-              <p className="mt-2 text-xs text-neutral-400">
-                This browser holds a pairing secret that the agent no longer accepts, which means
-                its record was replaced since you paired. Another program on your machine can do
-                that. Do not re-pair until you know what changed — remove{' '}
-                <code className="text-neutral-300">~/.onbridge/peers.json</code> deliberately if you
-                want to start over.
-              </p>
+            {authRefusals.length > 0 ? (
+              <AuthRefusalHelp refusals={authRefusals} act={act} />
             ) : (
               <p className="mt-2 text-xs text-neutral-500">
                 If you did not expect this, something else on your machine may be holding the
                 bridge.
               </p>
             )}
+          </div>
+        )}
+
+        {/* ── One config line, many servers ── */}
+        {crowded && (
+          <div className="mx-3 mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-200">
+            <div className="mb-1 flex items-center gap-1.5 font-medium">
+              <AlertIcon className="h-3.5 w-3.5 shrink-0" /> {status.sessions.length} agents found
+            </div>
+            <p className="text-neutral-400">
+              That usually means onbridge is installed at user scope, so every editor session
+              starts its own server. Ten ports are scanned; past that, new agents cannot connect
+              at all. Move it to the projects that need it if this was not deliberate.
+            </p>
           </div>
         )}
 
@@ -654,6 +699,16 @@ export default function App() {
               mode, including Bypass.
             </p>
           </div>
+
+          {/* ── Saved secrets ── */}
+          <SecretsSection
+            secrets={status.secrets ?? EMPTY.secrets}
+            windowId={windowIdRef.current}
+            act={act}
+          />
+
+          {/* ── Pairings ── */}
+          <PairingsSection sessions={status.sessions} act={act} />
         </div>
 
         {/* ── Activity ── */}
@@ -797,6 +852,323 @@ function AgentCard({ agent, port }: { agent: AgentInfo | null; port: number }) {
       <div className="mt-0.5 pl-6 font-mono text-[10px] text-neutral-600">
         pid {agent.pid} · port {port} · onbridge {agent.serverVersion}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Credentials the agent can use but never read. Only name, origin and age ever
+ * reach this component — get_status strips values in the background worker, so
+ * there is nothing here a screen-share or a DOM inspector could give away.
+ */
+function SecretsSection({
+  secrets,
+  windowId,
+  act,
+}: {
+  secrets: SecretRecord[];
+  windowId?: number;
+  act: (msg: Record<string, unknown>) => Promise<{ ok: boolean; reason?: string } | undefined>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [name, setName] = useState('');
+  const [value, setValue] = useState('');
+  const [origin, setOrigin] = useState('');
+
+  const startAdd = async () => {
+    setAdding(true);
+    // Prefill the binding from the page the user is looking at — the common
+    // flow is "I am on the login page, save this". Editable, never assumed.
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, windowId });
+      if (tab?.url && /^https?:/.test(tab.url)) setOrigin(new URL(tab.url).origin);
+    } catch {
+      /* no tab access is fine — the field stays blank */
+    }
+  };
+
+  const save = async () => {
+    const res = await act({ type: 'save_secret', name: name.trim(), value, origin: origin.trim() });
+    // A refusal (bad name, bad origin) keeps the form so the user can fix it;
+    // act() has already surfaced the reason.
+    if (res && !res.ok) return;
+    setName('');
+    setValue('');
+    setOrigin('');
+    setAdding(false);
+  };
+
+  return (
+    <div>
+      <button
+        onClick={() => setOpen(!open)}
+        className="mb-1.5 flex w-full items-center justify-between"
+      >
+        <span className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-neutral-400">
+          <LockIcon className="h-3.5 w-3.5" />
+          Saved secrets
+        </span>
+        <span className="text-[10px] text-neutral-600">
+          {secrets.length > 0 ? `${secrets.length} · ` : ''}
+          {open ? 'hide' : 'show'}
+        </span>
+      </button>
+
+      {open && (
+        <div className="space-y-1.5">
+          <p className="text-[10px] text-neutral-600">
+            The agent types <code className="text-neutral-400">{'{{secret:name}}'}</code> and the
+            real value is filled in here — it never sees or receives it. Each secret only works on
+            the site it is saved for.
+          </p>
+
+          {secrets.map((s) => (
+            <div
+              key={s.name}
+              className="flex items-center gap-2 rounded-lg border border-neutral-700 bg-neutral-800/60 px-2.5 py-2 text-xs"
+            >
+              <LockIcon className="h-3 w-3 shrink-0 text-emerald-400" />
+              <span className="shrink-0 font-mono text-neutral-200">{s.name}</span>
+              <span className="min-w-0 flex-1 truncate text-neutral-500" title={s.origin}>
+                {safeHost(s.origin)}
+              </span>
+              <span className="shrink-0 font-mono text-[10px] text-neutral-600">
+                {ago(s.createdAt)}
+              </span>
+              <button
+                onClick={() => act({ type: 'delete_secret', name: s.name })}
+                title={`Delete ${s.name}`}
+                className="shrink-0 rounded p-0.5 text-neutral-500 transition-colors hover:text-red-300"
+              >
+                <TrashIcon className="h-3 w-3" />
+              </button>
+            </div>
+          ))}
+
+          {adding ? (
+            <div className="space-y-1.5 rounded-lg border border-neutral-700 bg-neutral-800/60 p-2.5">
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="name, e.g. github_password"
+                autoFocus
+                className="w-full rounded-md border border-neutral-700 bg-neutral-800 px-2 py-1.5 font-mono text-xs text-neutral-100 placeholder-neutral-600 outline-none focus:border-emerald-500/50"
+              />
+              <input
+                type="password"
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                placeholder="value"
+                autoComplete="new-password"
+                className="w-full rounded-md border border-neutral-700 bg-neutral-800 px-2 py-1.5 text-xs text-neutral-100 placeholder-neutral-600 outline-none focus:border-emerald-500/50"
+              />
+              <input
+                value={origin}
+                onChange={(e) => setOrigin(e.target.value)}
+                placeholder="site it works on, e.g. https://github.com"
+                className="w-full rounded-md border border-neutral-700 bg-neutral-800 px-2 py-1.5 text-xs text-neutral-100 placeholder-neutral-600 outline-none focus:border-emerald-500/50"
+              />
+              <div className="flex gap-1.5 pt-0.5">
+                <button
+                  onClick={() => void save()}
+                  disabled={!name.trim() || !value || !origin.trim()}
+                  className="flex-1 rounded-md bg-emerald-500 py-1.5 text-xs font-medium text-neutral-900 transition-colors hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-neutral-700 disabled:text-neutral-500"
+                >
+                  Save
+                </button>
+                <button
+                  onClick={() => {
+                    setValue('');
+                    setAdding(false);
+                  }}
+                  className="flex-1 rounded-md border border-neutral-700 bg-neutral-800 py-1.5 text-xs text-neutral-300 transition-colors hover:bg-neutral-700"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={() => void startAdd()}
+              className="w-full rounded-lg border border-dashed border-neutral-700 py-2 text-xs text-neutral-500 transition-colors hover:border-neutral-600 hover:text-neutral-300"
+            >
+              Add a secret
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The way out of a failed authentication.
+ *
+ * Two things were wrong here. There was no recovery at all — the handshake
+ * dead-ended at `invalid auth proof` and the only exit was hand-editing
+ * `~/.onbridge/peers.json`, which is also a trap: removing one entry leaves
+ * trust-on-first-use armed and the very extension you are fixing gets refused
+ * for a different reason. And the wording asserted a hostile cause as fact,
+ * which sent people hunting for an intruder when nothing had touched the file.
+ *
+ * So: state what the server actually reported, let the person weigh it, and
+ * give them a button that clears exactly one pairing.
+ */
+/**
+ * Forgetting pairings from the panel.
+ *
+ * `clear_pairings` has existed in the background worker since the start with
+ * nothing in the UI reaching it, so the documented cure for a broken pairing
+ * was to delete a file in `~/.onbridge` by hand. Per-agent comes first because
+ * it is almost always the right one; clearing everything is behind a
+ * confirmation because it makes every other agent re-prompt.
+ */
+function PairingsSection({
+  sessions,
+  act,
+}: {
+  sessions: SessionView[];
+  act: (msg: Record<string, unknown>) => Promise<{ ok: boolean; reason?: string } | undefined>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const pairable = sessions.filter((s) => s.serverId);
+
+  return (
+    <div>
+      <button
+        onClick={() => setOpen(!open)}
+        className="mb-1.5 flex w-full items-center justify-between"
+      >
+        <span className="text-xs font-medium uppercase tracking-wide text-neutral-400">
+          Pairings
+        </span>
+        <span className="text-[10px] text-neutral-600">{open ? 'hide' : 'show'}</span>
+      </button>
+
+      {open && (
+        <div className="space-y-1.5">
+          <p className="text-[10px] text-neutral-600">
+            A pairing is this browser's shared secret with one agent. Forget one and that agent
+            has to ask your permission again the next time it connects.
+          </p>
+
+          {pairable.length === 0 ? (
+            <p className="text-[10px] text-neutral-600">No agents are currently listed.</p>
+          ) : (
+            pairable.map((s) => (
+              <div
+                key={s.id}
+                className="flex items-center gap-2 rounded-lg border border-neutral-700 bg-neutral-800/60 px-2.5 py-2 text-xs"
+              >
+                <span className="min-w-0 flex-1 truncate text-neutral-300">
+                  {s.agent?.name ?? 'Unidentified agent'}{' '}
+                  <span className="text-neutral-600">:{s.port}</span>
+                </span>
+                <button
+                  onClick={() => act({ type: 'forget_pairing', id: s.id })}
+                  className="shrink-0 rounded border border-neutral-700 px-2 py-0.5 text-[11px] text-neutral-400 transition-colors hover:border-amber-500/50 hover:text-amber-300"
+                >
+                  Forget
+                </button>
+              </div>
+            ))
+          )}
+
+          {confirming ? (
+            <div className="space-y-1.5 rounded-lg border border-red-500/40 bg-red-500/10 p-2.5">
+              <p className="text-xs text-neutral-300">
+                Forget every pairing? Each agent will ask to pair again the next time it connects.
+              </p>
+              <div className="flex gap-1.5">
+                <button
+                  onClick={() => {
+                    void act({ type: 'clear_pairings' });
+                    setConfirming(false);
+                  }}
+                  className="flex-1 rounded-md bg-red-500 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-400"
+                >
+                  Forget all
+                </button>
+                <button
+                  onClick={() => setConfirming(false)}
+                  className="flex-1 rounded-md border border-neutral-700 bg-neutral-800 py-1.5 text-xs text-neutral-300 transition-colors hover:bg-neutral-700"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={() => setConfirming(true)}
+              className="w-full rounded-lg border border-dashed border-neutral-700 py-2 text-xs text-neutral-500 transition-colors hover:border-red-500/40 hover:text-red-300"
+            >
+              Forget all pairings
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AuthRefusalHelp({
+  refusals,
+  act,
+}: {
+  refusals: SessionView[];
+  act: (msg: Record<string, unknown>) => Promise<{ ok: boolean; reason?: string } | undefined>;
+}) {
+  const evidence = refusals.find((s) => s.failure?.evidence)?.failure?.evidence;
+  // A record whose file has not been rewritten since it was created was not
+  // replaced by anything — which is the fact that settles the question.
+  const untouched =
+    evidence?.pairedAt != null &&
+    evidence.storeWrittenAt != null &&
+    Math.abs(evidence.storeWrittenAt - evidence.pairedAt) < 60_000;
+
+  return (
+    <div className="mt-2 space-y-2">
+      <p className="text-xs text-neutral-400">
+        This browser holds a pairing secret that the agent no longer accepts. Either the secret
+        here is stale — left over from a session that never completed — or the agent's record was
+        replaced, which is also what another program on your machine would have to do to take this
+        agent's place.
+      </p>
+
+      {evidence && (
+        <div className="rounded-md border border-neutral-700 bg-neutral-900/60 p-2 text-[11px] text-neutral-400">
+          <div className="mb-1 font-medium text-neutral-300">What the agent reports</div>
+          {evidence.pairedAt != null && <div>Paired {ago(evidence.pairedAt)} ago</div>}
+          {evidence.lastSeen != null && <div>Last successful auth {ago(evidence.lastSeen)} ago</div>}
+          {evidence.storeWrittenAt != null && (
+            <div>Its pairing file last written {ago(evidence.storeWrittenAt)} ago</div>
+          )}
+          {evidence.siblingServers != null && evidence.siblingServers > 1 && (
+            <div>{evidence.siblingServers} onbridge servers running on this machine</div>
+          )}
+          <div className="mt-1 text-neutral-500">
+            {untouched
+              ? 'Nothing has rewritten that file since the pairing was made, so the record was not replaced — a stale secret here is the likely cause.'
+              : 'The file has been written since the pairing was made. That happens when you clear ~/.onbridge, when several agents pair, and also if something enrolled itself.'}
+          </div>
+        </div>
+      )}
+
+      {refusals.map((s) => (
+        <button
+          key={s.id}
+          onClick={() => act({ type: 'forget_pairing', id: s.id })}
+          className="w-full rounded-md bg-amber-500 py-2 text-xs font-medium text-neutral-900 transition-colors hover:bg-amber-400"
+        >
+          Forget the pairing on port {s.port} and pair again
+        </button>
+      ))}
+      <p className="text-[10px] text-neutral-600">
+        This clears only this browser's secret for that one agent and asks it to pair again — you
+        will be prompted, so nothing reconnects without your say-so. Other agents are untouched.
+      </p>
     </div>
   );
 }

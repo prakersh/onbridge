@@ -20,9 +20,18 @@
  * with the wrong session driving the window you were reading.
  */
 
-import type { AgentIdentity, ExtensionMessage, ServerMessage } from '@onbridge/shared';
+import type {
+  AgentIdentity,
+  ExtensionMessage,
+  PairingEvidence,
+  ServerMessage,
+} from '@onbridge/shared';
 import { WS_PORT_RANGE } from '@onbridge/shared';
-import { SecureClient, type ClientState } from './secure-client.js';
+import {
+  SecureClient,
+  forgetPairing as forgetStoredPairing,
+  type ClientState,
+} from './secure-client.js';
 
 export type SessionStatus =
   /** Handshake in flight. */
@@ -83,6 +92,15 @@ export interface AgentSession {
    * what the pairing-prompt timeout regression looked like from outside.
    */
   attempts: number;
+  /**
+   * Why the server refused, with whatever it could prove about its own record.
+   *
+   * Carried so the panel can offer a real way out of a failed authentication
+   * instead of telling the user to edit JSON, and so it can report what is
+   * actually known rather than asserting the alarming reading of an ambiguous
+   * symptom.
+   */
+  failure?: { reason: string; evidence?: PairingEvidence };
 }
 
 interface Entry {
@@ -305,6 +323,7 @@ export class ConnectionManager {
       const denied = /pairing denied/i.test(why);
       session.status = 'failed';
       session.detail = why;
+      session.failure = client.getFailure() ?? { reason: why };
       // A denial is sticky: without a long backoff the sweep redials within ~20s,
       // the server re-offers while still inside its 60s pairing window, and the
       // user is re-prompted for an agent they just refused. The panel hides the
@@ -407,6 +426,43 @@ export class ConnectionManager {
     entry.session.scope = null;
     if (entry.session.status === 'active') entry.session.status = 'on_hold';
     this.hooks.onChange();
+  }
+
+  /**
+   * Forgets this browser's stored secret for one agent and redials it.
+   *
+   * The way out of the dead end. When the browser holds a secret the server no
+   * longer accepts, the handshake fails at `invalid auth proof` and nothing in
+   * the protocol recovers: the extension keeps offering a secret the server
+   * will keep rejecting. Dropping just this one puts the next handshake on the
+   * `pair_reset` path — the server drops its record and the user is asked to
+   * approve a fresh pairing — which is a path that already exists and already
+   * requires consent. Every other pairing is left untouched.
+   */
+  async forgetPairing(id: string): Promise<{ ok: boolean; reason?: string }> {
+    const entry = [...this.entries.values()].find((e) => e.session.id === id);
+    if (!entry) return { ok: false, reason: 'That agent is no longer listed.' };
+
+    const serverId = entry.session.serverId;
+    if (!serverId) {
+      return {
+        ok: false,
+        reason: 'That agent never got far enough to identify itself, so there is nothing stored to forget.',
+      };
+    }
+
+    const removed = await forgetStoredPairing(serverId);
+    entry.client.disconnect();
+    entry.session.status = 'failed';
+    entry.session.detail = removed
+      ? 'Pairing forgotten. Reconnecting — approve it when it asks.'
+      : 'No stored pairing for this agent. Reconnecting.';
+    entry.session.failure = undefined;
+    // Clear the backoff: the user just asked for this one specifically.
+    entry.retryAfter = 0;
+    this.hooks.onChange();
+    void this.sweep();
+    return { ok: true };
   }
 
   /** Drops the connection entirely. The sweep will rediscover it as on-hold. */

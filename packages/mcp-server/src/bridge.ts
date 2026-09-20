@@ -21,10 +21,19 @@ import {
   verifyProof,
   ReplayGuard,
 } from '@onbridge/shared';
-import type { ServerMessage, ExtensionMessage, CommandAction, HandshakeFrame } from '@onbridge/shared';
+import type {
+  ServerMessage,
+  ExtensionMessage,
+  CommandAction,
+  ConsoleDeltaEntry,
+  HandshakeFrame,
+} from '@onbridge/shared';
 import {
   buildAgentIdentity,
   checkPeerIdentity,
+  claimPairing,
+  countListeningServers,
+  pairingEvidence,
   peerRefusalHelp,
   forgetPeer,
   getPeer,
@@ -44,6 +53,17 @@ type PendingCommand = {
 /** Generous, because first-run pairing waits on a human clicking Allow. */
 const HANDSHAKE_TIMEOUT_MS = 90_000;
 
+/**
+ * How long to wait for a sibling server that is already running a pairing
+ * prompt for this browser.
+ *
+ * Comfortably inside the handshake budget, so a peer that waits the whole time
+ * is still refused cleanly rather than being cut off mid-wait. Nothing is shown
+ * to the user while this runs — that is the point: one approval, not one per
+ * server process.
+ */
+const PAIRING_CLAIM_BUDGET_MS = 60_000;
+
 /** Ceiling on undelivered side-panel notes. See `handleMessage`. */
 const MAX_QUEUED_USER_MESSAGES = 20;
 
@@ -51,15 +71,42 @@ const MAX_QUEUED_USER_MESSAGES = 20;
  * Marks an error as composed by onbridge rather than carrying page text, so the
  * reply builders can frame it authoritatively instead of fencing it.
  */
-export function commandError(message: string, trusted: boolean): Error {
-  const err = new Error(message);
-  if (trusted) (err as Error & { onbridgeTrusted?: true }).onbridgeTrusted = true;
+export function commandError(
+  message: string,
+  trusted: boolean,
+  retry?: { code: string; retryAfterMs?: number },
+): Error {
+  const err = new Error(message) as Error & {
+    onbridgeTrusted?: true;
+    onbridgeCode?: string;
+    onbridgeRetryAfterMs?: number;
+  };
+  if (trusted) err.onbridgeTrusted = true;
+  // A code only ever accompanies a trusted error — see `errorCode` in the
+  // protocol. Attaching one to page-derived text would let a page present
+  // itself as a well-known onbridge condition.
+  if (trusted && retry) {
+    err.onbridgeCode = retry.code;
+    err.onbridgeRetryAfterMs = retry.retryAfterMs;
+  }
   return err;
 }
 
 /** True only for errors this stack composed. Absent means assume page-derived. */
 export function isTrustedError(err: unknown): boolean {
   return Boolean((err as { onbridgeTrusted?: boolean } | null)?.onbridgeTrusted);
+}
+
+/**
+ * The machine-readable condition behind a trusted failure, if there was one.
+ *
+ * Exists so a tool can tell the agent "this is a retry, not a refusal" without
+ * the agent having to recognise a sentence.
+ */
+export function errorRetry(err: unknown): { code: string; retryAfterMs?: number } | undefined {
+  const e = err as { onbridgeCode?: string; onbridgeRetryAfterMs?: number } | null;
+  if (!isTrustedError(err) || !e?.onbridgeCode) return undefined;
+  return { code: e.onbridgeCode, retryAfterMs: e.onbridgeRetryAfterMs };
 }
 
 type SessionState = 'hello' | 'pairing' | 'auth' | 'ready';
@@ -83,6 +130,14 @@ interface Session {
    * destroy a working pairing on its way out.
    */
   resetRequested?: boolean;
+  /**
+   * Releases the cross-process pairing claim. Held from the moment we decide to
+   * prompt until the pairing resolves either way, so sibling servers wait
+   * rather than racing us — and released on every exit path, including a peer
+   * that simply vanishes, or the next agent to start would wait out the stale
+   * lock.
+   */
+  releasePairing?: () => void;
   txCounter: number;
   replay: ReplayGuard;
   /**
@@ -113,8 +168,19 @@ export class Bridge {
   private isOriginAllowed = makeOriginCheck((m) => this.log(m));
   /** Notes typed in the side panel, awaiting delivery on the next tool result. */
   private userMessages: string[] = [];
+  /** Console output from the command that just finished. See `takeConsoleDelta`. */
+  private consoleDelta: ConsoleDeltaEntry[] = [];
   private startedAt = Date.now();
   private serverVersion = '0.0.0';
+  /**
+   * How many onbridge servers are up, counted at startup.
+   *
+   * A user-scope MCP install spawns one per editor session, which is how a
+   * single configuration line quietly turns into ten servers and exhausts the
+   * port range. Counting it is the only cheap way to tell the user that is what
+   * is happening.
+   */
+  private siblingCount = 1;
   /**
    * Pulled on demand rather than pushed once.
    *
@@ -169,6 +235,7 @@ export class Bridge {
         this.port = port;
         this.log(`listening on 127.0.0.1:${port}`);
         this.attachHandlers();
+        void this.reportSiblings();
         return;
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;
@@ -178,6 +245,26 @@ export class Bridge {
       }
     }
     this.log(`could not bind any port in ${WS_PORT_RANGE[0]}-${WS_PORT_RANGE[WS_PORT_RANGE.length - 1]}`);
+  }
+
+  /** Counts and reports the other onbridge servers sharing this machine. */
+  private async reportSiblings(): Promise<void> {
+    try {
+      this.siblingCount = Math.max(1, await countListeningServers());
+    } catch {
+      return;
+    }
+    if (this.siblingCount < 3) return;
+    this.log(
+      `${this.siblingCount} onbridge servers are listening on this machine. That usually ` +
+        'means onbridge is configured at user scope, so every editor session starts one. ' +
+        `The range holds ${WS_PORT_RANGE.length}; past that no new agent can connect.`,
+    );
+  }
+
+  /** For the panel and for `auth_fail` evidence. */
+  getSiblingCount(): number {
+    return this.siblingCount;
   }
 
   private bind(port: number): Promise<WebSocketServer> {
@@ -250,6 +337,12 @@ export class Bridge {
     const fail = (reason: string) => {
       this.log(`handshake failed: ${reason}`);
       if (this.claiming === ws) this.claiming = null;
+      // A pairing claim left behind makes every sibling wait out its stale
+      // timeout before anyone can pair again.
+      if (this.session?.ws === ws) {
+        this.session.releasePairing?.();
+        this.session.releasePairing = undefined;
+      }
       this.closeWithReason(ws, 4001, reason);
     };
 
@@ -301,7 +394,8 @@ export class Bridge {
               fromB64(sNonce),
             );
             const sessionId = await computeSessionId(frame.ePub, kp.publicKeyB64, frame.eNonce, sNonce);
-            const known = getPeer(frame.extId);
+            const serverId = getServerId();
+            const known = getPeer(frame.extId, serverId);
 
             this.session = {
               ws,
@@ -325,28 +419,57 @@ export class Bridge {
             // reservation.
             if (this.claiming === ws) this.claiming = null;
 
+            const session = this.session;
+
             this.sendPlain(ws, {
               t: 'hello_ack',
               sPub: kp.publicKeyB64,
               sNonce,
-              serverId: getServerId(),
+              serverId,
               paired: Boolean(known),
             });
 
-            if (known) {
-              const nonce = toB64(randomBytes(16));
-              this.session.challengeNonce = nonce;
-              await this.sendSealed(this.session.handshakeKey, {
-                t: 'challenge',
-                nonce,
-                agent: this.agentIdentity(),
-              });
-            } else {
-              await this.sendSealed(this.session.handshakeKey, {
-                t: 'pair_required',
-                agent: this.agentIdentity(),
-              });
+            if (known) return this.sendChallenge(session);
+
+            // No record — but "no record" is not the same as "nobody is
+            // pairing". Every agent session spawns its own server against one
+            // shared `~/.onbridge`, so several can arrive here at once; if each
+            // prompts and each derives its own secret, the two stores end up
+            // holding different ones and the browser dead-ends at `invalid auth
+            // proof` forever. Exactly one runs the prompt; the rest wait and
+            // then authenticate with what it wrote.
+            const claim = await claimPairing(frame.extId, serverId, PAIRING_CLAIM_BUDGET_MS);
+            // The peer can disconnect while we wait on a sibling's prompt.
+            if (this.session !== session || ws.readyState !== WebSocket.OPEN) {
+              claim.release();
+              return;
             }
+            if (claim.waited) {
+              this.log(
+                `waited for another onbridge server to finish pairing with ${frame.extId}`,
+              );
+            }
+
+            if (claim.record) {
+              // A sibling paired while we waited. Authenticate against its
+              // record rather than starting a second pairing, which is what the
+              // extension is expecting too — it decides which secret to use
+              // from this frame, not from `hello_ack`.
+              session.pairingSecret = fromB64(claim.record.pairingSecret);
+              session.state = 'auth';
+              return this.sendChallenge(session);
+            }
+            if (!claim.pair) {
+              return fail(
+                'another onbridge server is pairing with this browser; retry in a moment',
+              );
+            }
+
+            session.releasePairing = claim.release;
+            await this.sendSealed(session.handshakeKey, {
+              t: 'pair_required',
+              agent: this.agentIdentity(),
+            });
             return;
           }
 
@@ -377,6 +500,16 @@ export class Bridge {
       this.teardown(ws);
     });
     ws.on('error', (err) => this.log(`socket error: ${err.message}`));
+  }
+
+  private async sendChallenge(s: Session): Promise<void> {
+    const nonce = toB64(randomBytes(16));
+    s.challengeNonce = nonce;
+    await this.sendSealed(s.handshakeKey, {
+      t: 'challenge',
+      nonce,
+      agent: this.agentIdentity(),
+    });
   }
 
   /** Frames after `hello`: sealed under the handshake key, then the session key. */
@@ -410,10 +543,18 @@ export class Bridge {
       if (!(await verifyProof(s.pairingSecret, PROOF_PAIR, s.sessionId, '', hs.proof))) {
         return fail('invalid pairing proof');
       }
-      if (s.resetRequested) forgetPeer(s.extId);
-      savePeer(s.extId, toB64(s.pairingSecret));
+      const serverId = getServerId();
+      if (s.resetRequested) forgetPeer(s.extId, serverId);
+      savePeer(s.extId, serverId, toB64(s.pairingSecret));
       this.log(`paired with extension ${s.extId}`);
-      return this.promote(s);
+      await this.promote(s);
+      // Only now: a sibling that has been waiting will read this record and
+      // authenticate with it, and it must not be able to read a half-written
+      // pairing. Releasing before promotion would hand it a secret the
+      // extension might not have committed yet.
+      s.releasePairing?.();
+      s.releasePairing = undefined;
+      return;
     }
 
     if (s.state === 'auth') {
@@ -424,8 +565,20 @@ export class Bridge {
         s.resetRequested = true;
         this.log(`peer ${s.extId} requested pairing reset`);
         const { pairingSecret } = await deriveHandshakeKeys(s.shared, s.eNonce, s.sNonce);
+        if (this.session !== s) return;
         s.pairingSecret = pairingSecret;
         s.state = 'pairing';
+        // Take the pairing claim for this one too. A reset is a pairing, and a
+        // sibling starting one in parallel would clobber it the same way.
+        const claim = await claimPairing(s.extId, getServerId(), PAIRING_CLAIM_BUDGET_MS);
+        if (this.session !== s || s.ws.readyState !== WebSocket.OPEN) {
+          claim.release();
+          return;
+        }
+        // A record appearing while we waited belongs to a sibling's fresh
+        // pairing, not to the one being reset; the reset still has to run, so
+        // the claim is taken regardless and only the wait mattered.
+        s.releasePairing = claim.release;
         return this.sendSealed(s.handshakeKey, {
           t: 'pair_required',
           agent: this.agentIdentity(),
@@ -439,7 +592,24 @@ export class Bridge {
         s.challengeNonce ?? '',
         hs.proof,
       );
-      if (!ok) return fail('invalid auth proof');
+      if (!ok) {
+        // Say what we actually know before hanging up. The browser sees only
+        // "invalid auth proof", which has an innocent cause (a stale secret
+        // from an abandoned session) and a hostile one (another local process
+        // took this pairing over) — and the panel used to assert the hostile
+        // reading as fact. The server is holding the evidence that separates
+        // them: a record that has not been rewritten since it was created was
+        // not replaced by anybody.
+        await this.sendSealed(s.handshakeKey, {
+          t: 'auth_fail',
+          reason: 'invalid auth proof',
+          evidence: {
+            ...pairingEvidence(s.extId, getServerId()),
+            siblingServers: this.siblingCount,
+          },
+        });
+        return fail('invalid auth proof');
+      }
 
       // Mutual: prove to the extension that we hold the pairing secret too, so a
       // rogue local server cannot impersonate a previously paired agent.
@@ -447,7 +617,9 @@ export class Bridge {
         t: 'auth_ok',
         proof: await makeProof(s.pairingSecret, PROOF_AUTH_SRV, s.sessionId, s.challengeNonce ?? ''),
       });
-      touchPeer(s.extId);
+      // Forced: this is a real authentication, and it is the event that makes
+      // `lastSeen` mean something. Heartbeats touch it too, throttled.
+      touchPeer(s.extId, getServerId(), true);
       return this.promote(s);
     }
   }
@@ -521,6 +693,9 @@ export class Bridge {
   private teardown(ws: WebSocket): void {
     if (this.session?.ws !== ws) return;
     clearTimeout(this.session.timer);
+    // A peer that vanishes mid-prompt must not leave siblings queued behind a
+    // lock nobody will ever release.
+    this.session.releasePairing?.();
     this.session = null;
     this.stopHeartbeat();
     this.log('extension disconnected');
@@ -551,6 +726,20 @@ export class Bridge {
    */
   takeUserMessages(limit = 5): string[] {
     return this.userMessages.splice(0, limit);
+  }
+
+  /**
+   * Console output recorded during the command that just completed, consumed
+   * once by the reply builders.
+   *
+   * Draining rather than reading is what keeps it attached to the action that
+   * caused it: left in place, the same lines would be appended to every later
+   * result and read as though the page had just produced them again.
+   */
+  takeConsoleDelta(): ConsoleDeltaEntry[] {
+    const out = this.consoleDelta;
+    this.consoleDelta = [];
+    return out;
   }
 
   async sendCommand(
@@ -592,8 +781,21 @@ export class Bridge {
         if (!cmd) break;
         clearTimeout(cmd.timer);
         this.pending.delete(msg.id);
+        // Console output produced *while this command ran* rides along on the
+        // result and is lifted off here, before the data reaches the tool.
+        // Taken on the failure path too: an action that threw is exactly when
+        // the page's console explains why, and a tool that only reports console
+        // output on success hides it at the moment it matters most.
+        this.consoleDelta = Array.isArray(msg.consoleDelta) ? msg.consoleDelta : [];
         if (msg.success) cmd.resolve(msg.data);
-        else cmd.reject(commandError(msg.error ?? 'Command failed', msg.errorKind === 'trusted'));
+        else
+          cmd.reject(
+            commandError(
+              msg.error ?? 'Command failed',
+              msg.errorKind === 'trusted',
+              msg.errorCode ? { code: msg.errorCode, retryAfterMs: msg.retryAfterMs } : undefined,
+            ),
+          );
         break;
       }
 
@@ -622,7 +824,11 @@ export class Bridge {
   private startHeartbeat(): void {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
-      if (this.isConnected()) void this.sendSealed(this.session!.sessionKey!, { type: 'ping' });
+      if (!this.isConnected()) return;
+      void this.sendSealed(this.session!.sessionKey!, { type: 'ping' });
+      // Keeps `lastSeen` honest for the life of a long session. Throttled
+      // inside `touchPeer`, so this is not a file write every fifteen seconds.
+      touchPeer(this.session!.extId, getServerId());
     }, HEARTBEAT_INTERVAL_MS);
   }
 

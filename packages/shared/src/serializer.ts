@@ -2,15 +2,24 @@ import type { DomNode, PageSnapshot, FindResult, ScrollState } from './dom-types
 
 export function serializeSnapshot(snapshot: PageSnapshot): string {
   const lines: string[] = [];
-  lines.push(`[page] ${snapshot.title} (${snapshot.url})`);
+  lines.push(`[page] ${snapshot?.title ?? ''} (${snapshot?.url ?? ''})`);
 
-  for (const node of snapshot.tree) {
+  // Defensive rather than trusting: `for (const node of snapshot.tree)` on an
+  // object with no `tree` throws "snapshot.tree is not iterable", and that throw
+  // used to travel back to the agent as the *action's* failure — reporting a
+  // click that had already landed as an error. The shape check is the last line
+  // of that defence; the first is that action tools no longer pass a
+  // non-snapshot here at all.
+  const tree = Array.isArray(snapshot?.tree) ? snapshot.tree : [];
+  for (const node of tree) {
     serializeNode(node, 1, lines);
   }
 
-  const { percent, pagesBelow } = snapshot.scroll;
-  if (pagesBelow > 0) {
-    lines.push(`  [scroll] ${percent}% · ${pagesBelow} page${pagesBelow === 1 ? '' : 's'} below`);
+  const scroll: ScrollState | undefined = snapshot?.scroll;
+  if (scroll && scroll.pagesBelow > 0) {
+    lines.push(
+      `  [scroll] ${scroll.percent}% · ${scroll.pagesBelow} page${scroll.pagesBelow === 1 ? '' : 's'} below`,
+    );
   }
 
   return lines.join('\n');
@@ -44,8 +53,14 @@ function serializeNode(node: DomNode, depth: number, lines: string[]): void {
 }
 
 export function serializeFindResults(results: FindResult[]): string {
-  if (results.length === 0) return 'No matches found.';
+  if (!Array.isArray(results) || results.length === 0) return 'No matches found.';
   return results
-    .map((r) => `[${r.role}:${r.ref}] "${r.name}" — ${r.context}`)
+    .map((r) => {
+      // The href is what lets the agent `navigate` straight to a result instead
+      // of clicking through it, so it belongs on the line rather than behind a
+      // second call.
+      const href = r.href ? ` → ${r.href}` : '';
+      return `[${r.role}:${r.ref}] "${r.name}" — ${r.context}${href}`;
+    })
     .join('\n');
 }

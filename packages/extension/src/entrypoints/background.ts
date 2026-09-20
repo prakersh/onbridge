@@ -2,11 +2,21 @@ import { defineBackground } from 'wxt/utils/define-background';
 import type {
   ServerMessage,
   ExtensionMessage,
+  ConsoleDeltaEntry,
+  ActionResult,
   DomNode,
   PageSnapshot,
   AgentIdentity,
 } from '@onbridge/shared';
 import { clearPairings } from '../core/secure-client.js';
+import {
+  listSecrets,
+  saveSecret,
+  deleteSecret,
+  hasPlaceholder,
+  resolvePlaceholders,
+  type SecretRecord,
+} from '../core/secrets.js';
 import {
   ConnectionManager,
   scopeAllows,
@@ -22,6 +32,11 @@ import {
   clearConsole,
   enableConsoleCapture,
   setBlockedUrlPatterns,
+  enableNetworkCapture,
+  getNetwork,
+  getResponseBody,
+  consoleCursor,
+  consoleSince,
 } from '../core/cdp.js';
 import * as trusted from '../core/trusted-input.js';
 import {
@@ -65,6 +80,18 @@ export default defineBackground(() => {
    * the last refusal lets the panel say so and offer a deliberate way in.
    */
   let pairBlocked: { name: string; port: number; at: number } | null = null;
+
+  /**
+   * Secret names and origins, cached for the synchronous `get_status` reply.
+   * Never holds a value — reading one is `resolvePlaceholders`' job alone.
+   */
+  let knownSecrets: SecretRecord[] = [];
+  const refreshSecrets = (): void => {
+    void listSecrets().then((s) => {
+      knownSecrets = s;
+    });
+  };
+  refreshSecrets();
   let pairRequest:
     | {
         agent: AgentIdentity;
@@ -315,6 +342,25 @@ export default defineBackground(() => {
    */
   class TrustedError extends Error {}
 
+  /**
+   * A transient condition the agent should simply try again, carried as a
+   * *code* rather than as English.
+   *
+   * The distinction matters because the alternative is asking the agent to
+   * recognise Chrome's phrasing — and an agent that cannot tell "retry this"
+   * from "this failed" either gives up on a working page or, far worse,
+   * re-issues an action that already happened.
+   */
+  class RetryableError extends TrustedError {
+    constructor(
+      message: string,
+      readonly code: 'navigating' | 'no-content-script',
+      readonly retryAfterMs: number,
+    ) {
+      super(message);
+    }
+  }
+
   const refusal = (msg: string): TrustedError => new TrustedError(msg);
 
   const manager = new ConnectionManager({
@@ -344,11 +390,27 @@ export default defineBackground(() => {
     const cmdStart = Date.now();
     const summary = summarizeParams(msg.action, msg.params);
 
+    // Where this tab's console stood before the command ran, so only what the
+    // action itself provoked rides back on the result. Taken here rather than
+    // inside the handler because the tab is resolved downstream and a failure
+    // must still report its console — that is when it matters most.
+    const consoleTab = msg.tabId ?? (await defaultTabFor(session).catch(() => undefined));
+    const consoleMark = consoleTab != null ? consoleCursor(consoleTab) : null;
+    const deltaSince = (): { consoleDelta?: ConsoleDeltaEntry[] } => {
+      if (consoleTab == null || consoleMark == null) return {};
+      const entries = consoleSince(consoleTab, consoleMark).map((e) => ({
+        level: e.level,
+        text: e.text,
+        timestamp: e.timestamp,
+      }));
+      return entries.length ? { consoleDelta: entries } : {};
+    };
+
     let response: ExtensionMessage;
     try {
       const data = await handleCommand(session, msg);
       const timing = Date.now() - cmdStart;
-      response = { type: 'result', id: msg.id, success: true, data, timing };
+      response = { type: 'result', id: msg.id, success: true, data, ...deltaSince(), timing };
       session.activityLog.unshift({
         action: msg.action,
         summary,
@@ -367,6 +429,12 @@ export default defineBackground(() => {
         error: errorMsg,
         // Anything not deliberately marked is assumed to carry page text.
         ...(err instanceof TrustedError ? { errorKind: 'trusted' as const } : {}),
+        // A code is a claim about provenance as much as about kind, so it only
+        // ever rides on an error onbridge composed. RetryableError extends
+        // TrustedError, so the two always travel together.
+        ...(err instanceof RetryableError
+          ? { errorCode: err.code, retryAfterMs: err.retryAfterMs }
+          : {}),
         timing,
       };
       session.activityLog.unshift({
@@ -522,6 +590,14 @@ export default defineBackground(() => {
 
     await enforcePolicy(action, params, tabId, frameId);
 
+    // Substitute {{secret:…}} placeholders last, after policy and after the
+    // activity log has already recorded the command. The agent wrote the
+    // placeholder, the panel and the log show the placeholder, and only the
+    // value that goes on the wire to the page is real — so the secret exists in
+    // exactly one place it has to and nowhere else. Bound to the page's origin:
+    // a placeholder on the wrong site does not resolve.
+    params = await substituteSecrets(action, params, targetTabId);
+
     // Where the tab sat before this command ran.
     //
     // Checking the destination the agent *named* covers `navigate` and friends,
@@ -657,7 +733,10 @@ export default defineBackground(() => {
       case 'snapshot':
         return handleSnapshot(params, tabId);
       case 'navigate':
-        return handleNavigate(params as { url: string }, tabId);
+        return handleNavigate(
+          params as { url: string; snapshot?: boolean; compact?: boolean; depth?: number },
+          tabId,
+        );
       case 'back':
         return handleGoBack(tabId);
       case 'forward':
@@ -680,6 +759,10 @@ export default defineBackground(() => {
         return handleSetCookie(params as { name: string; value: string; domain: string });
       case 'console_logs':
         return handleConsoleLogs(params as { level?: string; clear?: boolean }, tabId);
+      case 'network_requests':
+        return handleNetworkRequests(params as NetworkFilter, tabId);
+      case 'network_request_body':
+        return handleNetworkRequestBody(params as { requestId?: string }, tabId);
       case 'download_file':
         return handleDownloadFile(params as { url?: string; ref?: number });
       case 'list_downloads':
@@ -690,9 +773,26 @@ export default defineBackground(() => {
         return { entries: session.activityLog.slice(0, 30), totalCommands: session.commandCount };
       case 'upload':
         return handleFileUpload(params as { ref: number; filePath: string }, tabId);
+      // Everything that can move the page shares one post-action path, so the
+      // result shape and the "a performed action is never a failure" rule hold
+      // for all of them. `dismiss_modal` belongs here too: "Continue to site"
+      // is a dismissal that navigates.
       case 'click':
       case 'click_by_text':
-        return handleClickWithNavDetection(action, params, tabId, frameId);
+      case 'scroll':
+      case 'dismiss_modal':
+        return performPageAction(action, params, tabId, frameId);
+      // Refs leaving the content script are frame-local; the agent only ever
+      // sees global ones.
+      case 'find':
+      case 'list_actions':
+      case 'dom_query':
+        return globaliseResultRefs(
+          action,
+          await routeToContentScript(action, params, tabId, frameId),
+          tabId!,
+          frameId,
+        );
       case 'type':
       case 'hover':
       case 'press_key':
@@ -714,10 +814,67 @@ export default defineBackground(() => {
     localRef: number;
   }
   const frameRefsByTab = new Map<number, Map<number, FrameRef>>();
+  /**
+   * The same mapping the other way round, keyed `frameId:localRef`.
+   *
+   * Needed because refs also come *out* of tools that never went through a
+   * snapshot — `find`, `list_actions`, `dom_query` all read the content
+   * script's own ref map. Those refs are frame-local, and handing them to the
+   * agent alongside snapshot refs, which are global, mixed two numbering
+   * schemes in one namespace: `localiseRefs` then translated a `find` ref as
+   * though it were global and the command landed on a different element
+   * entirely. That is a silent wrong-element action — the worst kind — and it
+   * explains both a scoped read coming back empty and a click that "did
+   * nothing".
+   */
+  const reverseRefsByTab = new Map<number, Map<string, number>>();
   let globalRefCounter = 0;
 
   function resolveRef(tabId: number, ref: number): FrameRef {
     return frameRefsByTab.get(tabId)?.get(ref) ?? { frameId: 0, localRef: ref };
+  }
+
+  /** The global ref for a frame-local one, minting a new one if needed. */
+  function globalRefFor(tabId: number, frameId: number, localRef: number): number {
+    let forward = frameRefsByTab.get(tabId);
+    let reverse = reverseRefsByTab.get(tabId);
+    if (!forward || !reverse) {
+      forward = forward ?? new Map<number, FrameRef>();
+      reverse = reverse ?? new Map<string, number>();
+      frameRefsByTab.set(tabId, forward);
+      reverseRefsByTab.set(tabId, reverse);
+    }
+    const key = `${frameId}:${localRef}`;
+    const known = reverse.get(key);
+    if (known != null) return known;
+    globalRefCounter++;
+    forward.set(globalRefCounter, { frameId, localRef });
+    reverse.set(key, globalRefCounter);
+    return globalRefCounter;
+  }
+
+  /**
+   * Rewrites the refs in a tool result from the content script's namespace into
+   * the global one, so every ref the agent ever sees means the same thing.
+   */
+  function globaliseResultRefs(action: string, data: unknown, tabId: number, frameId: number): unknown {
+    const fix = (row: Record<string, unknown>) =>
+      typeof row.ref === 'number' ? { ...row, ref: globalRefFor(tabId, frameId, row.ref) } : row;
+
+    if (action === 'find' && Array.isArray(data)) {
+      return data.map((r) => fix(r as Record<string, unknown>));
+    }
+    if (action === 'list_actions') {
+      const d = data as { actions?: Array<Record<string, unknown>> };
+      if (!Array.isArray(d?.actions)) return data;
+      return { ...d, actions: d.actions.map(fix) };
+    }
+    if (action === 'dom_query') {
+      const d = data as { results?: Array<Record<string, unknown>> };
+      if (!Array.isArray(d?.results)) return data;
+      return { ...d, results: d.results.map(fix) };
+    }
+    return data;
   }
 
   /**
@@ -756,14 +913,20 @@ export default defineBackground(() => {
   }
 
   /** Rewrites a captured subtree's refs into the global namespace. */
-  function remapTree(nodes: DomNode[], frameId: number, map: Map<number, FrameRef>): void {
+  function remapTree(
+    nodes: DomNode[],
+    frameId: number,
+    map: Map<number, FrameRef>,
+    reverse: Map<string, number>,
+  ): void {
     for (const node of nodes) {
       if (node.ref != null) {
         globalRefCounter++;
         map.set(globalRefCounter, { frameId, localRef: node.ref });
+        reverse.set(`${frameId}:${node.ref}`, globalRefCounter);
         node.ref = globalRefCounter;
       }
-      if (node.children) remapTree(node.children, frameId, map);
+      if (node.children) remapTree(node.children, frameId, map, reverse);
     }
   }
 
@@ -786,8 +949,9 @@ export default defineBackground(() => {
       0,
     )) as PageSnapshot;
     const map = new Map<number, FrameRef>();
+    const reverse = new Map<string, number>();
     globalRefCounter = 0;
-    remapTree(snap.tree, 0, map);
+    remapTree(snap.tree, 0, map, reverse);
 
     let frames: chrome.webNavigation.GetAllFrameResultDetails[] = [];
     try {
@@ -814,7 +978,7 @@ export default defineBackground(() => {
           frame.frameId,
         )) as PageSnapshot;
         if (!sub?.tree?.length) continue;
-        remapTree(sub.tree, frame.frameId, map);
+        remapTree(sub.tree, frame.frameId, map, reverse);
         snap.tree.push({ role: 'iframe', name: sub.title || frame.url, children: sub.tree });
       } catch {
         // A frame with no injected script (cross-origin restrictions, sandboxed)
@@ -823,6 +987,7 @@ export default defineBackground(() => {
     }
 
     frameRefsByTab.set(targetTabId, map);
+    reverseRefsByTab.set(targetTabId, reverse);
     return snap;
   }
 
@@ -985,6 +1150,12 @@ export default defineBackground(() => {
    * on the tab, restricted pages). The fallback is degraded — untrusted events
    * are rejected by some sites — so it is recorded in the activity feed.
    */
+  /**
+   * Actions that routinely submit a form and therefore move the page, without
+   * any destination appearing in their parameters.
+   */
+  const MAY_SUBMIT = new Set(['type', 'press_key']);
+
   async function handleTrustedAction(
     action: string,
     params: Record<string, unknown>,
@@ -993,6 +1164,26 @@ export default defineBackground(() => {
   ): Promise<unknown> {
     const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab found');
+
+    // Enter in a search box is a navigation the agent has no other way to
+    // learn about: the result used to be a bare "Typed successfully" while the
+    // browser was already on a different page.
+    const urlBefore = MAY_SUBMIT.has(action)
+      ? ((await chrome.tabs.get(targetTabId).catch(() => null))?.url ?? '')
+      : '';
+    const startedAt = Date.now();
+    const withNav = async (res: Record<string, unknown>): Promise<unknown> => {
+      if (!MAY_SUBMIT.has(action)) return res;
+      const navigated = await awaitNavigationSettled(targetTabId, urlBefore, startedAt);
+      const tab = await chrome.tabs.get(targetTabId).catch(() => null);
+      return {
+        ...res,
+        navigated,
+        url: tab?.url ?? urlBefore,
+        title: tab?.title ?? '',
+        ...(navigated ? { from: urlBefore } : {}),
+      };
+    };
 
     try {
       switch (action) {
@@ -1004,7 +1195,7 @@ export default defineBackground(() => {
             { clear: Boolean(params.clear), submit: Boolean(params.submit) },
             frameId,
           );
-          return { success: true, trusted: true };
+          return await withNav({ success: true, trusted: true });
 
         case 'hover':
           await trusted.hover(targetTabId, params.ref as number, frameId);
@@ -1016,7 +1207,7 @@ export default defineBackground(() => {
             String(params.key ?? ''),
             (params.modifiers as string[]) ?? [],
           );
-          return { success: true, trusted: true };
+          return await withNav({ success: true, trusted: true });
 
         case 'drag':
           await trusted.dragAndDrop(
@@ -1042,7 +1233,9 @@ export default defineBackground(() => {
       degraded = err.message;
     }
 
-    return routeToContentScript(action, params, targetTabId, frameId);
+    return withNav(
+      (await routeToContentScript(action, params, targetTabId, frameId)) as Record<string, unknown>,
+    );
   }
 
   /**
@@ -1093,49 +1286,146 @@ export default defineBackground(() => {
     }
   }
 
-  async function handleClickWithNavDetection(
+  /**
+   * How long an action is given to *announce* a navigation before we conclude
+   * it did not cause one.
+   *
+   * The old code slept a flat 300ms and compared URLs. That was both too long
+   * when nothing happened and too short when something did: a click on a heavy
+   * site regularly committed at 400-600ms, so the same call reported "did not
+   * navigate" for a click that had in fact navigated, and then failed trying to
+   * snapshot a document that was being torn down. Polling `webNavigation`'s
+   * recorded intent exits in a few milliseconds in the common case and still
+   * catches the slow one.
+   */
+  const NAV_ANNOUNCE_BUDGET_MS = 1_200;
+  /** Hard cap on waiting for a started navigation to finish loading. */
+  const NAV_COMPLETE_BUDGET_MS = 10_000;
+  const NAV_POLL_MS = 40;
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  /**
+   * Waits out any navigation this command caused and reports whether there was
+   * one.
+   *
+   * Intent comes from `webNavigation.onBeforeNavigate` (recorded in
+   * `recentNavigations`) rather than from polling the tab, because
+   * `location.href = …` and a link click both return before anything commits —
+   * the tab still reports the old URL at the moment we would look.
+   */
+  async function awaitNavigationSettled(
+    tabId: number,
+    urlBefore: string,
+    startedAt: number,
+  ): Promise<boolean> {
+    const announced = () => recentNavigations.some((n) => n.tabId === tabId && n.at >= startedAt);
+
+    let moved = announced();
+    const announceDeadline = Date.now() + NAV_ANNOUNCE_BUDGET_MS;
+    while (!moved && Date.now() < announceDeadline) {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tab) return false;
+      if ((tab.url ?? '') !== urlBefore) {
+        moved = true;
+        break;
+      }
+      await sleep(NAV_POLL_MS);
+      moved = announced();
+    }
+    if (!moved) return false;
+
+    const completeDeadline = Date.now() + NAV_COMPLETE_BUDGET_MS;
+    while (Date.now() < completeDeadline) {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tab) return true;
+      if (tab.status === 'complete') break;
+      await sleep(NAV_POLL_MS);
+    }
+    // Content scripts are injected at document_idle, which lands a beat after
+    // the tab reports 'complete'. Snapshotting inside that gap is exactly how
+    // "Receiving end does not exist" used to reach the agent.
+    await sleep(150);
+    return true;
+  }
+
+  /**
+   * Why a post-action snapshot is missing.
+   *
+   * Deliberately a fixed phrase and never the underlying error text. This
+   * string is presented to the agent as onbridge's own words, outside the
+   * untrusted-content fence, and the underlying failure can carry text a page
+   * chose. Classifying it here and discarding the original is what keeps that
+   * channel closed; the original still goes to the console for debugging.
+   */
+  function describeSnapshotFailure(err: unknown): string {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.debug('[onbridge] post-action snapshot failed:', msg);
+    if (CONTENT_SCRIPT_GONE.test(msg) || /navigat|timed out|timeout/i.test(msg)) {
+      return 'the page was still loading when it was captured';
+    }
+    return 'the page could not be captured';
+  }
+
+  /**
+   * Runs an action that might move the page, then reports what happened.
+   *
+   * The contract this enforces is the important part: **a performed action is
+   * never reported as a failure.** The click, scroll or dismissal has already
+   * happened by the time we get here, so everything below — settling the
+   * navigation, rebuilding the snapshot — is best effort. If the capture fails
+   * the result still says `ok: true` and carries the new URL; only the snapshot
+   * is missing. Previously the capture threw and the whole call came back as an
+   * error, which invites the agent to retry an action that already went
+   * through. That is how an order gets placed twice.
+   */
+  async function performPageAction(
     action: string,
     params: Record<string, unknown>,
-    tabId?: number,
+    tabId: number | undefined,
     frameId = 0,
-  ): Promise<unknown> {
+  ): Promise<ActionResult> {
     const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab found');
 
     const tabBefore = await chrome.tabs.get(targetTabId);
     const urlBefore = tabBefore.url ?? '';
+    const startedAt = Date.now();
 
     const domBefore = await domSignature(targetTabId, frameId);
-    const result = await clickTrustedOrFallback(action, params, targetTabId, frameId);
 
-    // Check if the tab URL changed (navigation happened)
-    await new Promise((r) => setTimeout(r, 300));
-    const tabAfter = await chrome.tabs.get(targetTabId);
-    const urlAfter = tabAfter.url ?? '';
+    const raw =
+      action === 'click' || action === 'click_by_text'
+        ? await clickTrustedOrFallback(action, params, targetTabId, frameId)
+        : await routeToContentScript(action, params, targetTabId, frameId);
 
-    if (urlAfter !== urlBefore) {
-      // Navigation happened — wait for it to finish, then re-snapshot the new page
-      await waitForNavigation(targetTabId);
-      const fresh = await handleSnapshot({}, targetTabId);
-      return { ...fresh, changed: { navigated: true, from: urlBefore, to: urlAfter } };
+    const navigated = await awaitNavigationSettled(targetTabId, urlBefore, startedAt);
+    const tabAfter = await chrome.tabs.get(targetTabId).catch(() => null);
+
+    const result: ActionResult = {
+      ok: true,
+      action,
+      navigated,
+      url: tabAfter?.url ?? urlBefore,
+      title: tabAfter?.title ?? '',
+      ...(navigated ? { from: urlBefore } : {}),
+      ...((raw as { trusted?: boolean })?.trusted ? { trusted: true } : {}),
+    };
+
+    if (!navigated) {
+      // Same page: say whether the DOM moved at all. Without this the agent
+      // cannot tell "clicked and something happened" from "clicked into the
+      // void" — the usual cause of it confidently continuing down a dead path.
+      const domAfter = await domSignature(targetTabId, frameId);
+      if (domBefore != null && domAfter != null) result.domChanged = domBefore !== domAfter;
     }
 
-    // Nothing navigated, so say whether the DOM moved at all. Without this the
-    // agent cannot tell "clicked and something happened" from "clicked into the
-    // void" — the usual cause of it confidently continuing down a dead path.
-    const domAfter = await domSignature(targetTabId, frameId);
-    const changed = domBefore != null && domAfter != null && domBefore !== domAfter;
-
-    return {
-      ...(result as Record<string, unknown>),
-      changed: {
-        navigated: false,
-        domChanged: changed,
-        ...(changed
-          ? {}
-          : { hint: 'The page did not visibly change. Verify the click landed on what you intended before continuing.' }),
-      },
-    };
+    try {
+      result.snapshot = await handleSnapshot({}, targetTabId);
+    } catch (err) {
+      result.snapshotError = describeSnapshotFailure(err);
+    }
+    return result;
   }
 
   /**
@@ -1143,6 +1433,144 @@ export default defineBackground(() => {
    * console. Enabling it is best-effort so a tab where the debugger cannot
    * attach still answers, with an explanation instead of a silent empty list.
    */
+  /**
+   * Resolves `{{secret:name}}` placeholders in the values a command will type.
+   *
+   * Only the fields that carry typed text are touched — `type`'s `text` and
+   * `fill_form`'s field values. Everything else is left alone, so a placeholder
+   * cannot be smuggled into a URL, a selector or a script and have the value
+   * come back out somewhere the agent can read it.
+   *
+   * A placeholder that does not resolve is a refusal, not a silent pass-through:
+   * typing the literal `{{secret:x}}` into a login form would fail confusingly,
+   * and — worse — sending it to the wrong site is exactly what origin binding
+   * exists to prevent, so it must be visible.
+   */
+  async function substituteSecrets(
+    action: string,
+    params: Record<string, unknown>,
+    tabId?: number,
+  ): Promise<Record<string, unknown>> {
+    if (action !== 'type' && action !== 'fill_form') return params;
+
+    const carriesText =
+      (typeof params.text === 'string' && hasPlaceholder(params.text)) ||
+      (Array.isArray(params.fields) &&
+        (params.fields as Array<{ value?: unknown }>).some(
+          (f) => typeof f?.value === 'string' && hasPlaceholder(f.value),
+        ));
+    if (!carriesText) return params;
+
+    const url = tabId != null ? ((await chrome.tabs.get(tabId).catch(() => null))?.url ?? '') : '';
+    const pageOrigin = originOf(url);
+    if (!pageOrigin) {
+      throw refusal('Cannot resolve a secret placeholder: this tab has no page origin to match against.');
+    }
+
+    const refusals: string[] = [];
+    const out = { ...params };
+
+    if (typeof out.text === 'string') {
+      const r = await resolvePlaceholders(out.text, pageOrigin);
+      out.text = r.text;
+      refusals.push(...r.refused.map((x) => `${x.name} (${x.reason})`));
+    }
+    if (Array.isArray(out.fields)) {
+      const fields = out.fields as Array<{ value?: unknown; [k: string]: unknown }>;
+      out.fields = await Promise.all(
+        fields.map(async (f) => {
+          if (typeof f?.value !== 'string') return f;
+          const r = await resolvePlaceholders(f.value, pageOrigin);
+          refusals.push(...r.refused.map((x) => `${x.name} (${x.reason})`));
+          return { ...f, value: r.text };
+        }),
+      );
+    }
+
+    if (refusals.length) {
+      throw refusal(
+        `Secret placeholder not filled: ${refusals.join(', ')}. Secrets are bound to one origin and ` +
+          `this page is ${pageOrigin}. Ask the user to save the secret for this site in the onbridge side panel.`,
+      );
+    }
+    return out;
+  }
+
+  interface NetworkFilter {
+    urlFilter?: string;
+    method?: string;
+    status?: number;
+    limit?: number;
+    failedOnly?: boolean;
+  }
+
+  /**
+   * Recent network activity for a tab.
+   *
+   * Capture has to be switched on before it can report anything, and it only
+   * sees requests made after that point — the same limitation console capture
+   * has, and worth saying plainly rather than returning a confusing empty list.
+   */
+  async function handleNetworkRequests(
+    params: NetworkFilter,
+    tabId?: number,
+  ): Promise<{ entries: unknown[]; total: number; note?: string }> {
+    const targetTabId = tabId;
+    if (!targetTabId) throw new Error('No active tab found');
+
+    try {
+      await enableNetworkCapture(targetTabId);
+    } catch (err) {
+      if (err instanceof CdpUnavailable) {
+        return {
+          entries: [],
+          total: 0,
+          note: `Network capture unavailable: ${err.message}. Reload the tab after closing DevTools.`,
+        };
+      }
+      throw err;
+    }
+
+    let entries = getNetwork(targetTabId);
+    const total = entries.length;
+
+    if (params.urlFilter) {
+      const needle = params.urlFilter.toLowerCase();
+      entries = entries.filter((e) => e.url.toLowerCase().includes(needle));
+    }
+    if (params.method) {
+      const m = params.method.toUpperCase();
+      entries = entries.filter((e) => e.method.toUpperCase() === m);
+    }
+    if (typeof params.status === 'number') {
+      entries = entries.filter((e) => e.status === params.status);
+    }
+    if (params.failedOnly) entries = entries.filter((e) => e.failed != null);
+
+    const limit = typeof params.limit === 'number' && params.limit > 0 ? params.limit : 50;
+    return {
+      entries: entries.slice(-limit),
+      total,
+      note: total
+        ? undefined
+        : 'No requests captured yet. Capture starts when onbridge first attaches to the tab, so anything loaded before that — including the initial page load — is not recorded. Reload the page to see it.',
+    };
+  }
+
+  async function handleNetworkRequestBody(
+    params: { requestId?: string },
+    tabId?: number,
+  ): Promise<{ body: string; base64Encoded: boolean; mimeType?: string } | null> {
+    const targetTabId = tabId;
+    if (!targetTabId) throw new Error('No active tab found');
+    if (!params.requestId) throw refusal('network_request_body needs a requestId from network_requests.');
+
+    const body = await getResponseBody(targetTabId, params.requestId);
+    if (!body) return null;
+    const entry = getNetwork(targetTabId).find((e) => e.requestId === params.requestId);
+    return { ...body, mimeType: entry?.mimeType };
+  }
+
   async function handleConsoleLogs(
     params: { level?: string; clear?: boolean },
     tabId?: number,
@@ -1193,6 +1621,21 @@ export default defineBackground(() => {
     }
   }
 
+  /**
+   * Chrome's own wording for "there is no content script listening right now".
+   *
+   * It is what you get in the window between a navigation committing and the
+   * new document's script being injected — a normal, transient state that used
+   * to be handed to the agent verbatim as `Could not establish connection.
+   * Receiving end does not exist.`. To an agent that reads as a hard failure of
+   * the thing it asked for, rather than "ask again in a moment".
+   */
+  const CONTENT_SCRIPT_GONE =
+    /could not establish connection|receiving end does not exist|message port closed|no response from content script|the tab was closed/i;
+
+  /** How many times a command is re-delivered across a navigation. */
+  const CONTENT_SCRIPT_ATTEMPTS = 3;
+
   async function routeToContentScript(
     action: string,
     params: Record<string, unknown>,
@@ -1202,13 +1645,41 @@ export default defineBackground(() => {
     const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab found');
 
-    if (frameId === 0) await ensureContentScript(targetTabId);
+    let last = '';
+    for (let attempt = 0; attempt < CONTENT_SCRIPT_ATTEMPTS; attempt++) {
+      if (frameId === 0) await ensureContentScript(targetTabId);
+      try {
+        return await deliverToContentScript(targetTabId, action, params, frameId);
+      } catch (err) {
+        last = (err as Error).message;
+        // Anything that is not the page being between documents is the real
+        // answer and must not be retried — a page that threw, a bad selector, a
+        // missing ref all mean something the agent needs to see.
+        if (!CONTENT_SCRIPT_GONE.test(last)) throw err;
+        if (attempt === CONTENT_SCRIPT_ATTEMPTS - 1) break;
+        await waitForTabQuiet(targetTabId, 2_000);
+      }
+    }
 
+    throw new RetryableError(
+      `The page was still loading, so "${action}" could not be delivered to it. ` +
+        'Nothing was changed. Wait a moment and try the same call again.',
+      'navigating',
+      600,
+    );
+  }
+
+  function deliverToContentScript(
+    tabId: number,
+    action: string,
+    params: Record<string, unknown>,
+    frameId: number,
+  ): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Content script timed out')), 25000);
 
       chrome.tabs.sendMessage(
-        targetTabId,
+        tabId,
         { type: 'command', id: `cs_${Date.now()}`, action, params },
         { frameId },
         (response) => {
@@ -1231,6 +1702,21 @@ export default defineBackground(() => {
     });
   }
 
+  /** Waits for a tab to stop loading, so a re-delivery has somewhere to land. */
+  async function waitForTabQuiet(tabId: number, budgetMs: number): Promise<void> {
+    const deadline = Date.now() + budgetMs;
+    while (Date.now() < deadline) {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tab) return;
+      if (tab.status === 'complete') {
+        // document_idle injection lands just after 'complete'.
+        await sleep(150);
+        return;
+      }
+      await sleep(NAV_POLL_MS);
+    }
+  }
+
   async function ensureContentScript(tabId: number): Promise<void> {
     try {
       await chrome.tabs.sendMessage(tabId, { type: 'ping' });
@@ -1243,13 +1729,60 @@ export default defineBackground(() => {
     }
   }
 
-  async function handleNavigate(params: { url: string }, tabId?: number): Promise<unknown> {
+  /**
+   * Goes somewhere and reports where it ended up.
+   *
+   * Two things this now does that it did not:
+   *
+   *  - the snapshot is optional. It used to always return a full one, and a
+   *    heavy results page costs thousands of tokens of navigation chrome,
+   *    filter lists and footers when the caller wanted ten product titles.
+   *    `snapshot: false` plus `extract_text` is the cheap path.
+   *  - it compares the origin it landed on with the one that was asked for. A
+   *    navigation that silently returns a different site — a redirect, an
+   *    interstitial, or a human typing in the omnibox at the wrong moment — is
+   *    otherwise indistinguishable from success, and the agent reads the wrong
+   *    page believing it is the right one.
+   */
+  async function handleNavigate(
+    params: { url: string; snapshot?: boolean; compact?: boolean; depth?: number },
+    tabId?: number,
+  ): Promise<ActionResult> {
     const targetTabId = tabId;
     if (!targetTabId) throw new Error('No active tab');
 
+    const before = (await chrome.tabs.get(targetTabId).catch(() => null))?.url ?? '';
+    const startedAt = Date.now();
+
     await chrome.tabs.update(targetTabId, { url: params.url });
-    await waitForNavigation(targetTabId);
-    return routeToContentScript('snapshot', {}, targetTabId);
+    await awaitNavigationSettled(targetTabId, before, startedAt);
+
+    const tab = await chrome.tabs.get(targetTabId).catch(() => null);
+    const url = tab?.url ?? '';
+
+    const result: ActionResult = {
+      ok: true,
+      action: 'navigate',
+      navigated: url !== before,
+      url,
+      title: tab?.title ?? '',
+      ...(url !== before ? { from: before } : {}),
+    };
+
+    const wanted = originOf(params.url);
+    if (wanted && originOf(url) !== wanted) result.redirectedFrom = params.url;
+
+    if (params.snapshot === false) return result;
+
+    try {
+      result.snapshot = await handleSnapshot(
+        { compact: params.compact, depth: params.depth },
+        targetTabId,
+      );
+    } catch (err) {
+      result.snapshotError = describeSnapshotFailure(err);
+    }
+    return result;
   }
 
   async function handleGoBack(tabId?: number): Promise<{ url: string; title: string }> {
@@ -1279,18 +1812,27 @@ export default defineBackground(() => {
     return { url: tab.url ?? '', title: tab.title ?? '' };
   }
 
-  function waitForNavigation(tabId: number): Promise<void> {
-    return new Promise((resolve) => {
-      const timeout = setTimeout(resolve, 10000);
-      const listener = (updatedTabId: number, info: chrome.tabs.OnUpdatedInfo) => {
-        if (updatedTabId === tabId && info.status === 'complete') {
-          chrome.tabs.onUpdated.removeListener(listener);
-          clearTimeout(timeout);
-          setTimeout(resolve, 300);
-        }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
-    });
+  /**
+   * Waits for a navigation the background itself started — back, forward,
+   * reload, a new tab with a URL.
+   *
+   * Poll-based rather than listener-based. Listening for `status: 'complete'`
+   * missed a load that finished before the listener attached (a bfcache restore
+   * is effectively instant), and the call then sat out the full 10s timeout
+   * with the page long since ready.
+   */
+  async function waitForNavigation(tabId: number, budgetMs = NAV_COMPLETE_BUDGET_MS): Promise<void> {
+    // Let the load declare itself, so 'complete' left over from the previous
+    // document is not mistaken for the new one.
+    await sleep(200);
+    const deadline = Date.now() + budgetMs;
+    while (Date.now() < deadline) {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tab || tab.status === 'complete') break;
+      await sleep(NAV_POLL_MS);
+    }
+    // Content scripts are injected at document_idle, just after 'complete'.
+    await sleep(150);
   }
 
   /**
@@ -1621,6 +2163,11 @@ export default defineBackground(() => {
         attempts: s.attempts,
         lastAction: s.lastAction,
         connectedAt: s.connectedAt,
+        serverId: s.serverId,
+        // What the server could actually prove about a refused pairing, so the
+        // panel can report facts instead of asserting the alarming reading of
+        // an ambiguous symptom.
+        failure: s.failure,
         /** Owns the window this panel is in — drives the "controlling" heading. */
         ownsThisWindow: mine?.id === s.id,
         agent: s.identity
@@ -1658,6 +2205,9 @@ export default defineBackground(() => {
             }
           : null,
         pairBlocked,
+        // Names and origins only — `SecretRecord` carries no value, so there is
+        // nothing here the panel could render even by mistake.
+        secrets: knownSecrets,
         // Whether a newly-appearing agent would be offered to the user at all.
         // Once this closes, a new agent cannot get in without a deliberate
         // gesture, which is worth being able to see rather than infer.
@@ -1838,6 +2388,58 @@ export default defineBackground(() => {
     if (message?.type === 'resolve_pairing') {
       resolvePairing(Boolean(message.allow));
       sendResponse({ ok: true });
+      return true;
+    }
+
+    // Secrets are written only from the extension's own pages, on the same
+    // principle as the approval mode: an agent that could store or rebind a
+    // secret could point one at a site of its choosing.
+    if (message?.type === 'save_secret') {
+      saveSecret(String(message.name ?? ''), String(message.value ?? ''), String(message.origin ?? ''))
+        .then(() => {
+          refreshSecrets();
+          sendResponse({ ok: true });
+        })
+        .catch((err: Error) => sendResponse({ ok: false, reason: err.message }));
+      return true;
+    }
+
+    if (message?.type === 'delete_secret') {
+      deleteSecret(String(message.name ?? ''))
+        .then(() => {
+          refreshSecrets();
+          sendResponse({ ok: true });
+        })
+        .catch((err: Error) => sendResponse({ ok: false, reason: err.message }));
+      return true;
+    }
+
+    /**
+     * Forgets one agent's pairing and reconnects it.
+     *
+     * The recovery the panel previously did not have. `clear_pairings` exists
+     * but throws away every working pairing along with the broken one, and
+     * there was no UI reaching even that — the documented fix was to hand-edit
+     * a file in `~/.onbridge`, and the obvious careful version of that (remove
+     * only your own entry) leaves trust-on-first-use refusing the very
+     * extension being repaired.
+     */
+    if (message?.type === 'forget_pairing') {
+      manager
+        .forgetPairing(String(message.id))
+        .then((res) => {
+          if (res.ok) {
+            // Re-open the pairing window: the agent is about to ask again, and
+            // being refused for "no new agents right now" immediately after the
+            // user asked to re-pair would be absurd.
+            controlEnabledAt = Date.now();
+            pairBlocked = null;
+            rememberPairingWindow();
+            manager.rearm();
+          }
+          sendResponse(res);
+        })
+        .catch((err: Error) => sendResponse({ ok: false, reason: err.message }));
       return true;
     }
 
