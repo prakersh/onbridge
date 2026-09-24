@@ -54,7 +54,7 @@ jobs:
       - name: Test
         run: pnpm test
 
-      # The published bundle must be runnable by `npx onbridge`. A duplicated
+      # The published bundle must be runnable by `npx onbridge-mcp`. A duplicated
       # shebang and an unbundled workspace dep both silently broke this before,
       # and neither typecheck nor build caught it.
       - name: Verify server binary starts and registers tools

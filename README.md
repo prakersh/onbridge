@@ -3,6 +3,8 @@
 **Browser control for AI agents — an MCP server plus a Chrome extension that lets any agent drive your real browser.**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![npm](https://img.shields.io/npm/v/onbridge-mcp.svg)](https://www.npmjs.com/package/onbridge-mcp)
+[![Chrome Web Store](https://img.shields.io/badge/Chrome_Web_Store-install-blue.svg)](https://chromewebstore.google.com/detail/onbridge/minhhfibhfnjdcgiipmcbfgclmeineca)
 
 OnBridge connects AI agents (Claude Code, Codex, Cursor, …) to the browser you already use — with your sessions, your logins, your extensions — over the [Model Context Protocol](https://modelcontextprotocol.io).
 
@@ -37,21 +39,33 @@ Agent  ──stdio/MCP──>  MCP server
 
 ## Install
 
+**1. The MCP server.** Add this to your agent's MCP config:
+
 ```json
 {
   "mcpServers": {
     "onbridge": {
       "command": "npx",
-      "args": ["-y", "onbridge"],
+      "args": ["-y", "onbridge-mcp"],
       "type": "stdio"
     }
   }
 }
 ```
 
-Then install the extension and click its toolbar icon to open the side panel.
+The package is [`onbridge-mcp`](https://www.npmjs.com/package/onbridge-mcp). It
+installs nothing globally — `npx` fetches it on first run.
 
-> The extension is not yet on the Chrome Web Store. Until then, download the `.zip` from [Releases](https://github.com/prakersh/onbridge/releases), unzip it, and load it unpacked at `chrome://extensions/` with Developer mode enabled.
+**2. The extension.** Install it from the [Chrome Web Store](https://chromewebstore.google.com/detail/onbridge/minhhfibhfnjdcgiipmcbfgclmeineca),
+then click its toolbar icon to open the side panel.
+
+<details>
+<summary>Installing the extension from source instead</summary>
+
+Download the `.zip` from [Releases](https://github.com/prakersh/onbridge/releases),
+or run `./app.sh --package`, then load `packages/extension/.output/chrome-mv3/`
+unpacked at `chrome://extensions/` with Developer mode enabled.
+</details>
 
 ### First run
 
@@ -256,7 +270,7 @@ Or build and load `packages/extension/.output/chrome-mv3/` unpacked at `chrome:/
 
 | Variable | Purpose |
 |---|---|
-| `ONBRIDGE_EXTENSION_ID` | Restrict the Origin allowlist to a specific extension id. Set this for release. |
+| `ONBRIDGE_EXTENSION_ID` | Restrict the Origin allowlist to a specific extension id. The published extension's id is `minhhfibhfnjdcgiipmcbfgclmeineca`. |
 | `ONBRIDGE_DEV_EXTENSION_IDS` | Extra ids allowed during development (comma-separated). |
 | `ONBRIDGE_AGENT_NAME` | Name shown in the pairing prompt. |
 | `ONBRIDGE_HOME` | Override `~/.onbridge` (used by tests). |
@@ -278,6 +292,13 @@ With no id configured, any `chrome-extension://` origin is accepted and a warnin
 | `./app.sh --package` | Build and package into `./artifacts/` |
 
 Releases are cut by tagging: `./app.sh --bump minor && git tag "v$(cat VERSION)" && git push --tags`.
+
+Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which builds the artifacts, attaches them to a GitHub Release, and publishes
+`onbridge-mcp` to npm. The publish job needs an `NPM_TOKEN` repository secret —
+an npm **automation** token for an account with publish rights on the package.
+It is not a dependency of the GitHub Release, so a bad token fails that one job
+without holding back the release.
 
 ---
 

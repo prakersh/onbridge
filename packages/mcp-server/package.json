@@ -1,5 +1,5 @@
 {
-  "name": "onbridge",
+  "name": "onbridge-mcp",
   "version": "0.4.0",
   "license": "GPL-3.0-only",
   "description": "MCP server that lets AI agents drive your real Chrome browser — trusted input, approval gates, encrypted local bridge",
@@ -20,7 +20,7 @@
   "bugs": "https://github.com/prakersh/onbridge/issues",
   "type": "module",
   "bin": {
-    "onbridge": "./dist/index.js"
+    "onbridge": "dist/index.js"
   },
   "main": "./dist/index.js",
   "files": [

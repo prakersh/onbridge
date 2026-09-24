@@ -10,9 +10,129 @@ permissions:
   packages: write
 
 jobs:
+  # ─── Extract version from tag ──────────────────────────────────
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION (tag: $TAG)"
+
+  # ─── Publish the MCP server to npm ─────────────────────────────
+  # Needs an `NPM_TOKEN` repository secret: an npm *automation* token for an
+  # account with publish rights on `onbridge-mcp`.
+  #
+  # Deliberately NOT a dependency of `release` below, so an npm failure — an
+  # expired token, a registry wobble — never blocks the GitHub Release and its
+  # artifacts, which are the path most users install from.
+  npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: meta
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # provenance attestation
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `VERSION` and the manifest npm will actually read must agree. ./app.sh
+      # --build syncs them, so a mismatch means one was edited by hand.
+      - name: Verify version matches tag
+        run: |
+          set -euo pipefail
+          FILE_VERSION=$(cat VERSION | tr -d '[:space:]')
+          PKG_VERSION=$(node -p "require('./packages/mcp-server/package.json').version")
+          for pair in "VERSION:$FILE_VERSION" "packages/mcp-server/package.json:$PKG_VERSION"; do
+            IFS=: read -r what a <<< "$pair"
+            if [ "$a" != "${{ needs.meta.outputs.version }}" ]; then
+              echo "::error::$what is $a but the tag is ${{ needs.meta.outputs.version }}"
+              exit 1
+            fi
+          done
+          echo "✓ v${{ needs.meta.outputs.version }}"
+
+      - name: Build the MCP server
+        run: |
+          chmod +x app.sh
+          ./app.sh --build
+
+      # Publishes the exact bytes `npm install` would fetch, then runs them.
+      # The in-repo build is not the same artifact: `files` and the workspace
+      # devDependency are only resolved at pack time.
+      - name: Verify the packed tarball installs and runs
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          tarball="$(cd packages/mcp-server && npm pack --pack-destination "$work" --silent)"
+          cd "$work" && npm init -y > /dev/null && npm install --silent "./$tarball"
+          node - <<'EOF'
+          const { spawn } = require('node:child_process');
+          const p = spawn('node', ['node_modules/onbridge-mcp/dist/index.js'], { stdio: ['pipe', 'pipe', 'inherit'] });
+          let out = '';
+          p.stdout.on('data', d => out += d);
+          const send = o => p.stdin.write(JSON.stringify(o) + '\n');
+          send({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'ci',version:'1'}}});
+          setTimeout(() => send({jsonrpc:'2.0',id:2,method:'tools/list',params:{}}), 500);
+          setTimeout(() => {
+            const msgs = out.trim().split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            const list = msgs.find(m => m.id === 2);
+            p.kill();
+            if (!list?.result?.tools?.length) { console.error('packed server did not register tools'); process.exit(1); }
+            console.log(`OK: packed server runs, ${list.result.tools.length} tools`);
+          }, 2500);
+          EOF
+
+      - name: Publish to npm
+        working-directory: packages/mcp-server
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::NPM_TOKEN secret is not set — add it under Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          VERSION="${{ needs.meta.outputs.version }}"
+          # Re-running a tag (a failed job retried, a re-tag) must not be a hard
+          # error: npm rejects a version that already exists, and the artifact
+          # already published is the one this commit produced.
+          if npm view "onbridge-mcp@$VERSION" version > /dev/null 2>&1; then
+            echo "onbridge-mcp@$VERSION is already on npm — skipping publish."
+            exit 0
+          fi
+          npm publish --access public --provenance
+
+  # ─── Build artifacts and create the GitHub Release ─────────────
   release:
     name: Build & Release
     runs-on: ubuntu-latest
+    needs: meta
     timeout-minutes: 20
 
     steps:
@@ -44,15 +164,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Extract version
-        id: version
+      - name: Verify version matches tag
         run: |
+          set -euo pipefail
           VERSION=$(cat VERSION | tr -d '[:space:]')
-          TAG_VERSION=${GITHUB_REF#refs/tags/v}
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag_version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
-          if [ "$VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::VERSION file ($VERSION) does not match tag (v$TAG_VERSION)"
+          if [ "$VERSION" != "${{ needs.meta.outputs.version }}" ]; then
+            echo "::error::VERSION file ($VERSION) does not match tag (v${{ needs.meta.outputs.version }})"
             exit 1
           fi
           echo "✓ Version: $VERSION"
@@ -70,8 +187,8 @@ jobs:
         run: |
           set -euo pipefail
           work="$(mktemp -d)"
-          tar -xzf "artifacts/onbridge-mcp-server-v${{ steps.version.outputs.version }}.tar.gz" -C "$work"
-          cd "$work/onbridge-mcp-server-v${{ steps.version.outputs.version }}"
+          tar -xzf "artifacts/onbridge-mcp-server-v${{ needs.meta.outputs.version }}.tar.gz" -C "$work"
+          cd "$work/onbridge-mcp-server-v${{ needs.meta.outputs.version }}"
           npm install --omit=dev
           node - <<'EOF'
           const { spawn } = require('node:child_process');
@@ -93,44 +210,61 @@ jobs:
       - name: Upload MCP Server artifact
         uses: actions/upload-artifact@v4
         with:
-          name: onbridge-mcp-server-v${{ steps.version.outputs.version }}
-          path: artifacts/onbridge-mcp-server-v${{ steps.version.outputs.version }}.tar.gz
+          name: onbridge-mcp-server-v${{ needs.meta.outputs.version }}
+          path: artifacts/onbridge-mcp-server-v${{ needs.meta.outputs.version }}.tar.gz
           retention-days: 90
 
       - name: Upload Extension artifact
         uses: actions/upload-artifact@v4
         with:
-          name: onbridge-extension-v${{ steps.version.outputs.version }}
-          path: artifacts/onbridge-extension-v${{ steps.version.outputs.version }}.zip
+          name: onbridge-extension-v${{ needs.meta.outputs.version }}
+          path: artifacts/onbridge-extension-v${{ needs.meta.outputs.version }}.zip
           retention-days: 90
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: OnBridge v${{ steps.version.outputs.version }}
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: OnBridge v${{ needs.meta.outputs.version }}
           generate_release_notes: true
           files: |
-            artifacts/onbridge-mcp-server-v${{ steps.version.outputs.version }}.tar.gz
-            artifacts/onbridge-extension-v${{ steps.version.outputs.version }}.zip
+            artifacts/onbridge-mcp-server-v${{ needs.meta.outputs.version }}.tar.gz
+            artifacts/onbridge-extension-v${{ needs.meta.outputs.version }}.zip
           body: |
-            ## OnBridge v${{ steps.version.outputs.version }}
+            ## OnBridge v${{ needs.meta.outputs.version }}
+
+            ### Install
+
+            **MCP server** — add to your agent's MCP config:
+
+            ```json
+            {
+              "mcpServers": {
+                "onbridge": {
+                  "command": "npx",
+                  "args": ["-y", "onbridge-mcp"],
+                  "type": "stdio"
+                }
+              }
+            }
+            ```
+
+            **Chrome extension** — install from the [Chrome Web Store](https://chromewebstore.google.com/detail/onbridge/minhhfibhfnjdcgiipmcbfgclmeineca).
+            Or download `onbridge-extension-v${{ needs.meta.outputs.version }}.zip` below, unzip it, and load it unpacked at `chrome://extensions/` with Developer mode enabled.
 
             ### Artifacts
 
             | Artifact | Description |
             |---|---|
-            | `onbridge-mcp-server-v${{ steps.version.outputs.version }}.tar.gz` | MCP server — install via `npx onbridge` or extract and run |
-            | `onbridge-extension-v${{ steps.version.outputs.version }}.zip` | Chrome extension (MV3) — load unpacked in `chrome://extensions/` |
+            | `onbridge-mcp-server-v${{ needs.meta.outputs.version }}.tar.gz` | MCP server — same build the npm package ships |
+            | `onbridge-extension-v${{ needs.meta.outputs.version }}.zip` | Chrome extension (MV3), Web Store ready |
 
-            ### Quick Start
+            ### Run without npm
 
             ```bash
-            # MCP Server (after npm publish)
-            npx onbridge
-
-            # Or download and run directly
-            tar -xzf onbridge-mcp-server-v${{ steps.version.outputs.version }}.tar.gz
-            node onbridge-mcp-server-v${{ steps.version.outputs.version }}/dist/index.js
+            tar -xzf onbridge-mcp-server-v${{ needs.meta.outputs.version }}.tar.gz
+            cd onbridge-mcp-server-v${{ needs.meta.outputs.version }} && npm install --omit=dev
+            node dist/index.js
             ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
