@@ -161,7 +161,7 @@ cmd_build() {
   log_ok "shared built"
 
   log_info "Building mcp-server..."
-  pnpm --filter onbridge-mcp run build
+  pnpm --filter @onllm-dev/onbridge-mcp run build
   log_ok "mcp-server built"
 
   log_info "Building extension..."

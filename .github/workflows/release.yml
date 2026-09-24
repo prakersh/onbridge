@@ -28,8 +28,9 @@ jobs:
           echo "Version: $VERSION (tag: $TAG)"
 
   # ─── Publish the MCP server to npm ─────────────────────────────
-  # Setup: npmjs.com → the `onbridge-mcp` package → Settings → Trusted Publisher
-  # → GitHub Actions, with repo=prakersh/onbridge and workflow=release.yml.
+  # Setup: npmjs.com → the `@onllm-dev/onbridge-mcp` package → Settings →
+  # Trusted Publisher → GitHub Actions, with repo=prakersh/onbridge and
+  # workflow=release.yml.
   # No NPM_TOKEN: CI authenticates via GitHub OIDC, so there is no long-lived
   # credential to leak and nothing that expires to break a future release.
   #
@@ -127,8 +128,8 @@ jobs:
           # Re-running a tag (a failed job retried, a re-tag) must not be a hard
           # error: npm rejects a version that already exists, and the artifact
           # already published is the one this commit produced.
-          if npm view "onbridge-mcp@$VERSION" version > /dev/null 2>&1; then
-            echo "onbridge-mcp@$VERSION is already on npm — skipping publish."
+          if npm view "@onllm-dev/onbridge-mcp@$VERSION" version > /dev/null 2>&1; then
+            echo "@onllm-dev/onbridge-mcp@$VERSION is already on npm — skipping publish."
             exit 0
           fi
           npm publish --access public --provenance
@@ -247,7 +248,7 @@ jobs:
               "mcpServers": {
                 "onbridge": {
                   "command": "npx",
-                  "args": ["-y", "onbridge-mcp"],
+                  "args": ["-y", "@onllm-dev/onbridge-mcp"],
                   "type": "stdio"
                 }
               }

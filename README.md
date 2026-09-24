@@ -3,7 +3,7 @@
 **Browser control for AI agents — an MCP server plus a Chrome extension that lets any agent drive your real browser.**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![npm](https://img.shields.io/npm/v/onbridge-mcp.svg)](https://www.npmjs.com/package/onbridge-mcp)
+[![npm](https://img.shields.io/npm/v/@onllm-dev/onbridge-mcp.svg)](https://www.npmjs.com/package/@onllm-dev/onbridge-mcp)
 [![Chrome Web Store](https://img.shields.io/badge/Chrome_Web_Store-install-blue.svg)](https://chromewebstore.google.com/detail/onbridge/minhhfibhfnjdcgiipmcbfgclmeineca)
 
 OnBridge connects AI agents (Claude Code, Codex, Cursor, …) to the browser you already use — with your sessions, your logins, your extensions — over the [Model Context Protocol](https://modelcontextprotocol.io).
@@ -46,15 +46,15 @@ Agent  ──stdio/MCP──>  MCP server
   "mcpServers": {
     "onbridge": {
       "command": "npx",
-      "args": ["-y", "onbridge-mcp"],
+      "args": ["-y", "@onllm-dev/onbridge-mcp"],
       "type": "stdio"
     }
   }
 }
 ```
 
-The package is [`onbridge-mcp`](https://www.npmjs.com/package/onbridge-mcp). It
-installs nothing globally — `npx` fetches it on first run.
+The package is [`@onllm-dev/onbridge-mcp`](https://www.npmjs.com/package/@onllm-dev/onbridge-mcp).
+It installs nothing globally — `npx` fetches it on first run.
 
 **2. The extension.** Install it from the [Chrome Web Store](https://chromewebstore.google.com/detail/onbridge/minhhfibhfnjdcgiipmcbfgclmeineca),
 then click its toolbar icon to open the side panel.
@@ -295,10 +295,10 @@ Releases are cut by tagging: `./app.sh --bump minor && git tag "v$(cat VERSION)"
 
 Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which builds the artifacts, attaches them to a GitHub Release, and publishes
-`onbridge-mcp` to npm. The publish job authenticates to npm with GitHub OIDC —
-there is no stored token. It needs a one-time Trusted Publisher entry on the
-package (npmjs.com → package settings → Trusted Publisher → GitHub Actions:
-repo `prakersh/onbridge`, workflow `release.yml`).
+`@onllm-dev/onbridge-mcp` to npm. The publish job authenticates to npm with
+GitHub OIDC — there is no stored token. It needs a one-time Trusted Publisher
+entry on the package (npmjs.com → package settings → Trusted Publisher →
+GitHub Actions: repo `prakersh/onbridge`, workflow `release.yml`).
 
 The npm job is not a dependency of the GitHub Release, so a failed publish never
 withholds the release or its artifacts.
