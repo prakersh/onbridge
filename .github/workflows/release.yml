@@ -28,12 +28,13 @@ jobs:
           echo "Version: $VERSION (tag: $TAG)"
 
   # ─── Publish the MCP server to npm ─────────────────────────────
-  # Needs an `NPM_TOKEN` repository secret: an npm *automation* token for an
-  # account with publish rights on `onbridge-mcp`.
+  # Setup: npmjs.com → the `onbridge-mcp` package → Settings → Trusted Publisher
+  # → GitHub Actions, with repo=prakersh/onbridge and workflow=release.yml.
+  # No NPM_TOKEN: CI authenticates via GitHub OIDC, so there is no long-lived
+  # credential to leak and nothing that expires to break a future release.
   #
-  # Deliberately NOT a dependency of `release` below, so an npm failure — an
-  # expired token, a registry wobble — never blocks the GitHub Release and its
-  # artifacts, which are the path most users install from.
+  # Not a dependency of `release` below, so an npm failure never blocks the
+  # GitHub Release and its artifacts, which are the path most users install from.
   npm:
     name: Publish to npm
     runs-on: ubuntu-latest
@@ -41,7 +42,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      id-token: write # provenance attestation
+      id-token: write # required for OIDC trusted publishing
 
     steps:
       - name: Checkout
@@ -52,6 +53,16 @@ jobs:
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
+
+      # npm >= 11.5.1 is required for OIDC trusted publishing. Installing into
+      # a user prefix avoids the known self-upgrade bug where the existing
+      # system npm breaks mid-update (MODULE_NOT_FOUND for promise-retry).
+      - name: Upgrade npm to a version supporting trusted publishing
+        run: |
+          NPM_PREFIX="$HOME/.npm-global"
+          mkdir -p "$NPM_PREFIX"
+          npm install -g --prefix "$NPM_PREFIX" npm@11.12.1
+          echo "$NPM_PREFIX/bin" >> "$GITHUB_PATH"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -108,16 +119,10 @@ jobs:
           }, 2500);
           EOF
 
-      - name: Publish to npm
+      - name: Publish to npm (trusted publishing + provenance)
         working-directory: packages/mcp-server
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::NPM_TOKEN secret is not set — add it under Settings → Secrets and variables → Actions"
-            exit 1
-          fi
           VERSION="${{ needs.meta.outputs.version }}"
           # Re-running a tag (a failed job retried, a re-tag) must not be a hard
           # error: npm rejects a version that already exists, and the artifact

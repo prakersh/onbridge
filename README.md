@@ -295,10 +295,13 @@ Releases are cut by tagging: `./app.sh --bump minor && git tag "v$(cat VERSION)"
 
 Pushing a `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which builds the artifacts, attaches them to a GitHub Release, and publishes
-`onbridge-mcp` to npm. The publish job needs an `NPM_TOKEN` repository secret —
-an npm **automation** token for an account with publish rights on the package.
-It is not a dependency of the GitHub Release, so a bad token fails that one job
-without holding back the release.
+`onbridge-mcp` to npm. The publish job authenticates to npm with GitHub OIDC —
+there is no stored token. It needs a one-time Trusted Publisher entry on the
+package (npmjs.com → package settings → Trusted Publisher → GitHub Actions:
+repo `prakersh/onbridge`, workflow `release.yml`).
+
+The npm job is not a dependency of the GitHub Release, so a failed publish never
+withholds the release or its artifacts.
 
 ---
 
