@@ -264,8 +264,12 @@ export default function App() {
    * One MCP entry at user scope becomes one server per editor session, and ten
    * of them exhaust the port range — at which point onbridge simply stops
    * working with no error that points at the cause.
+   *
+   * Only live agents count. Every probed port stays in the list as a failed
+   * entry so the sweep can reconnect later, and a single agent on one port
+   * used to read as "10 agents found".
    */
-  const crowded = status.sessions.length >= 3;
+  const crowded = status.sessions.filter((s) => s.status !== 'failed').length >= 3;
 
   const conn = owner
     ? { color: 'bg-emerald-400', label: owner.agent?.name ?? 'Connected' }
