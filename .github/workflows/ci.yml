@@ -5,15 +5,17 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The release workflow runs this same job first, so nothing is tagged or published unless every suite passes.
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
   check:
-    name: Lint, Typecheck & Build
+    name: Typecheck, Build & All Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -77,6 +79,52 @@ jobs:
             process.exit(res.result.tools.length > 0 ? 0 : 1);
           }, 2000);
           EOF
+
+      # The browser suites load the built extension into Playwright's Chromium and pair it with the built server, on the test ports. verify-browser.mjs runs a headed browser, hence the virtual display.
+      - name: Install Chromium for the browser suites
+        run: pnpm exec playwright-core install --with-deps chromium
+
+      - name: Browser suites (verify-browser, verify-multi-browser)
+        run: xvfb-run -a pnpm test:browser
+
+      # What a release ships, built and run the way a user gets it, so a PR proves everything a release does except tagging and publishing: the GitHub Release server tarball (installed from the tarball, not the workspace), the npm tarball (the exact bytes npm would fetch), and the Web Store zip.
+      - name: Package as a release would, and run what it ships
+        run: |
+          set -euo pipefail
+          ./app.sh --package
+          v="$(tr -d '[:space:]' < VERSION)"
+          work="$(mktemp -d)"
+          tar -xzf "artifacts/onbridge-mcp-server-v$v.tar.gz" -C "$work"
+          (cd "$work/onbridge-mcp-server-v$v" && npm install --omit=dev --silent)
+          tarball="$(cd packages/mcp-server && npm pack --pack-destination "$work" --silent)"
+          mkdir "$work/npm" && (cd "$work/npm" && npm init -y > /dev/null && npm install --silent "../$tarball")
+          npm_entry="$(cd "$work/npm" && node -p "require.resolve('@onllm-dev/onbridge-mcp')")"
+          for entry in "$work/onbridge-mcp-server-v$v/dist/index.js" "$npm_entry"; do
+            node - "$entry" "$v" <<'EOF'
+          const { spawn } = require('node:child_process');
+          const [entry, version] = process.argv.slice(2);
+          const p = spawn('node', [entry], { stdio: ['pipe', 'pipe', 'inherit'] });
+          let out = '';
+          p.stdout.on('data', d => out += d);
+          const send = o => p.stdin.write(JSON.stringify(o) + '\n');
+          send({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'ci',version:'1'}}});
+          setTimeout(() => send({jsonrpc:'2.0',id:2,method:'tools/list',params:{}}), 500);
+          setTimeout(() => {
+            const msgs = out.trim().split('\n').map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+            const init = msgs.find(m => m.id === 1), list = msgs.find(m => m.id === 2);
+            p.kill();
+            if (init?.result?.serverInfo?.version !== version) { console.error(`${entry}: reports ${init?.result?.serverInfo?.version}, expected ${version}`); process.exit(1); }
+            if (!list?.result?.tools?.length) { console.error(`${entry}: registered no tools`); process.exit(1); }
+            console.log(`OK: ${entry} runs v${version}, ${list.result.tools.length} tools`);
+          }, 2500);
+          EOF
+          done
+          # The store rejects a manifest carrying `key`, and the zip must be the version being released.
+          unzip -p "artifacts/onbridge-extension-v$v.zip" manifest.json | node -e '
+            const m = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            if (m.key) { console.error("extension zip still carries the manifest key"); process.exit(1); }
+            if (m.version !== process.argv[1]) { console.error(`extension zip is ${m.version}, expected ${process.argv[1]}`); process.exit(1); }
+            console.log(`OK: extension zip v${m.version}, no key`);' "$v"
 
       - name: Verify build artifacts
         run: |

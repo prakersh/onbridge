@@ -95,10 +95,8 @@ export function renderDiff(ops: Op[]): string {
       const indent = indentOf(o.line);
       if (indent >= want) continue;
       want = indent;
-      if (o.kind !== 'eq') continue;
-      // An unchanged line already shown was shown with its own ancestors.
-      if (show[j]) break;
-      show[j] = true;
+      // No early stop at a line already shown: an unchanged line can have different ancestors in the old page and the new one, so its earlier walk may not have covered this side.
+      if (o.kind === 'eq') show[j] = true;
     }
   }
 

@@ -12,8 +12,13 @@ permissions:
   packages: write
 
 jobs:
+  # ─── Every automated test, before anything is tagged or published ─
+  test:
+    uses: ./.github/workflows/ci.yml
+
   # ─── Extract version from tag ──────────────────────────────────
   meta:
+    needs: test
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
