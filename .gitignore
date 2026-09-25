@@ -25,10 +25,9 @@ Thumbs.db
 *.swo
 *~
 
-# AI agent config (local paths)
+# AI agent config (local paths). CLAUDE.md and AGENTS.md are shared and tracked.
 .mcp.json
 .claude/
-CLAUDE.md
 
 # Logs
 *.log
