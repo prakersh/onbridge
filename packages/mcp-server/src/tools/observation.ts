@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { serializeSnapshot, serializeFindResults } from '@onbridge/shared';
 import type { PageSnapshot, FindResult, ExtractTextResult } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';
-import { text, pageText, image, error, notConnected } from './reply.js';
+import { text, pageText, image, error, notConnected, recordView } from './reply.js';
 
 export function registerObservationTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
@@ -14,7 +14,8 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
         'click/type/fill_form/etc). Use target ref to scope to a subtree, depth to limit nesting. ' +
         'This is the tool for ACTING on a page — it is also the most expensive one here, because most of what it ' +
         'returns is structure. If you only need to read the page, use extract_text; if you know what you are ' +
-        'looking for, use find. Reach for those first and snapshot when you need refs.',
+        'looking for, use find. Reach for those first and snapshot when you need refs. ' +
+        'Always returns the whole page, so call it when you no longer have the page view an action reply refers to.',
       inputSchema: z.object({
         target: z.number().optional().describe('Ref number to scope snapshot to a subtree'),
         depth: z.number().optional().describe('Max nesting depth to capture'),
@@ -25,7 +26,10 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('snapshot', { target, depth, compact })) as PageSnapshot;
-        return pageText(bridge, serializeSnapshot(data));
+        const page = serializeSnapshot(data);
+        // A scoped snapshot is not the whole page, so later changes are never described against it.
+        if (target != null) return pageText(bridge, page);
+        return pageText(bridge, page, `This is page view ${recordView(bridge, data?.url ?? '', page)}.`);
       } catch (err) {
         return error(err);
       }
@@ -100,16 +104,21 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
     {
       description:
         'Read the page as text, with tables rendered as markdown. Use this when you need to READ content — an article, a results table, a description — rather than act on it. ' +
-        'Far cheaper than a snapshot, which spends most of its tokens describing structure you do not need for reading. Pass a ref to read just that section.',
+        'Far cheaper than a snapshot, which spends most of its tokens describing structure you do not need for reading. Pass a ref to read just that section. ' +
+        'Long text comes in parts: a reply that stops early says so, with the offset to continue from.',
       inputSchema: z.object({
         ref: z.number().optional().describe('Read only this element and its descendants'),
-        maxChars: z.number().optional().describe('Truncate beyond this many characters (default 20000)'),
+        offset: z.number().optional().describe('Start at this character, to continue where an earlier reply stopped'),
+        maxChars: z.number().optional().describe('Characters in one reply (default 20000)'),
       }),
     },
-    async ({ ref, maxChars }) => {
+    async ({ ref, offset, maxChars }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = (await bridge.sendCommand('extract_text', { ref, maxChars })) as ExtractTextResult;
+        const start = Math.max(0, Math.floor(offset ?? 0));
+        const limit = Math.max(1, Math.floor(maxChars ?? 20_000));
+        // The extension reads from the start, so asking it for start + limit and slicing here pages the text with no extension change.
+        const data = (await bridge.sendCommand('extract_text', { ref, maxChars: start + limit })) as ExtractTextResult;
 
         // A bare "" used to cover three different answers — the element has no
         // text, the ref names nothing, and the reader failed — and an agent
@@ -132,10 +141,30 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
           );
         }
 
-        const suffix = data.truncated
-          ? `\n\n[truncated — ${data.chars} characters total; re-read a specific section with ref]`
-          : '';
-        return pageText(bridge, data.text + suffix);
+        const total = Number(data.chars) || data.text.length;
+        if (start >= total) {
+          return text(bridge, `The text is ${total} characters long, so offset ${start} is past its end.`);
+        }
+        let part = data.text.slice(start, start + limit);
+        let end = start + part.length;
+        const more = end < total;
+        if (more) {
+          // End on a line break when one is near, so a sentence or table row is not split across two replies.
+          const cut = part.lastIndexOf('\n');
+          if (cut > part.length * 0.8) {
+            part = part.slice(0, cut);
+            end = start + cut + 1;
+          }
+        }
+        // Outside the fence and never silent: an agent that is not told the text stopped reads the end of the reply as the end of the page.
+        const where = `Characters ${start}–${end} of ${total}.`;
+        const next = ref != null ? `offset: ${end}, ref: ${ref}` : `offset: ${end}`;
+        const note = more
+          ? `${where} The text continues: call extract_text with ${next} for the next part.`
+          : start > 0
+            ? `${where} This is the end of the text.`
+            : undefined;
+        return pageText(bridge, part, note);
       } catch (err) {
         return error(err);
       }

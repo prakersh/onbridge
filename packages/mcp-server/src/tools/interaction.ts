@@ -10,7 +10,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
     {
       description:
         'Click an element by ref number (from snapshot/find). Reports whether the page navigated, where it ended up, ' +
-        'and the updated snapshot. If the click ran but the page could not be captured afterwards the call still succeeds ' +
+        'and the updated snapshot (on the same page, only what changed since the last whole page). If the click ran but the page could not be captured afterwards the call still succeeds ' +
         'and says so — it never reports a click that happened as a failure, so do not re-click on an error.',
       inputSchema: z.object({
         ref: z.number().describe('Element ref number from snapshot or find'),
@@ -141,7 +141,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
   server.registerTool(
     'scroll',
     {
-      description: 'Scroll the page or a specific element. Returns where the page is now and an updated snapshot.',
+      description: 'Scroll the page or a specific element. Returns where the page is now and an updated snapshot (only what changed since the last whole page, when that is smaller).',
       inputSchema: z.object({
         direction: z.enum(['up', 'down', 'left', 'right']).describe('Scroll direction'),
         amount: z.union([z.literal('page'), z.literal('half'), z.number()]).optional().describe('Scroll amount: "page", "half", or pixels'),
@@ -230,7 +230,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
     {
       description:
         'Click an element by its visible text content. No prior snapshot needed — finds and clicks in one call. ' +
-        'Reports whether the page navigated, where it ended up, and the updated snapshot.',
+        'Reports whether the page navigated, where it ended up, and the updated snapshot (on the same page, only what changed since the last whole page).',
       inputSchema: z.object({
         text: z.string().describe('Text to search for (case-insensitive)'),
         role: z.string().optional().describe('Filter by element role (button, link, etc)'),

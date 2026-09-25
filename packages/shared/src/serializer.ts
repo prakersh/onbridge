@@ -25,7 +25,32 @@ export function serializeSnapshot(snapshot: PageSnapshot): string {
   return lines.join('\n');
 }
 
+/** A bare `group` (a layout div) says nothing its only child's line does not, so the child takes its place. */
+function isBareWrapper(node: DomNode): boolean {
+  return (
+    node.role === 'group' &&
+    node.ref == null &&
+    !node.name &&
+    node.value == null &&
+    !node.placeholder &&
+    node.checked == null &&
+    !node.disabled &&
+    node.expanded == null &&
+    !node.selected &&
+    node.children?.length === 1
+  );
+}
+
+/** Punctuation that only separates links visually ("home - popular - all"). It carries no text and no ref. */
+function isSeparator(node: DomNode): boolean {
+  return node.role === 'text' && node.ref == null && !node.children?.length && /^[-|•·]$/.test(node.name?.trim() ?? '');
+}
+
 function serializeNode(node: DomNode, depth: number, lines: string[]): void {
+  // Both are lossless: no ref, no text and no grouping of siblings disappears. They were about a fifth of the text of real snapshots.
+  if (isSeparator(node)) return;
+  if (isBareWrapper(node)) return serializeNode(node.children![0], depth, lines);
+
   const indent = '  '.repeat(depth);
   const refTag = node.ref != null ? `:${node.ref}` : '';
   let label = `[${node.role}${refTag}]`;
