@@ -1,6 +1,6 @@
 {
   "name": "@onllm-dev/onbridge-mcp",
-  "version": "0.4.1",
+  "version": "0.4.3",
   "license": "GPL-3.0-only",
   "description": "MCP server that lets AI agents drive your real Chrome browser — trusted input, approval gates, encrypted local bridge",
   "keywords": [
