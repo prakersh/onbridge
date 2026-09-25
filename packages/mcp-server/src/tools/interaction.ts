@@ -19,7 +19,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ ref, button, doubleClick }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('click', { ref, button, doubleClick })) as ActionResult;
         return actionReply(bridge, data, 'Clicked.');
@@ -43,7 +43,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ ref, text: inputText, clear, submit }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('type', { ref, text: inputText, clear, submit })) as
           | Partial<ActionResult>
@@ -81,7 +81,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ fields, submit }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('fill_form', { fields, submit })) as {
           filled: number;
@@ -109,7 +109,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ ref, value }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         await bridge.sendCommand('select', { ref, value });
         return text(bridge, 'Selected successfully.');
@@ -128,7 +128,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ ref }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         await bridge.sendCommand('hover', { ref });
         return text(bridge, 'Hovered successfully.');
@@ -149,7 +149,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ direction, amount, ref }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('scroll', { direction, amount, ref })) as ActionResult;
         return actionReply(bridge, data, 'Scrolled.');
@@ -169,7 +169,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ key, modifiers }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('press_key', { key, modifiers })) as
           | Partial<ActionResult>
@@ -195,7 +195,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ fromRef, toRef }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         await bridge.sendCommand('drag', { fromRef, toRef });
         return text(bridge, 'Drag completed.');
@@ -215,7 +215,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ ref, filePath }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         await bridge.sendCommand('upload', { ref, filePath });
         return text(bridge, 'File uploaded.');
@@ -238,7 +238,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ text: searchText, role, index }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('click_by_text', { text: searchText, role, index })) as ActionResult;
         return actionReply(bridge, data, 'Clicked.');
@@ -257,7 +257,7 @@ export function registerInteractionTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ text: dismissText }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('dismiss_modal', { text: dismissText })) as ActionResult;
         return actionReply(bridge, data, 'Dismissed.');

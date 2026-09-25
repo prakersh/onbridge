@@ -15,7 +15,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ script, ref }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('evaluate', { script, ref })) as { result: unknown };
         const formatted = typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
@@ -39,7 +39,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ text: waitText, textGone, selector, timeout }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('wait', {
           text: waitText,
@@ -69,7 +69,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ domain, includeValues }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('get_cookies', { domain, includeValues })) as {
           cookies: Array<Record<string, unknown>>;
@@ -105,7 +105,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ name, value, domain }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         await bridge.sendCommand('set_cookie', { name, value, domain });
         return text(bridge, `Cookie "${name}" set for ${domain}.`);
@@ -124,7 +124,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ level }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const raw = (await bridge.sendCommand('console_logs', { level })) as { logs: Array<{ level: string; text: string; timestamp: number }> } | Array<{ level: string; text: string; timestamp: number }>;
         const data = Array.isArray(raw) ? raw : (raw.logs ?? []);
@@ -153,7 +153,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ urlFilter, method, status, limit, failedOnly }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('network_requests', {
           urlFilter,
@@ -225,7 +225,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ requestId }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('network_request_body', { requestId })) as {
           body?: string;
@@ -277,7 +277,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ selector, action, attr, index }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = await bridge.sendCommand('dom_query', { selector, action, attr, index });
         if (action === 'text') {
@@ -320,7 +320,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ url, ref }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('download_file', { url, ref })) as { filename: string; path: string };
         return pageText(bridge, `${data.filename}\n${data.path}`, 'Downloaded. Filename and path come from the remote server:');
@@ -339,7 +339,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ limit }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('list_downloads', { limit })) as Array<{
           filename: string;
@@ -366,7 +366,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       inputSchema: z.object({}),
     },
     async () => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('activity_log', {})) as {
           entries: Array<{ action: string; summary: string; success: boolean; error?: string; timing: number; timestamp: number }>;

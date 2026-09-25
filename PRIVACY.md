@@ -1,6 +1,6 @@
 # OnBridge Privacy Policy
 
-_Last updated: 2026-08-03_
+_Last updated: 2026-09-26_
 
 ## The short version
 
@@ -20,6 +20,8 @@ While Control Mode is on, and only within the tab scope you selected:
 | The URL and title of pages in scope | So the agent knows where it is | The local agent |
 | Screenshots, when requested | Visual verification | The local agent |
 | Console output, when requested | Debugging | The local agent |
+| Network activity for the tab (URL, method, status, type, size, timing), when requested | Debugging | The local agent, with the values of authorization, cookie and API-key headers removed first |
+| A network response **body** | Only if the agent asks *and you explicitly approve* | The local agent |
 | Cookie **names and domains**, when requested | So the agent can tell whether you are signed in | The local agent |
 | Cookie **values** | Only if the agent asks *and you explicitly approve* | The local agent |
 
@@ -36,6 +38,7 @@ To one place: a process running on your own computer, reached over `ws://127.0.0
 | Item | Location | Contents |
 |---|---|---|
 | Pairing secrets | `chrome.storage.local` | A key per paired agent, used to authenticate the local connection |
+| Install id | `chrome.storage.local` | A random identifier for this browser profile, sent only to the agents on your own computer, so each browser you use keeps its own pairing |
 | Preferences | `chrome.storage.local` | Control Mode, access scope, domain policy |
 | Activity log | Extension memory only | The last 50 commands; cleared when the browser restarts |
 | Server identity and peer records | `~/.onbridge/` (mode 0600) | Identifiers and pairing secrets on your filesystem |
@@ -68,8 +71,8 @@ OnBridge is a developer tool and is not directed at children under 13.
 
 ## Changes
 
-Material changes will be noted in the repository changelog and reflected in the date above.
+Material changes will be noted in the [release notes](https://github.com/prakersh/onbridge/releases) and reflected in the date above.
 
 ## Contact
 
-Questions or concerns: https://github.com/prakersh/onbridge/issues
+Questions or concerns: open an issue at https://github.com/prakersh/onbridge/issues, or email prakersh@live.com.

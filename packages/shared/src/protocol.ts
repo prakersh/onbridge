@@ -72,7 +72,11 @@ export type ServerMessage =
    * correct it here.
    */
   | { type: 'agent_identity'; agent: AgentIdentity }
-  | { type: 'ping' };
+  | { type: 'ping' }
+  /**
+   * The user gave this agent control in another browser, so its commands now go there. Lets this browser's panel show the agent as held instead of still controlling. An extension that predates it ignores it.
+   */
+  | { type: 'control_moved' };
 
 // Extension → MCP Server
 /** One console line, as it crosses the wire. */
@@ -83,7 +87,19 @@ export interface ConsoleDeltaEntry {
 }
 
 export type ExtensionMessage =
-  | { type: 'ready'; version: string; controlMode: boolean }
+  | {
+      type: 'ready';
+      version: string;
+      controlMode: boolean;
+      /**
+       * The command actions this extension implements. Lets a newer server tell the agent "this needs a newer extension" up front instead of sending a command the extension cannot run. Absent from extensions older than the field, which the server treats as "unknown", never as "none".
+       */
+      actions?: string[];
+    }
+  /**
+   * The user took this agent's control back (the panel's hold) but kept the connection. Tells the server to stop preferring this browser for its commands. Optional: an older server ignores it.
+   */
+  | { type: 'released' }
   | {
       type: 'result';
       id: string;
@@ -115,7 +131,7 @@ export type ExtensionMessage =
        * provenance, and a page-derived error must not be able to present itself
        * as a well-known onbridge condition.
        */
-      errorCode?: 'navigating' | 'no-content-script' | 'ref-not-found';
+      errorCode?: 'navigating' | 'no-content-script' | 'ref-not-found' | 'unsupported-action';
       /** How long to wait before retrying, for a retryable `errorCode`. */
       retryAfterMs?: number;
       /**

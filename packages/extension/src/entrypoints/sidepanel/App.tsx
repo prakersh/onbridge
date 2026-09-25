@@ -40,6 +40,8 @@ interface AgentInfo {
   pid: number;
   cwd?: string;
   serverVersion: string;
+  /** Also shown in the agent's own output, so the user can match the two. Absent from older servers. */
+  code?: string;
 }
 
 interface SessionView {
@@ -113,6 +115,8 @@ interface Status {
     askedAt: number;
   } | null;
   pairRequest: { port: number; wasPaired?: boolean; agent: AgentInfo } | null;
+  /** Every agent waiting to pair, oldest first. Older backgrounds send only `pairRequest`. */
+  pairRequests?: { port: number; wasPaired?: boolean; agent: AgentInfo }[];
   pairBlocked: { name: string; port: number; at: number } | null;
   /** True while a newly started agent would be offered to the user. */
   pairWindowOpen: boolean;
@@ -252,7 +256,7 @@ export default function App() {
       s.detail &&
       // Ordinary probe churn, not something the user needs to see: a dead port,
       // or a non-onbridge service answering on one of the ports we scan.
-      !/^(closed|disconnected|socket error|no onbridge server on this port|handshake timed out)$/i.test(
+      !/^(closed|disconnected|socket error|no onbridge server on this port|handshake timed out|paired in another browser)$/i.test(
         s.detail,
       ),
   );
@@ -269,7 +273,9 @@ export default function App() {
    * entry so the sweep can reconnect later, and a single agent on one port
    * used to read as "10 agents found".
    */
-  const crowded = status.sessions.filter((s) => s.status !== 'failed').length >= 3;
+  const pairRequests = status.pairRequests ?? (status.pairRequest ? [status.pairRequest] : []);
+  const liveAgents = status.sessions.filter((s) => s.status !== 'failed').length;
+  const crowded = liveAgents >= 3;
 
   const conn = owner
     ? { color: 'bg-emerald-400', label: owner.agent?.name ?? 'Connected' }
@@ -301,14 +307,19 @@ export default function App() {
           </div>
         )}
 
-        {/* ── Pairing request ── */}
-        {status.pairRequest && (
-          <div className="m-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
+        {/* ── Pairing requests: every agent asking to connect, each answered on its own ── */}
+        {pairRequests.length > 1 && (
+          <p className="mx-3 mt-3 text-xs text-amber-200">
+            {pairRequests.length} agents want to connect. Allow the ones you started; the rest can be denied.
+          </p>
+        )}
+        {pairRequests.map((req) => (
+          <div key={req.port} className="m-3 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
             <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-amber-300">
               Pairing request
             </div>
-            <AgentCard agent={status.pairRequest.agent} port={status.pairRequest.port} />
-            {status.pairRequest.wasPaired && (
+            <AgentCard agent={req.agent} port={req.port} />
+            {req.wasPaired && (
               <div className="mt-2 rounded-md border border-red-500/50 bg-red-500/10 p-2">
                 <div className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-red-300">
                   <AlertIcon className="h-3.5 w-3.5" /> This agent was paired before
@@ -323,25 +334,35 @@ export default function App() {
               </div>
             )}
             <p className="mb-3 mt-2 text-xs text-neutral-400">
-              Approve this once and it connects silently from then on. Check the project path
-              above matches the session you just started.
+              {req.agent.code
+                ? `Check the code ${req.agent.code} matches the one your agent shows. `
+                : 'Check the project path above matches the session you just started. '}
+              Allowing also gives it {SCOPE_OPTIONS.find((o) => o.value === status.preferredScope)?.desc.toLowerCase()} (Grant on approval). This browser trusts it from then on.
             </p>
             <div className="flex gap-2">
               <button
-                onClick={() => act({ type: 'resolve_pairing', allow: true })}
+                onClick={() =>
+                  act({
+                    type: 'resolve_pairing',
+                    allow: true,
+                    port: req.port,
+                    windowId: windowIdRef.current,
+                    scope: status.preferredScope,
+                  })
+                }
                 className="flex-1 rounded-md bg-emerald-500 py-2 font-medium text-neutral-900 transition-colors hover:bg-emerald-400"
               >
-                Allow
+                Allow and give control
               </button>
               <button
-                onClick={() => act({ type: 'resolve_pairing', allow: false })}
+                onClick={() => act({ type: 'resolve_pairing', allow: false, port: req.port })}
                 className="flex-1 rounded-md border border-neutral-700 bg-neutral-800 py-2 transition-colors hover:bg-neutral-700"
               >
                 Deny
               </button>
             </div>
           </div>
-        )}
+        ))}
 
         {/* ── Pairing refused because the window had lapsed ── */}
         {!status.pairRequest && status.pairBlocked && (
@@ -401,12 +422,11 @@ export default function App() {
         {crowded && (
           <div className="mx-3 mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2.5 text-xs text-amber-200">
             <div className="mb-1 flex items-center gap-1.5 font-medium">
-              <AlertIcon className="h-3.5 w-3.5 shrink-0" /> {status.sessions.length} agents found
+              <AlertIcon className="h-3.5 w-3.5 shrink-0" /> {liveAgents} agents found
             </div>
             <p className="text-neutral-400">
-              That usually means onbridge is installed at user scope, so every editor session
-              starts its own server. Ten ports are scanned; past that, new agents cannot connect
-              at all. Move it to the projects that need it if this was not deliberate.
+              The browser holds at most ten. Each agent keeps its slot until its session ends,
+              so close the sessions you have finished with, or new agents cannot connect.
             </p>
           </div>
         )}
@@ -838,6 +858,14 @@ function AgentCard({ agent, port }: { agent: AgentInfo | null; port: number }) {
         <AgentIcon className="h-4 w-4 shrink-0 text-emerald-400" />
         <span className="truncate font-medium text-neutral-100">{agent.name}</span>
         {agent.version && <span className="shrink-0 text-[10px] text-neutral-500">{agent.version}</span>}
+        {agent.code && (
+          <span
+            title="This agent shows the same code in its own output. Match them to know which session this is."
+            className="ml-auto shrink-0 rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 font-mono text-[11px] tracking-wider text-emerald-300"
+          >
+            {agent.code}
+          </span>
+        )}
         {/* A name the client reported is worth more than one we inferred. */}
         {agent.source !== 'mcp' && (
           <span

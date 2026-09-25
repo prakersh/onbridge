@@ -102,10 +102,24 @@ export interface AgentIdentity {
   port: number;
   serverVersion: string;
   startedAt: number;
+  /**
+   * A short code this agent session also shows in its own tool results, so the user can match the request in the panel with the session on their screen, even two sessions in the same project. Random per server process; identifies, does not authenticate. Absent from servers older than it.
+   */
+  code?: string;
 }
 
 export type HandshakeFrame =
-  | { t: 'hello'; v: number; extId: string; ePub: string; eNonce: string }
+  | {
+      t: 'hello';
+      v: number;
+      extId: string;
+      ePub: string;
+      eNonce: string;
+      /**
+       * A random id for this browser profile's copy of the extension, created once. Every copy of the store extension shares one `extId`, so without it a second profile pairing with the same agent overwrote the first profile's pairing, and each browser could only be connected to an agent on its own. Identifies, does not authenticate: the pairing secret still does that. Absent from older extensions, which the server treats as one shared install.
+       */
+      installId?: string;
+    }
   | { t: 'hello_ack'; sPub: string; sNonce: string; serverId: string; paired: boolean }
   | { t: 'pair_required'; agent: AgentIdentity }
   | { t: 'pair_confirm'; proof: string }

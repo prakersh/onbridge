@@ -27,7 +27,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       }),
     },
     async ({ url, snapshot, compact, depth }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('navigate', {
           url,
@@ -49,7 +49,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       inputSchema: z.object({}),
     },
     async () => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('back')) as { url: string; title: string };
         return pageText(bridge, `${data.title}\n${data.url}`, 'Navigated back. Page-reported title and URL:');
@@ -66,7 +66,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       inputSchema: z.object({}),
     },
     async () => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('forward')) as { url: string; title: string };
         return pageText(bridge, `${data.title}\n${data.url}`, 'Navigated forward. Page-reported title and URL:');
@@ -85,7 +85,7 @@ export function registerNavigationTools(server: McpServer, bridge: Bridge): void
       }),
     },
     async ({ hard }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('reload', { hard })) as { url: string; title: string };
         return pageText(bridge, `${data.title}\n${data.url}`, 'Reloaded. Page-reported title and URL:');

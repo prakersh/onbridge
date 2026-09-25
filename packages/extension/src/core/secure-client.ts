@@ -41,6 +41,22 @@ import type {
 } from '@onbridge/shared';
 
 const PAIRINGS_KEY = 'onbridge_pairings';
+const INSTALL_ID_KEY = 'onbridge_install_id';
+
+let installId: Promise<string> | undefined;
+
+/**
+ * This profile's install id, created on first use and kept. Sent in `hello` so an agent's server keeps one pairing and one connection per browser profile. Not a secret. Memoised so the parallel probes of a first sweep cannot each mint a different one.
+ */
+export function getInstallId(): Promise<string> {
+  return (installId ??= (async () => {
+    const stored = (await chrome.storage.local.get(INSTALL_ID_KEY))[INSTALL_ID_KEY];
+    if (typeof stored === 'string' && /^[a-f0-9]{32}$/.test(stored)) return stored;
+    const fresh = Array.from(randomBytes(16), (b) => b.toString(16).padStart(2, '0')).join('');
+    await chrome.storage.local.set({ [INSTALL_ID_KEY]: fresh });
+    return fresh;
+  })());
+}
 
 /**
  * How long we wait for a port to prove it is an onbridge server, i.e. to answer
@@ -320,6 +336,7 @@ export class SecureClient {
       extId: chrome.runtime.id,
       ePub: this.ePub,
       eNonce: this.eNonce,
+      installId: await getInstallId(),
     };
     ws.send(JSON.stringify(hello));
   }

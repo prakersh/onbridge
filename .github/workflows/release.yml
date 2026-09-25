@@ -189,7 +189,7 @@ jobs:
           chmod +x app.sh
           ./app.sh --package
 
-      # Exercises exactly what install.sh does to the published tarball. A
+      # Installs the published tarball the way someone installing from a Release would. A
       # `workspace:*` entry left in the shipped manifest made `npm install` fail
       # with EUNSUPPORTEDPROTOCOL, which no other check caught because the
       # in-repo build and the npx path both work fine.

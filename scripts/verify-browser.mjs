@@ -8,13 +8,15 @@
 import { chromium } from 'playwright-core';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const EXT = join(ROOT, 'packages/extension/.output/chrome-mv3');
+// Tests run on their own port range, in both directions: the servers listen there (ONBRIDGE_PORT_BASE) and the test browser scans only there (onbridge_port_base in its storage). Otherwise a test browser, which has the published extension id, reaches the user's real agents, and the user's browser reaches the test's.
+const TEST_PORT_BASE = 19876;
 
 /**
  * Served same-origin at /frame and cross-origin from a second port. A
@@ -154,7 +156,8 @@ async function main() {
   const home = mkdtempSync(join(tmpdir(), 'onbridge-browser-'));
   const srv = spawn('node', [join(ROOT, 'packages/mcp-server/dist/index.js')], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, ONBRIDGE_HOME: home, ONBRIDGE_AGENT_NAME: 'Verify Bot' },
+    // Paired through the panel before any tool is called, so listen at startup rather than on first use.
+    env: { ...process.env, ONBRIDGE_HOME: home, ONBRIDGE_AGENT_NAME: 'Verify Bot', ONBRIDGE_CONNECT: 'startup', ONBRIDGE_PORT_BASE: String(TEST_PORT_BASE) },
   });
   srv.stderr.on('data', (d) => process.env.V && process.stderr.write(`[srv] ${d}`));
 
@@ -188,12 +191,11 @@ async function main() {
     args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`],
   });
 
-  // MV3 service workers are lazy, so there may be no 'serviceworker' event yet.
-  // For an unpacked extension Chrome derives the id from the absolute path:
-  // sha256(path), first 16 bytes, each nibble mapped onto a-p.
+  // MV3 service workers are lazy, so there may be no 'serviceworker' event yet; compute the id Chrome assigns instead. With `key` in the manifest (the Web Store item's public key) the id comes from that key, so the build shares the published id; without it, from the absolute path. Either way: sha256, first 16 bytes, each nibble mapped onto a-p. Deriving it from the path alone broke this suite the moment `key` landed.
   const { createHash } = await import('node:crypto');
+  const { key } = JSON.parse(readFileSync(join(EXT, 'manifest.json'), 'utf8'));
   const extId = createHash('sha256')
-    .update(EXT)
+    .update(key ? Buffer.from(key, 'base64') : EXT)
     .digest('hex')
     .slice(0, 32)
     .split('')
@@ -210,6 +212,7 @@ async function main() {
   await panel.goto(`chrome-extension://${extId}/sidepanel.html`);
   const send = (msg) => panel.evaluate((m) => new Promise((r) => chrome.runtime.sendMessage(m, r)), msg);
 
+  await panel.evaluate((base) => chrome.storage.local.set({ onbridge_port_base: base }), TEST_PORT_BASE);
   await send({ type: 'set_scope', scope: 'all' });
   await send({ type: 'set_control_mode', enabled: true });
 
@@ -820,7 +823,7 @@ async function main() {
     }
     srv2 = spawn('node', [join(ROOT, 'packages/mcp-server/dist/index.js')], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ONBRIDGE_HOME: home2, ONBRIDGE_AGENT_NAME: 'Second Agent' },
+      env: { ...process.env, ONBRIDGE_HOME: home2, ONBRIDGE_AGENT_NAME: 'Second Agent', ONBRIDGE_CONNECT: 'startup', ONBRIDGE_PORT_BASE: String(TEST_PORT_BASE) },
     });
     srv2.stderr.on('data', (d) => process.env.V && process.stderr.write(`[srv2] ${d}`));
     let buf2 = '';

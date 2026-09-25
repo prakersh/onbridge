@@ -11,7 +11,7 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
       inputSchema: z.object({}),
     },
     async () => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('list_tabs')) as Array<{
           id: number;
@@ -38,7 +38,7 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ tabId }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('switch_tab', { tabId })) as { url: string; title: string };
         return pageText(bridge, `${data.title}\n${data.url}`, 'Switched tab. Page-reported title and URL:');
@@ -57,7 +57,7 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ url }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('new_tab', { url })) as { tabId: number; url: string; title: string };
         return pageText(bridge, `${data.title}\n${data.url}`, `Opened tab [${data.tabId}]. Page-reported title and URL:`);
@@ -76,7 +76,7 @@ export function registerTabTools(server: McpServer, bridge: Bridge): void {
       }),
     },
     async ({ tabId }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         await bridge.sendCommand('close_tab', { tabId });
         return text(bridge, 'Tab closed.');

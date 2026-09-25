@@ -1,5 +1,6 @@
 import { defineConfig } from 'wxt';
 import tailwindcss from '@tailwindcss/vite';
+import { TOOLBAR_ICON } from './src/core/toolbar-icon';
 
 export default defineConfig({
   srcDir: 'src',
@@ -34,7 +35,8 @@ export default defineConfig({
     // Declared with no default_popup on purpose: the toolbar icon must open the
     // side panel in one click. The key itself is still required — without it
     // there is no toolbar button and chrome.action.setBadgeText does nothing.
-    action: {},
+    // The toolbar starts grey: Control Mode is off until the background restores it and switches the icon.
+    action: { default_icon: TOOLBAR_ICON.idle },
   },
   vite: () => ({
     plugins: [tailwindcss()],

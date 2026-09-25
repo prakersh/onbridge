@@ -9,7 +9,7 @@
     "lint": "eslint packages/*/src",
     "typecheck": "pnpm -r run typecheck",
     "test": "vitest run",
-    "test:browser": "node scripts/verify-browser.mjs"
+    "test:browser": "node scripts/verify-browser.mjs && node scripts/verify-multi-browser.mjs"
   },
   "engines": {
     "node": ">=20.0.0"
