@@ -138,19 +138,30 @@ async function upload(token, env) {
   log(`uploading ${zip} (${(statSync(zip).size / 1024).toFixed(0)} KB)`);
 
   const res = await api(token, 'POST', `/upload/v2/${itemName(env)}:upload`, readFileSync(zip), 'application/zip');
-  log(`upload accepted: state=${res.uploadState ?? '?'} version=${res.crxVersion ?? 'pending'}`);
+  // UploadState is SUCCEEDED, IN_PROGRESS, FAILED, NOT_FOUND or
+  // UPLOAD_STATE_UNSPECIFIED. A small package is validated inline and the
+  // answer is final here; only IN_PROGRESS needs a wait.
+  const state = res.uploadState ?? 'UPLOAD_STATE_UNSPECIFIED';
+  if (state === 'SUCCEEDED') {
+    log(`upload complete: version ${res.crxVersion ?? '?'}`);
+    return;
+  }
+  if (state !== 'IN_PROGRESS') {
+    fail(`upload ${state}: ${JSON.stringify(res).slice(0, 800)}`);
+  }
+  log(`upload accepted, store still processing version ${res.crxVersion ?? '?'}`);
 
-  // Large packages are processed asynchronously; wait until the store has
-  // finished validating before publishing, or publish will reject it.
+  // fetchStatus reports lastAsyncUploadState only for an upload the store
+  // processed asynchronously, which is exactly this case.
   for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 5000));
     const s = await fetchStatus(token, env);
-    const state = s.lastAsyncUploadState ?? 'UNKNOWN';
-    if (state !== 'UPLOAD_IN_PROGRESS' && state !== 'UPLOAD_STATE_UNSPECIFIED') {
-      if (/FAIL|ERROR/i.test(state)) fail(`upload ended in state ${state}`);
-      log(`upload complete: ${state}`);
+    const now = s.lastAsyncUploadState ?? 'IN_PROGRESS';
+    if (now === 'SUCCEEDED') {
+      log('upload complete');
       return;
     }
-    await new Promise((r) => setTimeout(r, 5000));
+    if (now === 'FAILED' || now === 'NOT_FOUND') fail(`upload ended in state ${now}; check the dashboard`);
   }
   fail('upload still in progress after five minutes; check the dashboard');
 }
