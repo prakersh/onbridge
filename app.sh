@@ -11,6 +11,8 @@
 #   ./app.sh --version        Print current version
 #   ./app.sh --bump <part>    Bump version (major|minor|patch)
 #   ./app.sh --package        Package artifacts for distribution
+#   ./app.sh --release [part] Bump, verify, package, tag, push, publish to the Web Store
+#   ./app.sh --store <cmd>    Web Store: auth | status | upload | publish | release
 #   ./app.sh --help           Show this help message
 #
 # Copyright (C) 2025 OnBridge contributors
@@ -200,9 +202,10 @@ cmd_package() {
   # Ensure build is up to date
   cmd_build
 
-  # Create artifacts directory
-  rm -rf "$ARTIFACTS_DIR"
+  # Replace only what this command produces. artifacts/store/ holds the Web
+  # Store screenshots from scripts/store-screenshots.mjs and must survive.
   mkdir -p "$ARTIFACTS_DIR"
+  rm -f "$ARTIFACTS_DIR"/*.zip "$ARTIFACTS_DIR"/*.tar.gz
 
   # ── Package MCP Server ──
   log_info "Packaging MCP server..."
@@ -249,7 +252,19 @@ cmd_package() {
 
   # Zipped from INSIDE chrome-mv3 so manifest.json sits at the archive root.
   # The Chrome Web Store rejects an upload whose manifest is nested in a folder.
-  (cd "$ext_output" && zip -qr "$ARTIFACTS_DIR/onbridge-extension-v${version}.zip" . -x '*.DS_Store')
+  # It also rejects a manifest carrying the `key` field, which the build keeps
+  # so unpacked installs share the published id; strip it from a staging copy.
+  local ext_stage
+  ext_stage="$(mktemp -d)"
+  cp -R "$ext_output"/. "$ext_stage"/
+  node -e "
+    const fs = require('fs');
+    const m = JSON.parse(fs.readFileSync('$ext_stage/manifest.json', 'utf8'));
+    delete m.key;
+    fs.writeFileSync('$ext_stage/manifest.json', JSON.stringify(m));
+  "
+  (cd "$ext_stage" && zip -qr "$ARTIFACTS_DIR/onbridge-extension-v${version}.zip" . -x '*.DS_Store')
+  rm -rf "$ext_stage"
   log_ok "Extension → artifacts/onbridge-extension-v${version}.zip (Web Store ready)"
 
   # Listing captured first: piping into `grep -q` makes grep exit on the first
@@ -270,6 +285,106 @@ cmd_package() {
   log_ok "All artifacts ready in ./artifacts/"
 }
 
+CWS_ENV_FILE="${ONBRIDGE_CWS_ENV:-$HOME/.config/onbridge/chrome-web-store.env}"
+
+# Chrome Web Store: status, upload, publish, release. Credentials live outside
+# the repo in $CWS_ENV_FILE, written once by chrome-web-store.auth.mjs.
+cmd_store() {
+  local sub="${1:-status}"
+  shift || true
+  case "$sub" in
+    auth)
+      node "$ROOT_DIR/scripts/release/chrome-web-store.auth.mjs" "$@"
+      ;;
+    status|upload|publish|release)
+      node "$ROOT_DIR/scripts/release/chrome-web-store.publish.mjs" "$sub" "$@"
+      ;;
+    *)
+      log_err "Usage: $0 --store <auth|status|upload|publish|release> [--zip <path>] [--percent <1-100>]"
+      exit 1
+      ;;
+  esac
+}
+
+# Cuts a release from this machine: bump, verify, package, commit, tag, push,
+# then upload and publish to the Chrome Web Store. The GitHub release itself is
+# created by .github/workflows/release.yml when the tag lands; that workflow
+# holds no store credentials and never talks to the store.
+cmd_release() {
+  local part="patch"
+  local run_browser_tests=1
+  local do_store=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      major|minor|patch) part="$1" ;;
+      --skip-browser-tests) run_browser_tests=0 ;;
+      --skip-store) do_store=0 ;;
+      *)
+        log_err "Usage: $0 --release [major|minor|patch] [--skip-browser-tests] [--skip-store]"
+        exit 1
+        ;;
+    esac
+    shift
+  done
+
+  check_pnpm
+  command -v git >/dev/null || { log_err "git is required"; exit 1; }
+
+  log_step "Preflight"
+  if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]]; then
+    log_err "Working tree is not clean. Commit or stash first."
+    git -C "$ROOT_DIR" status --short
+    exit 1
+  fi
+  local branch
+  branch="$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)"
+  if [[ "$branch" != "main" ]]; then
+    log_err "Releases are cut from main (currently on $branch)"
+    exit 1
+  fi
+  git -C "$ROOT_DIR" fetch origin main --quiet
+  if [[ "$(git -C "$ROOT_DIR" rev-parse HEAD)" != "$(git -C "$ROOT_DIR" rev-parse origin/main)" ]]; then
+    log_err "Local main differs from origin/main. Pull or push first."
+    exit 1
+  fi
+  if [[ "$do_store" -eq 1 && ! -f "$CWS_ENV_FILE" ]]; then
+    log_warn "No store credentials at $CWS_ENV_FILE."
+    log_warn "The tag will still be pushed; upload the zip by hand, or run: ./app.sh --store auth"
+    do_store=0
+  fi
+  log_ok "clean tree on main, in sync with origin"
+
+  cmd_bump "$part"
+  local version
+  version="$(get_version)"
+
+  log_step "Verifying v${version}"
+  pnpm typecheck
+  pnpm test
+  if [[ "$run_browser_tests" -eq 1 ]]; then
+    pnpm test:browser
+  else
+    log_warn "browser suite skipped"
+  fi
+
+  cmd_package
+
+  log_step "Committing and tagging v${version}"
+  git -C "$ROOT_DIR" add VERSION packages/mcp-server/package.json packages/extension/package.json packages/shared/package.json
+  git -C "$ROOT_DIR" commit -q -m "chore(release): v${version}"
+  git -C "$ROOT_DIR" tag "v${version}"
+  git -C "$ROOT_DIR" push origin main
+  git -C "$ROOT_DIR" push origin "v${version}"
+  log_ok "pushed; GitHub Actions is building the GitHub release for v${version}"
+
+  if [[ "$do_store" -eq 1 ]]; then
+    log_step "Chrome Web Store"
+    cmd_store release --zip "$ARTIFACTS_DIR/onbridge-extension-v${version}.zip"
+  fi
+
+  log_ok "Release v${version} done"
+}
+
 cmd_help() {
   cat <<EOF
 
@@ -287,6 +402,8 @@ ${BOLD}Commands:${NC}
   ${CYAN}--version${NC}            Print current version from VERSION file
   ${CYAN}--bump <part>${NC}        Bump version (major|minor|patch) and sync to all package.json
   ${CYAN}--package${NC}            Build + package artifacts for distribution
+  ${CYAN}--release [part]${NC}     Bump, verify, package, tag, push, publish to the Web Store
+  ${CYAN}--store <cmd>${NC}        Web Store: auth | status | upload | publish | release
   ${CYAN}--help${NC}               Show this help message
 
 ${BOLD}Examples:${NC}
@@ -294,14 +411,15 @@ ${BOLD}Examples:${NC}
   ./app.sh --bump patch           # 0.1.0 → 0.1.1
   ./app.sh --bump minor           # 0.1.0 → 0.2.0
   ./app.sh --package              # Build + create distributable artifacts
+  ./app.sh --release              # Patch release, end to end, from this machine
+  ./app.sh --release minor --skip-browser-tests
+  ./app.sh --store status         # What the store currently has
 
-${BOLD}CI/CD:${NC}
-  GitHub Actions automatically runs CI on PRs and creates releases on version tags.
-  To create a release:
-    1. ./app.sh --bump minor
-    2. git add -A && git commit -m "chore: bump version to \$(cat VERSION)"
-    3. git tag "v\$(cat VERSION)"
-    4. git push origin main --tags
+${BOLD}Releasing:${NC}
+  Everything runs from this machine. One-time setup: ./app.sh --store auth
+  stores Web Store credentials in ~/.config/onbridge/chrome-web-store.env
+  (never in the repo). GitHub Actions only builds the GitHub release from the
+  pushed tag; it holds no store credentials. See docs/CHROME_WEB_STORE.md.
 
 EOF
 }
@@ -326,6 +444,8 @@ main() {
     --version)    cmd_version ;;
     --bump)       cmd_bump "$@" ;;
     --package)    cmd_package ;;
+    --release)    cmd_release "$@" ;;
+    --store)      cmd_store "$@" ;;
     --help|-h)    cmd_help ;;
     *)
       log_err "Unknown command: $command"

@@ -6,6 +6,13 @@ export default defineConfig({
   manifest: {
     name: 'onbridge',
     description: 'Browser control for AI agents via MCP',
+    // Public key of the Chrome Web Store item minhhfibhfnjdcgiipmcbfgclmeineca.
+    // With it, an unpacked build gets the same extension id as the published
+    // one, so the MCP server's origin allowlist matches both. The store rejects
+    // packages that carry this field, so ./app.sh --package strips it from the
+    // zipped manifest.
+    key:
+      'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs6wCZvYV2hWRtEIXbYkUeqmDLF/tTt5YcI6l016etS1bppV7ne7fMkoOfAdDaDGA8ryy09D06vFHeRr3ekOWJ+rairMdt8jIokRqVJnWRM1ODbTM+u0Kbt1notmn4uAFAQBf5H2LvHu/l1gBNHH90wNBo/oqQkW0lG4Fbmpz5/GEN2aSAx6gdT7KMTSFWZ6FIdwP5+JhWfzzOZCc9fyZzM+ft6+sWqgJ1MFn9CT0NH9w2ZgXNBRT296Izn7vKzKq1M4ZD2ifdxMU/kURSZ2Lly6+XtOpLSqMixN5cShcs54KeL2p8VH4VC5UJscLBuP8QWuTqKE8vk5xR5WxafXgrQIDAQAB',
     permissions: [
       'activeTab',
       'tabs',
