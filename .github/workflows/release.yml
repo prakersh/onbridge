@@ -103,9 +103,13 @@ jobs:
           work="$(mktemp -d)"
           tarball="$(cd packages/mcp-server && npm pack --pack-destination "$work" --silent)"
           cd "$work" && npm init -y > /dev/null && npm install --silent "./$tarball"
-          node - <<'EOF'
+          # Resolved from the installed package rather than a hardcoded path, so
+          # a rename to a different scope cannot leave this pointing at a
+          # directory that no longer exists.
+          entry="$(node -p "require.resolve('@onllm-dev/onbridge-mcp')")"
+          node - "$entry" <<'EOF'
           const { spawn } = require('node:child_process');
-          const p = spawn('node', ['node_modules/onbridge-mcp/dist/index.js'], { stdio: ['pipe', 'pipe', 'inherit'] });
+          const p = spawn('node', [process.argv[2]], { stdio: ['pipe', 'pipe', 'inherit'] });
           let out = '';
           p.stdout.on('data', d => out += d);
           const send = o => p.stdin.write(JSON.stringify(o) + '\n');
