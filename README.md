@@ -47,11 +47,16 @@ Agent  ──stdio/MCP──>  MCP server
     "onbridge": {
       "command": "npx",
       "args": ["-y", "@onllm-dev/onbridge-mcp"],
+      "env": { "ONBRIDGE_EXTENSION_ID": "minhhfibhfnjdcgiipmcbfgclmeineca" },
       "type": "stdio"
     }
   }
 }
 ```
+
+The `ONBRIDGE_EXTENSION_ID` line pins the server to the published extension, so
+no other extension on the machine can pair with it. Leave it out only when
+developing against an unpacked build with a different id.
 
 The package is [`@onllm-dev/onbridge-mcp`](https://www.npmjs.com/package/@onllm-dev/onbridge-mcp).
 It installs nothing globally — `npx` fetches it on first run.

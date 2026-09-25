@@ -93,6 +93,60 @@ the corresponding fields.
 
 ---
 
+## Listing copy
+
+The store title is taken from `manifest.name`. Everything else below is pasted
+into the dashboard by hand.
+
+**Category:** Developer Tools
+
+**Language:** English
+
+**Summary** (132 characters max):
+
+> Let AI agents such as Claude Code, Codex and Cursor drive your real browser over MCP, with trusted input and approval gates.
+
+**Detailed description:**
+
+> OnBridge connects AI agents running on your own computer to the browser you
+> already use, with your sessions, your logins and your extensions, over the
+> Model Context Protocol.
+>
+> It differs from a headless automation library in three ways that matter.
+>
+> Real input. Clicks and keystrokes are dispatched through the Chrome DevTools
+> Protocol, so they arrive as genuine trusted events. Synthetic DOM events are
+> rejected by native form submission, drag-and-drop, canvas apps and most
+> modern web applications.
+>
+> A governance layer. Actions that spend money, delete things or read
+> credentials are held for your approval, and approvals fail closed. Page
+> content is fenced as untrusted so a hostile page cannot instruct the agent.
+> You choose the tab scope, restrict the agent to named domains, and can pause
+> it at any moment. Control Mode revokes itself after 30 idle minutes.
+>
+> An authenticated, encrypted channel. The extension talks only to a process on
+> your own machine over loopback. Pairing uses an ECDH key exchange, every frame
+> is AES-256-GCM encrypted, and web pages are refused by origin. Nothing is sent
+> to any server we operate, because there is none.
+>
+> Works with any MCP-capable agent: Claude Code, Codex, Cursor and others.
+>
+> Setup: install the OnBridge MCP server on your machine (see the repository),
+> open the side panel, turn on Control Mode and approve the agent once. Every
+> later session connects silently.
+>
+> Free and open source under GPL-3.0. Source, issues and documentation:
+> https://github.com/prakersh/onbridge
+
+**Screenshots** (1280x800): the side panel connected, an approval prompt, and
+the activity feed. Generated into `artifacts/store/` by
+`node scripts/store-screenshots.mjs`.
+
+**Support URL:** https://github.com/prakersh/onbridge/issues
+
+---
+
 ## Remote code
 
 **No remote code is used.** All logic ships inside the package. The extension
@@ -130,7 +184,16 @@ Privacy policy URL: `https://github.com/prakersh/onbridge/blob/main/PRIVACY.md`
 
 ---
 
-## Extension ID — do this before the first upload
+## Extension ID
+
+**Done on 2026-09-21.** The store assigned `minhhfibhfnjdcgiipmcbfgclmeineca`. Its public key is
+in `wxt.config.ts` as `manifest.key`, so unpacked builds share that id, and
+`./app.sh --package` strips the key from the store zip. The README's MCP config
+passes `ONBRIDGE_EXTENSION_ID=minhhfibhfnjdcgiipmcbfgclmeineca` to the server.
+The server source keeps no default on purpose: the test suite relies on
+trust-on-first-use with its own ids.
+
+The original order of operations, kept for the record:
 
 The Origin allowlist in the MCP server is keyed to the extension's ID, so the ID
 must be settled before release.
@@ -153,6 +216,66 @@ development but too permissive to ship.
 
 Getting this wrong in the other order means a server that rejects the very
 extension it shipped with.
+
+---
+
+## Automated releases, from this machine
+
+Everything after the first upload runs locally with one command. No store
+credential is ever stored in the repository or in GitHub. The GitHub Actions
+release workflow only builds the GitHub release from the pushed tag.
+
+### One-time setup (about ten minutes)
+
+1. In the [Google Cloud console](https://console.cloud.google.com), pick or
+   create a project and enable the **Chrome Web Store API**.
+2. Under **APIs & Services > OAuth consent screen**, choose External and add
+   your own Google account as a test user. The app can stay in Testing.
+3. Under **APIs & Services > Credentials**, create an **OAuth client ID** of
+   type **Desktop app**. Keep the client id and client secret to hand.
+4. In the [developer dashboard](https://chrome.google.com/webstore/devconsole),
+   copy the **publisher id** from the Account page.
+5. Run the consent flow. It opens a browser tab, receives the redirect on a
+   loopback port, and writes `~/.config/onbridge/chrome-web-store.env` with
+   mode 0600:
+
+   ```bash
+   ./app.sh --store auth
+   ```
+
+6. Do the first upload by hand in the dashboard (see the extension ID section
+   below), then record the id the store assigned:
+
+   ```bash
+   ./app.sh --store auth --extension-id <id>
+   ./app.sh --store status      # verifies the credentials against the item
+   ```
+
+### Every release after that
+
+```bash
+./app.sh --release              # patch
+./app.sh --release minor        # or major
+```
+
+This refuses to run unless the tree is clean, on `main`, and in sync with
+`origin/main`. It then bumps the version, runs typecheck, unit tests and the
+browser suite, packages, commits, tags, pushes, uploads the zip to the store
+and publishes it. Flags: `--skip-browser-tests`, `--skip-store`.
+
+The store still reviews every version. Check where it stands with:
+
+```bash
+./app.sh --store status
+```
+
+Partial rollout is available with `./app.sh --store publish --percent 10`.
+
+### What the API cannot do
+
+The listing text, screenshots, privacy disclosures and permission
+justifications are dashboard-only, and so is creating a brand-new item. Those
+are done once; every version after that is the command above.
 
 ---
 
