@@ -18,6 +18,7 @@ import { serializeSnapshot } from '@onbridge/shared';
 import type { ActionResult } from '@onbridge/shared';
 import { errorRetry, isTrustedError, notConnectedText } from '../bridge.js';
 import type { Bridge } from '../bridge.js';
+import { diffLines, renderDiff } from './page-diff.js';
 
 type Content = { type: 'text'; text: string };
 
@@ -240,6 +241,21 @@ export function actionReply(bridge: Bridge, result: ActionResult, verb: string) 
   }
 
   const body: string[] = [];
+  let page: string | undefined;
+  if (result.snapshot) {
+    page = serializeSnapshot(result.snapshot);
+    const delta = result.navigated ? null : changesSinceView(bridge, result.url || result.snapshot.url, page);
+    if (delta) {
+      page = delta.body;
+      notes.push(
+        delta.body
+          ? `Only what changed since page view ${delta.id} is below: '+' added, '-' removed, unmarked lines show where, '…' skips unchanged ones. The rest of page view ${delta.id} still stands, refs included; snapshot returns the whole page.`
+          : `The page text is identical to page view ${delta.id}.`,
+      );
+    } else {
+      notes.push(`This is page view ${recordView(bridge, result.url || result.snapshot.url, page)}.`);
+    }
+  }
   // Every field is optional here on purpose. An older extension, or one that
   // failed partway, returns a shape this code has never seen — and the failure
   // mode being fixed is precisely a tool that assumed a field was present and
@@ -247,10 +263,35 @@ export function actionReply(bridge: Bridge, result: ActionResult, verb: string) 
   if (result.url) body.push(`[url] ${result.url}`);
   if (result.title) body.push(`[title] ${result.title}`);
   if (result.from) body.push(`[from] ${result.from}`);
-  if (result.snapshot) body.push('', serializeSnapshot(result.snapshot));
+  if (page) body.push('', page);
   if (body.length === 0) body.push('(the browser reported no page state for this action)');
 
   return pageText(bridge, body.join('\n'), notes.join(' '));
+}
+
+/**
+ * The last whole page this agent was shown. A change-only reply is always relative to it, never to another change-only reply, so an agent needs one whole page and the latest reply rather than a chain of them. Correct whatever happened in between (another tab, a reload): the view plus the changes is exactly the page's current text.
+ */
+const pageViews = new WeakMap<Bridge, { next: number; last?: { id: number; url: string; lines: string[] } }>();
+
+/** Remembers a whole page sent to the agent, and returns the number it is referred to by. */
+export function recordView(bridge: Bridge, url: string, page: string): number {
+  const views = pageViews.get(bridge) ?? { next: 1 };
+  const id = views.next++;
+  views.last = { id, url, lines: page.split('\n') };
+  pageViews.set(bridge, views);
+  return id;
+}
+
+/** The changes since the last whole page, when the page is the same one and the changes are clearly smaller than it. */
+function changesSinceView(bridge: Bridge, url: string, page: string): { id: number; body: string } | null {
+  const last = pageViews.get(bridge)?.last;
+  if (!last || last.url !== url) return null;
+  const lines = page.split('\n');
+  const ops = diffLines(last.lines, lines, Math.floor(lines.length / 2));
+  if (!ops) return null;
+  const body = renderDiff(ops);
+  return body.length > page.length / 2 ? null : { id: last.id, body };
 }
 
 /**

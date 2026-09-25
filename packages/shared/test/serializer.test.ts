@@ -44,6 +44,32 @@ describe('serializeSnapshot', () => {
     expect(() => serializeSnapshot(snapshot({ tree: 'nope' as never }))).not.toThrow();
   });
 
+  it('drops separator glyphs and folds bare wrappers, and nothing else', () => {
+    const out = serializeSnapshot(
+      snapshot({
+        tree: [
+          {
+            role: 'list',
+            children: [
+              { role: 'listitem', children: [{ role: 'link', ref: 1, name: 'home' }] },
+              { role: 'listitem', children: [{ role: 'text', name: '-' }, { role: 'link', ref: 2, name: 'popular' }] },
+            ],
+          },
+          { role: 'group', children: [{ role: 'group', children: [{ role: 'button', ref: 3, name: 'Post' }] }] },
+          { role: 'group', children: [{ role: 'text', name: 'a' }, { role: 'text', name: 'b' }] },
+          { role: 'text', name: 'Price - $5' },
+        ],
+      }),
+    );
+    expect(out).not.toContain('"-"');
+    expect(out).toContain('\n  [button:3] "Post"');
+    // A list item with one child keeps its line; a group with two children keeps its grouping.
+    expect(out.match(/\[listitem\]/g)).toHaveLength(2);
+    expect(out).toContain('\n  [group]\n    [text] "a"\n    [text] "b"');
+    expect(out).toContain('[text] "Price - $5"');
+    for (const ref of [1, 2, 3]) expect(out).toContain(`:${ref}]`);
+  });
+
   it('does not throw when scroll state is missing', () => {
     expect(() => serializeSnapshot(snapshot({ scroll: undefined as never }))).not.toThrow();
   });

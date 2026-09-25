@@ -347,3 +347,91 @@ describe('submitting a form', () => {
     expect(out).not.toMatch(/navigated/i);
   });
 });
+
+describe('a second action on the same page', () => {
+  // A page big enough that a small change is clearly cheaper than the whole page.
+  const feed = (url: string, replyOpen: boolean) => ({
+    url,
+    title: 'Feed',
+    tree: [
+      { role: 'navigation', children: Array.from({ length: 30 }, (_, i) => ({ role: 'link', ref: 100 + i, name: `sub ${i}` })) },
+      {
+        role: 'main',
+        children: [
+          { role: 'button', ref: 7, name: 'Reply', ...(replyOpen ? { expanded: true } : {}) },
+          ...(replyOpen ? [{ role: 'textbox', ref: 8, name: 'Your reply' }] : []),
+        ],
+      },
+    ],
+    scroll: { percent: 0, pagesAbove: 0, pagesBelow: 0 },
+    refCount: 32,
+  });
+  const clickOn = (url: string, replyOpen: boolean, navigated = false) =>
+    session.onCommand(() => ({ ok: true, action: 'click', navigated, domChanged: true, url, title: 'Feed', snapshot: feed(url, replyOpen) }));
+
+  it('returns only what changed, named against the whole page it was sent before', async () => {
+    const url = 'https://forum.test/t/1';
+    clickOn(url, false, true);
+    const first = textOf(await call('click', { ref: 1 }));
+    const view = first.match(/This is page view (\d+)\./)?.[1];
+    expect(view).toBeTruthy();
+    expect(first).toContain('"sub 29"');
+
+    clickOn(url, true);
+    const second = textOf(await call('click', { ref: 7 }));
+    expect(second).toContain(`since page view ${view}`);
+    expect(second).toContain('+    [textbox:8] "Your reply"');
+    expect(second).toContain('-    [button:7] "Reply"');
+    expect(second).toContain('+    [button:7] "Reply" expanded=true');
+    // Unchanged lines stay out; the ancestors that place the change stay in.
+    expect(second).not.toContain('"sub 29"');
+    expect(second).toContain('\n   [main]');
+    expect(second).toContain('[url] https://forum.test/t/1');
+
+    // Still relative to the whole page, not to the change-only reply.
+    clickOn(url, true);
+    expect(textOf(await call('click', { ref: 7 }))).toContain(`since page view ${view}`);
+  });
+
+  it('sends the whole page after navigating, even back to the same address', async () => {
+    const url = 'https://forum.test/t/2';
+    clickOn(url, false, true);
+    await call('click', { ref: 1 });
+    clickOn(url, true, true);
+    const out = textOf(await call('click', { ref: 1 }));
+    expect(out).toMatch(/This is page view \d+\./);
+    expect(out).toContain('"sub 29"');
+  });
+});
+
+describe('extract_text on long text', () => {
+  const body = Array.from({ length: 50 }, (_, i) => `line ${String(i).padStart(2, '0')} ${'x'.repeat(40)}`).join('\n');
+  // Behaves like the extension: reads from the start, stops at maxChars, reports the full length.
+  const extension = () =>
+    session.onCommand((_action, params) => ({ text: body.slice(0, params.maxChars), truncated: body.length > params.maxChars, chars: body.length }));
+
+  it('says where it stopped, outside the page content, and continues from the offset it names', async () => {
+    extension();
+    const first = textOf(await call('extract_text', { maxChars: 500 }));
+    const next = Number(first.match(/call extract_text with offset: (\d+)/)?.[1]);
+    expect(next).toBeGreaterThan(0);
+    expect(first.indexOf('The text continues')).toBeLessThan(first.indexOf('<untrusted-page-content'));
+    // It ends on a line break, and the next part starts exactly where this one ended.
+    expect(body.slice(next)).toMatch(/^line \d\d /);
+
+    let read = first;
+    let offset = next;
+    while (offset) {
+      const part = textOf(await call('extract_text', { maxChars: 500, offset }));
+      read += part;
+      offset = Number(part.match(/offset: (\d+)/)?.[1] ?? 0);
+    }
+    for (let i = 0; i < 50; i++) expect(read).toContain(`line ${String(i).padStart(2, '0')} `);
+    expect(read).toMatch(/This is the end of the text\./);
+  });
+
+  it('says so when the offset is past the end', async () => {
+    extension();
+    expect(textOf(await call('extract_text', { offset: 999_999 }))).toMatch(/past its end/);
+  });
+});
