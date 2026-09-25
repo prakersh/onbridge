@@ -50,3 +50,8 @@ RESEARCH-*.md
 # investigation, not part of the project. Describe what a capture showed in the
 # bug log instead.
 docs/evidence/
+
+# Local release credentials are never kept in the repo (they live in ~/.config/onbridge/),
+# but ignore the pattern anyway in case someone copies one here.
+scripts/release/*.local.env
+scripts/release/*.env
