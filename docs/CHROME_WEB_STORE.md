@@ -156,7 +156,7 @@ Getting this wrong in the other order means a server that rejects the very exten
 
 ## Automated releases, from this machine
 
-Everything after the first upload runs locally with one command. No store credential is ever stored in the repository or in GitHub. The GitHub Actions release workflow only builds the GitHub release from the pushed tag.
+The release itself runs on GitHub (below); only the store upload runs from a machine with store credentials. No store credential is ever stored in the repository or in GitHub, and the GitHub release workflow never talks to the store.
 
 ### One-time setup (about ten minutes)
 
@@ -181,10 +181,14 @@ Everything after the first upload runs locally with one command. No store creden
 
 ```bash
 ./app.sh --bump minor           # in a PR: set the next version (or: patch, major)
-./app.sh --release              # on main after merging: release exactly that version
+./app.sh --release              # after merging: start the Release workflow on GitHub
 ```
 
-`--release` never bumps or commits: it releases the version in `VERSION`, as onWatch and 4DPocket do. It refuses unless the tree is clean, on `main`, in sync with `origin/main`, the tag is new and every `package.json` matches `VERSION`. It then builds, runs typecheck, unit tests and the browser suite, packages, pushes the `v<VERSION>` tag (which builds the GitHub release and publishes the npm package), and, on a machine with store credentials, uploads the zip and publishes it. Without credentials the zip in `artifacts/` is uploaded by hand. Flags: `--skip-browser-tests`, `--skip-store`.
+The release itself runs on GitHub: `./app.sh --release` (or **Run workflow** on the Release workflow in the Actions tab) tags the `main` commit with `v<VERSION>`, builds the GitHub release with the extension zip, and publishes the npm package. Then upload that zip to the store from a machine with store credentials:
+
+```bash
+./app.sh --store release --zip onbridge-extension-v<VERSION>.zip
+```
 
 The store still reviews every version. Check where it stands with:
 

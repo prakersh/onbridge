@@ -119,12 +119,12 @@ For maintainers. The version is set in a normal PR, and a release tags what was 
 
 ```bash
 ./app.sh --bump minor           # in the PR: VERSION and every package.json (or: patch, major)
-./app.sh --release              # on main after merging: release exactly that version
+./app.sh --release              # after merging: start the Release workflow on GitHub
 ```
 
-`--release` never bumps or commits. It refuses unless the tree is clean, on `main`, in sync with `origin/main`, the `v<VERSION>` tag does not exist yet and every `package.json` matches `VERSION`. It then builds, runs typecheck, the unit tests and the browser suite, packages the artifacts into `artifacts/`, and pushes the tag. When this machine holds Chrome Web Store credentials it also uploads and publishes the extension; otherwise the zip in `artifacts/` is uploaded by hand. `--skip-browser-tests` and `--skip-store` narrow it. The store credentials live outside the repository and are set up once with `./app.sh --store auth`; [docs/CHROME_WEB_STORE.md](docs/CHROME_WEB_STORE.md) has the full procedure and the listing material.
+Releases run on GitHub, never from a local machine. `./app.sh --release` checks that the version on `main` is not released yet and that every `package.json` matches `VERSION`, then starts `.github/workflows/release.yml`; the **Run workflow** button in the Actions tab does the same. The workflow tags the `main` commit with `v<VERSION>`, builds the GitHub release with the extension zip and the server tarball, and publishes the npm package. The Chrome Web Store upload is separate: the extension zip from the release, uploaded with `./app.sh --store release --zip <zip>` on a machine with store credentials, or by hand. The store credentials live outside the repository and are set up once with `./app.sh --store auth`; [docs/CHROME_WEB_STORE.md](docs/CHROME_WEB_STORE.md) has the full procedure and the listing material.
 
-The pushed `v*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds the artifacts, attaches them to a GitHub Release, and publishes `@onllm-dev/onbridge-mcp` to npm. The npm job authenticates with GitHub OIDC through a Trusted Publisher entry on the package, so there is no stored token, and it is not a dependency of the GitHub Release: a failed publish never withholds the release or its artifacts.
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds the artifacts, attaches them to a GitHub Release, and publishes `@onllm-dev/onbridge-mcp` to npm. The npm job authenticates with GitHub OIDC through a Trusted Publisher entry on the package, so there is no stored token, and it is not a dependency of the GitHub Release: a failed publish never withholds the release or its artifacts.
 
 Other `app.sh` commands: `--build`, `--dev`, `--clean`, `--typecheck`, `--version`, `--bump <part>`, `--package`, `--store <auth|status|upload|publish|release>`. Run `./app.sh --help` for details.
 

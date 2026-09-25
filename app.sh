@@ -11,7 +11,7 @@
 #   ./app.sh --version        Print current version
 #   ./app.sh --bump <part>    Bump version (major|minor|patch)
 #   ./app.sh --package        Package artifacts for distribution
-#   ./app.sh --release        Verify, package and tag the version in VERSION, then publish
+#   ./app.sh --release        Start the GitHub release workflow for the version in VERSION
 #   ./app.sh --store <cmd>    Web Store: auth | status | upload | publish | release
 #   ./app.sh --help           Show this help message
 #
@@ -306,62 +306,30 @@ cmd_store() {
   esac
 }
 
-# Releases the version already in VERSION, the way onWatch and 4DPocket do: the
-# version is set in a normal commit or PR (./app.sh --bump), and a release only
-# tags that commit. Nothing is bumped or committed here, so running it on main
-# after a merge releases exactly what was merged. Verifies, packages, and pushes
-# the v<VERSION> tag; .github/workflows/release.yml then builds the GitHub
-# release and publishes the npm package from that tag. The Chrome Web Store
-# upload runs from here only when this machine holds store credentials.
+# Releases run on GitHub, not on this machine. This checks the version is ready
+# and starts .github/workflows/release.yml on main, which tags the commit with
+# v<VERSION> and publishes the GitHub release and the npm package. Set the
+# version first in a PR with ./app.sh --bump. The same workflow can be started
+# from the Actions tab.
 cmd_release() {
-  local run_browser_tests=1
-  local do_store=1
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --skip-browser-tests) run_browser_tests=0 ;;
-      --skip-store) do_store=0 ;;
-      major|minor|patch)
-        log_err "--release no longer bumps the version. Set it in a PR first: ./app.sh --bump $1"
-        exit 1
-        ;;
-      *)
-        log_err "Usage: $0 --release [--skip-browser-tests] [--skip-store]"
-        exit 1
-        ;;
-    esac
-    shift
-  done
+  if [[ $# -gt 0 ]]; then
+    log_err "Usage: $0 --release   (set the version first in a PR: ./app.sh --bump <major|minor|patch>)"
+    exit 1
+  fi
+  command -v gh >/dev/null || { log_err "gh (GitHub CLI) is required, or start the Release workflow from the Actions tab"; exit 1; }
 
-  check_pnpm
-  command -v git >/dev/null || { log_err "git is required"; exit 1; }
-
-  local version tag
+  local version tag pkg pkg_version
   version="$(get_version)"
   tag="v${version}"
-
-  log_step "Preflight for ${tag}"
-  if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]]; then
-    log_err "Working tree is not clean. Commit or stash first."
-    git -C "$ROOT_DIR" status --short
-    exit 1
-  fi
-  local branch
-  branch="$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)"
-  if [[ "$branch" != "main" ]]; then
-    log_err "Releases are cut from main (currently on $branch)"
-    exit 1
-  fi
   git -C "$ROOT_DIR" fetch origin main --tags --quiet
-  if [[ "$(git -C "$ROOT_DIR" rev-parse HEAD)" != "$(git -C "$ROOT_DIR" rev-parse origin/main)" ]]; then
-    log_err "Local main differs from origin/main. Pull or push first."
-    exit 1
-  fi
   if git -C "$ROOT_DIR" rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
     log_err "${tag} is already released. Bump VERSION in a PR first: ./app.sh --bump <major|minor|patch>"
     exit 1
   fi
-  # The release workflow refuses a tag whose package versions disagree with it; catch that here instead of after the push.
-  local pkg pkg_version
+  if [[ "$(git -C "$ROOT_DIR" show origin/main:VERSION | tr -d '[:space:]')" != "$version" ]]; then
+    log_err "VERSION here ($version) is not what main has. The release is cut from main; merge the version bump first."
+    exit 1
+  fi
   for pkg in packages/mcp-server packages/extension packages/shared; do
     pkg_version="$(node -p "require('$ROOT_DIR/$pkg/package.json').version")"
     if [[ "$pkg_version" != "$version" ]]; then
@@ -369,37 +337,9 @@ cmd_release() {
       exit 1
     fi
   done
-  if [[ "$do_store" -eq 1 && ! -f "$CWS_ENV_FILE" ]]; then
-    log_warn "No store credentials at $CWS_ENV_FILE."
-    log_warn "The tag will still be pushed; upload the extension zip by hand, or run: ./app.sh --store auth"
-    do_store=0
-  fi
-  log_ok "clean main, in sync with origin, ${tag} not yet released, versions agree"
 
-  log_step "Verifying ${tag}"
-  # The browser suite loads the built extension, so build before testing it.
-  cmd_build
-  pnpm typecheck
-  pnpm test
-  if [[ "$run_browser_tests" -eq 1 ]]; then
-    pnpm test:browser
-  else
-    log_warn "browser suite skipped"
-  fi
-
-  cmd_package
-
-  log_step "Tagging ${tag}"
-  git -C "$ROOT_DIR" tag "${tag}"
-  git -C "$ROOT_DIR" push origin "${tag}"
-  log_ok "pushed ${tag}; GitHub Actions is building the GitHub release and publishing the npm package"
-
-  if [[ "$do_store" -eq 1 ]]; then
-    log_step "Chrome Web Store"
-    cmd_store release --zip "$ARTIFACTS_DIR/onbridge-extension-${tag}.zip"
-  fi
-
-  log_ok "Release ${tag} done. Extension zip: artifacts/onbridge-extension-${tag}.zip"
+  gh workflow run release.yml --ref main
+  log_ok "Started the Release workflow for ${tag} on GitHub. Follow it with: gh run watch"
 }
 
 cmd_help() {
@@ -419,7 +359,7 @@ ${BOLD}Commands:${NC}
   ${CYAN}--version${NC}            Print current version from VERSION file
   ${CYAN}--bump <part>${NC}        Bump version (major|minor|patch) and sync to all package.json
   ${CYAN}--package${NC}            Build + package artifacts for distribution
-  ${CYAN}--release${NC}            Verify, package and tag the version in VERSION, then publish
+  ${CYAN}--release${NC}            Start the GitHub release workflow for the version in VERSION
   ${CYAN}--store <cmd>${NC}        Web Store: auth | status | upload | publish | release
   ${CYAN}--help${NC}               Show this help message
 
@@ -429,14 +369,15 @@ ${BOLD}Examples:${NC}
   ./app.sh --bump minor           # 0.1.0 → 0.2.0
   ./app.sh --package              # Build + create distributable artifacts
   ./app.sh --bump minor           # In a PR: set the next version
-  ./app.sh --release              # On main after merging: release exactly that version
+  ./app.sh --release              # After merging: GitHub tags and releases that version
   ./app.sh --store status         # What the store currently has
 
 ${BOLD}Releasing:${NC}
-  Everything runs from this machine. One-time setup: ./app.sh --store auth
-  stores Web Store credentials in ~/.config/onbridge/chrome-web-store.env
-  (never in the repo). GitHub Actions only builds the GitHub release from the
-  pushed tag; it holds no store credentials. See docs/CHROME_WEB_STORE.md.
+  Set the version in a PR (./app.sh --bump), merge it, then run ./app.sh --release
+  or start the Release workflow from the Actions tab. GitHub tags the commit and
+  publishes the GitHub release and the npm package. The Chrome Web Store upload is
+  separate: ./app.sh --store (credentials in ~/.config/onbridge/chrome-web-store.env,
+  never in the repo). See docs/CHROME_WEB_STORE.md.
 
 EOF
 }

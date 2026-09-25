@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*'
+  # Run from the Actions tab (or `./app.sh --release`) on main: tags the commit with v<VERSION>, then releases it.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,11 +19,36 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
+      - name: Checkout
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+
+      # A manual run releases the version in VERSION: it creates the tag here, then the jobs below release it.
+      - name: Create the tag from VERSION
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Releases are cut from main, not $GITHUB_REF"
+            exit 1
+          fi
+          TAG="v$(tr -d '[:space:]' < VERSION)"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "::error::$TAG already exists. Bump VERSION in a PR first: ./app.sh --bump <major|minor|patch>"
+            exit 1
+          fi
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "$TAG"
+
       - name: Extract version from tag
         id: version
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF#refs/tags/}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="v$(tr -d '[:space:]' < VERSION)"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
           VERSION="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
