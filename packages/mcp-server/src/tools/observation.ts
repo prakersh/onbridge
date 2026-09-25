@@ -22,7 +22,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ target, depth, compact }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('snapshot', { target, depth, compact })) as PageSnapshot;
         return pageText(bridge, serializeSnapshot(data));
@@ -46,7 +46,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ text: searchText, role, selector }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('find', { text: searchText, role, selector })) as FindResult[];
         return pageText(bridge, serializeFindResults(data));
@@ -66,7 +66,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ fullPage, quality }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('screenshot', { fullPage, quality })) as { base64: string };
         return image(bridge, data.base64);
@@ -85,7 +85,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ ref }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('get_text', { ref })) as { text: string };
         return pageText(bridge, data.text);
@@ -107,7 +107,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ ref, maxChars }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('extract_text', { ref, maxChars })) as ExtractTextResult;
 
@@ -151,7 +151,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       inputSchema: z.object({}),
     },
     async () => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('list_actions')) as {
           actions: Array<Record<string, unknown>>;
@@ -185,7 +185,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       }),
     },
     async ({ ref, durationMs }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         await bridge.sendCommand('highlight', { ref, durationMs });
         return text(bridge, `Highlighted element ${ref}.`);
@@ -202,7 +202,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       inputSchema: z.object({}),
     },
     async () => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand('get_url')) as { url: string; title: string };
         return pageText(bridge, `${data.title}\n${data.url}`, 'Page-reported title and URL:');

@@ -17,6 +17,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -78,12 +79,19 @@ function readJson<T>(path: string, fallback: T): T {
   }
 }
 
+/**
+ * Written to a private temporary file and renamed into place, which is atomic on the same filesystem. Writing in place truncates the file first, and readers do not take the store lock: another server looking up its pairing at that moment read an empty file, fell back to "no record", and could prompt for a pairing that existed. The temporary file is created 0600, so the store is never readable by others even briefly.
+ */
 function writeJsonPrivate(path: string, value: unknown): void {
   ensureDir();
-  writeFileSync(path, JSON.stringify(value, null, 2), { mode: 0o600 });
-  // `mode` on writeFileSync only applies when the file is created, so a file
-  // that already existed keeps whatever permissions it had — including
-  // world-readable ones from an older build. Re-assert them on every write.
+  const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
+    renameSync(tmp, path);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+  // A file written by an older build may carry wider permissions; the rename replaced it, but re-assert anyway.
   try {
     chmodSync(path, 0o600);
   } catch {
@@ -296,6 +304,21 @@ export function forgetPeer(extId: string, serverId: string): void {
 }
 
 /**
+ * Refiles one pairing under another key, in a single locked write. Used to move a pairing made before install ids to the install that just proved it holds the secret. One write, so no reader (and no crash) can see the record in both places or in neither. The record keeps its history: `pairedAt` is when the user approved it, not when it moved.
+ */
+export function movePeer(fromKey: string, toKey: string, serverId: string): void {
+  withStoreLock(() => {
+    const store = readStore();
+    const rec = store.peers[fromKey]?.[serverId];
+    if (!rec) return;
+    store.peers[toKey] = { ...(store.peers[toKey] ?? {}), [serverId]: rec };
+    delete store.peers[fromKey][serverId];
+    if (Object.keys(store.peers[fromKey]).length === 0) delete store.peers[fromKey];
+    writeStore(store);
+  });
+}
+
+/**
  * What the server can actually say about a pairing whose proof just failed.
  *
  * A stale local secret and a hostile takeover look identical from the browser
@@ -387,6 +410,19 @@ export async function claimPairing(
 }
 
 /**
+ * The ports this server may bind: the range the extension scans, unless `ONBRIDGE_PORT_BASE` moves it.
+ *
+ * Only the test suites set it. A server outside 9876–9885 is invisible to the extension, and for tests that is the point: they start throwaway servers pinned to a fixture extension, and a contributor's own browser used to find them, get refused, and warn about a pairing conflict that did not exist. It also stops the suites failing when the contributor's own agents already hold most of the real range. Resolved per call, like `ONBRIDGE_HOME`.
+ */
+export function serverPortRange(): readonly number[] {
+  const raw = process.env.ONBRIDGE_PORT_BASE?.trim();
+  if (!raw) return WS_PORT_RANGE;
+  const base = Number(raw);
+  if (!Number.isInteger(base) || base < 1024 || base + WS_PORT_RANGE.length - 1 > 65535) return WS_PORT_RANGE;
+  return WS_PORT_RANGE.map((_, i) => base + i);
+}
+
+/**
  * How many onbridge servers are listening on the loopback range right now.
  *
  * One user-scope MCP install silently turns "one agent" into "one agent per
@@ -395,7 +431,7 @@ export async function claimPairing(
  * shown to the user rather than left to be inferred from a port number.
  */
 export async function countListeningServers(): Promise<number> {
-  const probes = WS_PORT_RANGE.map(
+  const probes = serverPortRange().map(
     (port) =>
       new Promise<boolean>((resolve) => {
         const socket = connect({ port, host: '127.0.0.1' });
@@ -449,6 +485,7 @@ export function buildAgentIdentity(opts: {
   serverVersion: string;
   startedAt: number;
   clientInfo?: { name?: string; version?: string; title?: string };
+  code?: string;
 }): AgentIdentity {
   // An explicit override outranks everything, including what the client says
   // about itself: someone who set it has a reason, and silently ignoring it
@@ -469,7 +506,14 @@ export function buildAgentIdentity(opts: {
     port: opts.port,
     serverVersion: opts.serverVersion,
     startedAt: opts.startedAt,
+    ...(opts.code ? { code: opts.code } : {}),
   };
+}
+
+/** Four characters with nothing easily misread (no 0/O, 1/I/L), shown as-is in both the agent's output and the panel. */
+export function makeConnectionCode(): string {
+  const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+  return Array.from(randomBytes(4), (b) => alphabet[b % alphabet.length]).join('');
 }
 
 /** MCP clients report slugs like `claude-code`; the panel shows this to a human. */
@@ -491,17 +535,44 @@ function safeCwd(): string | undefined {
   }
 }
 
-/** The set of extension ids we have ever paired with. */
-export function knownExtensionIds(): string[] {
-  return Object.entries(readStore().peers)
-    .filter(([, byServer]) => Object.keys(byServer ?? {}).length > 0)
-    .map(([extId]) => extId);
+/**
+ * The peer-store key for one install of an extension: `extId#installId`.
+ *
+ * Every copy of the store extension shares one `extId`, so keying pairings by it alone let a second browser profile's pairing overwrite the first's. An extension too old to send an install id, or one sending something malformed, gets the bare `extId`, which is also where every pairing made before install ids lives.
+ */
+export function peerKey(extId: string, installId?: string): string {
+  return installId && /^[a-f0-9]{32}$/.test(installId) ? `${extId}#${installId}` : extId;
 }
 
-/** Ids configured explicitly. When present they, not trust-on-first-use, decide. */
+/** The set of extension ids we have ever paired with, whichever installs paired. */
+export function knownExtensionIds(): string[] {
+  const ids = Object.entries(readStore().peers)
+    .filter(([, byServer]) => Object.keys(byServer ?? {}).length > 0)
+    .map(([key]) => key.split('#')[0]);
+  return [...new Set(ids)];
+}
+
+/**
+ * The Chrome Web Store id of the official extension. A build from this repository shares it, because the manifest carries the store item's public key.
+ */
+export const OFFICIAL_EXTENSION_ID = 'minhhfibhfnjdcgiipmcbfgclmeineca';
+
+/**
+ * `ONBRIDGE_ALLOW_ANY_EXTENSION=1`: accept any `chrome-extension://` origin and pin the first extension to pair. For development against a build with a different id, and for the test suites, which pair fixture ids. Web pages are rejected either way.
+ */
+export function allowAnyExtension(): boolean {
+  return process.env.ONBRIDGE_ALLOW_ANY_EXTENSION?.trim() === '1';
+}
+
+/**
+ * The extension ids this server accepts: the official one unless `ONBRIDGE_EXTENSION_ID` names another, plus any in `ONBRIDGE_DEV_EXTENSION_IDS`. With a list, the list decides and trust-on-first-use is not used. Empty only in allow-any mode.
+ *
+ * The official id is the default so that a user who copies the shortest possible config is still protected: with no list, the first extension to connect is the one that gets pinned, and nothing guarantees that is ours.
+ */
 function explicitIds(): string[] {
+  if (allowAnyExtension()) return [];
   return [
-    process.env.ONBRIDGE_EXTENSION_ID?.trim(),
+    process.env.ONBRIDGE_EXTENSION_ID?.trim() || OFFICIAL_EXTENSION_ID,
     ...(process.env.ONBRIDGE_DEV_EXTENSION_IDS ?? '').split(',').map((s) => s.trim()),
   ]
     .filter((v): v is string => Boolean(v))
@@ -531,9 +602,8 @@ export function extensionIdFromOrigin(origin?: string): string | undefined {
  *     it can always produce one); pinning the first id we saw is what stops a
  *     second local process from silently enrolling itself later.
  *
- * TOFU applies only when no ids are configured explicitly. If the deployment
- * names its extension, that list is the authority and pinning would only get in
- * the way of a deliberate change.
+ * TOFU applies only in allow-any mode. Otherwise the accepted ids are the
+ * authority, and pinning would only get in the way of a deliberate change.
  */
 /**
  * Recovery guidance for a refused peer. Too long for a close reason; logged.
@@ -549,7 +619,8 @@ export function peerRefusalHelp(extId: string): string {
   return (
     `To pair "${extId}" instead, delete the whole of ${peersFile()} — not just one ` +
     'entry, since any entry left behind keeps refusing new extensions — and pair ' +
-    'again, or list it in ONBRIDGE_DEV_EXTENSION_IDS.'
+    'again. Or, instead of ONBRIDGE_ALLOW_ANY_EXTENSION, name the extensions to accept ' +
+    'in ONBRIDGE_EXTENSION_ID and ONBRIDGE_DEV_EXTENSION_IDS.'
   );
 }
 
@@ -588,33 +659,29 @@ export function checkPeerIdentity(extId: string, origin?: string): string | null
  * the transport. A page on any site can open a socket to 127.0.0.1 (WebSockets
  * are not subject to CORS), and this is what stops it.
  *
- * When specific ids are configured we match them exactly. When none are — local
- * development before the Web Store id exists — we fall back to allowing any
- * `chrome-extension://` origin and warn. That fallback still blocks every web
- * page; it only widens trust to other installed extensions, which the user
- * installed deliberately and which carry their own permissions.
+ * By default only the accepted ids get through, matched exactly: the official extension, or whatever `ONBRIDGE_EXTENSION_ID` names instead. Allow-any mode, for development, accepts any `chrome-extension://` origin and warns. It still blocks every web page; it only widens trust to other installed extensions, and trust-on-first-use then pins the first one to pair.
  */
 export function makeOriginCheck(log: (msg: string) => void): (origin?: string) => boolean {
-  const ids = [
-    // Published Chrome Web Store id. Pinned via the manifest `key` field so dev
-    // and released builds share one origin.
-    process.env.ONBRIDGE_EXTENSION_ID?.trim(),
-    ...(process.env.ONBRIDGE_DEV_EXTENSION_IDS ?? '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean),
-  ].filter((v): v is string => Boolean(v));
+  const ids = explicitIds();
 
   if (ids.length === 0) {
     log(
-      'WARNING: no ONBRIDGE_EXTENSION_ID set — accepting any chrome-extension:// origin. ' +
-        'Web pages are still rejected. Set ONBRIDGE_EXTENSION_ID before release.',
+      'WARNING: ONBRIDGE_ALLOW_ANY_EXTENSION is set — accepting any chrome-extension:// origin, and the first to pair is pinned. ' +
+        'Web pages are still rejected. For development only.',
     );
     return (origin?: string) => Boolean(origin?.startsWith('chrome-extension://'));
   }
 
-  const allowed = new Set(
-    ids.map((id) => (id.startsWith('chrome-extension://') ? id : `chrome-extension://${id}`)),
-  );
+  const allowed = new Set(ids.map((id) => `chrome-extension://${id}`));
   return (origin?: string) => Boolean(origin && allowed.has(origin));
+}
+
+/** Logged when an extension is turned away at the door, so a developer reading the MCP log learns how to let their own build in. */
+export function originRefusalHelp(origin?: string): string {
+  const id = extensionIdFromOrigin(origin);
+  if (!id) return 'Only the OnBridge extension may connect.';
+  return (
+    `Only ${explicitIds().join(', ')} may connect. If ${id} is your own build, set ` +
+    `ONBRIDGE_EXTENSION_ID=${id}, or ONBRIDGE_ALLOW_ANY_EXTENSION=1 while developing.`
+  );
 }

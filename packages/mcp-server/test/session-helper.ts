@@ -54,6 +54,13 @@ let boundPort = 0;
  */
 const pairings = new Map<string, Uint8Array>();
 
+/** Plays a browser updating to an extension that sends an install id: it keeps the pairing it made without one. */
+export function adoptPairing(installId: string): void {
+  for (const [slot, secret] of [...pairings]) {
+    if (slot.startsWith('|')) pairings.set(`${installId}${slot}`, secret);
+  }
+}
+
 /** Forgets stored pairings, so the next connection pairs from scratch. */
 export function resetPairings(): void {
   pairings.clear();
@@ -72,11 +79,14 @@ export interface Harness {
   stop(): void;
 }
 
-export function startServer(): Harness {
+/** `env` overrides the inherited environment; a key set to undefined is removed. */
+export function startServer(env: Record<string, string | undefined> = {}): Harness {
   const home = mkdtempSync(join(tmpdir(), 'onbridge-test-'));
+  const merged: Record<string, string | undefined> = { ...process.env, ONBRIDGE_HOME: home, ...env };
+  for (const k of Object.keys(merged)) if (merged[k] === undefined) delete merged[k];
   const proc = spawn('node', [SERVER], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, ONBRIDGE_HOME: home },
+    env: merged as NodeJS.ProcessEnv,
   });
 
   proc.stderr!.on('data', (d) => {
@@ -156,8 +166,21 @@ export interface Session {
 /**
  * Completes pairing and then services commands, exactly as the extension does.
  */
-export async function openSession(): Promise<Session> {
+/**
+ * `installId` plays one browser profile's copy of the extension; omitted, the peer is an extension too old to send one. Stored pairings are kept per install, as each profile keeps its own.
+ * `approve` plays the user at the pairing prompt: the pairing is confirmed when it resolves (immediately when omitted). `onSocket` hands over the socket before the handshake finishes, and `onServerMessage` sees every non-command message the server sends once connected.
+ */
+export async function openSession(
+  opts: {
+    installId?: string;
+    approve?: Promise<unknown>;
+    onSocket?: (ws: WebSocket) => void;
+    onServerMessage?: (msg: ServerMessage) => void;
+  } = {},
+): Promise<Session> {
+  const slot = (serverId: string) => `${opts.installId ?? ''}|${serverId}`;
   const ws = await connect(EXT_ORIGIN);
+  opts.onSocket?.(ws);
   const kp = await generateEphemeralKeyPair();
   const eNonce = toB64(randomBytes(16));
   let tx = 0;
@@ -187,7 +210,8 @@ export async function openSession(): Promise<Session> {
         // when re-authenticating. Deriving anew on a reconnect would fail auth,
         // because the server checks against what it saved at pairing time.
         st.derived = d.pairingSecret;
-        st.pair = pairings.get(frame.serverId) ?? d.pairingSecret;
+        st.stored = pairings.get(slot(frame.serverId));
+        st.pair = st.stored ?? d.pairingSecret;
         st.sessionId = await computeSessionId(kp.publicKeyB64, frame.sPub, eNonce, frame.sNonce);
         return;
       }
@@ -196,8 +220,9 @@ export async function openSession(): Promise<Session> {
       const inner = JSON.parse(await openFrame(st.ready ? st.sessionKey : st.hsKey, frame));
 
       if (inner.t === 'pair_required') {
+        if (opts.approve) await opts.approve;
         st.pair = st.derived; // pairing always uses the freshly derived secret
-        pairings.set(st.serverId, st.pair);
+        pairings.set(slot(st.serverId), st.pair);
         await sendSealed(st.hsKey, {
           t: 'pair_confirm',
           proof: await makeProof(st.pair, PROOF_PAIR, st.sessionId),
@@ -210,6 +235,11 @@ export async function openSession(): Promise<Session> {
       }
 
       if (inner.t === 'challenge') {
+        // Mirrors the extension: a record it holds no secret for is asked to reset, not answered with a secret that cannot match.
+        if (!st.stored) {
+          await sendSealed(st.hsKey, { t: 'pair_reset' });
+          return;
+        }
         await sendSealed(st.hsKey, {
           t: 'auth',
           proof: await makeProof(st.pair, PROOF_AUTH_EXT, st.sessionId, inner.nonce),
@@ -230,6 +260,7 @@ export async function openSession(): Promise<Session> {
 
       // Established channel: service commands like the extension does.
       const msg = inner as ServerMessage;
+      if (msg.type !== 'command') opts.onServerMessage?.(msg);
       if (msg.type === 'ping') {
         await sendSealed(st.sessionKey, { type: 'pong' });
         return;
@@ -276,6 +307,7 @@ export async function openSession(): Promise<Session> {
       extId: EXT_ID,
       ePub: kp.publicKeyB64,
       eNonce,
+      ...(opts.installId ? { installId: opts.installId } : {}),
     }),
   );
 

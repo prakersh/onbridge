@@ -37,6 +37,8 @@ const SHOP_PORT = 8941;
 const SHOP_URL = `http://${SHOP_HOST}/checkout`;
 
 const PANEL_W = 420;
+// Tests run on their own port range, in both directions: the servers listen there (ONBRIDGE_PORT_BASE) and the test browser scans only there (onbridge_port_base in its storage). Otherwise a test browser, which has the published extension id, reaches the user's real agents, and the user's browser reaches the test's.
+const TEST_PORT_BASE = 19876;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ── the demo page ─────────────────────────────────────────────────────
@@ -164,10 +166,10 @@ async function waitForVerifyToFinish() {
   throw new Error('verify-browser.mjs still running after 10 minutes; giving up');
 }
 
-/** Unpacked extension id: sha256 of the absolute path, first 16 bytes, nibbles onto a-p. */
+/** The id Chrome assigns: from the manifest's `key` (the store item's public key) when present, else from the absolute path. sha256, first 16 bytes, nibbles onto a-p. */
 const extensionId = (dir) =>
   createHash('sha256')
-    .update(dir)
+    .update(((key) => (key ? Buffer.from(key, 'base64') : dir))(JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')).key))
     .digest('hex')
     .slice(0, 32)
     .split('')
@@ -178,7 +180,8 @@ function startMcpServer(home, cwd) {
   const srv = spawn('node', [join(ROOT, 'packages/mcp-server/dist/index.js')], {
     stdio: ['pipe', 'pipe', 'pipe'],
     cwd,
-    env: { ...process.env, ONBRIDGE_HOME: home },
+    // Paired through the panel before any tool is called, so listen at startup rather than on first use.
+    env: { ...process.env, ONBRIDGE_HOME: home, ONBRIDGE_CONNECT: 'startup', ONBRIDGE_PORT_BASE: String(TEST_PORT_BASE) },
   });
   srv.stderr.on('data', (d) => process.env.V && process.stderr.write(`[srv] ${d}`));
 
@@ -383,6 +386,7 @@ async function main() {
     };
 
     // ── pairing ─────────────────────────────────────────────────────
+    await panel.evaluate((base) => chrome.storage.local.set({ onbridge_port_base: base }), TEST_PORT_BASE);
     await send({ type: 'set_scope', scope: 'window' });
     await send({ type: 'set_control_mode', enabled: true });
 

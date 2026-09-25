@@ -16,7 +16,7 @@
 import { randomBytes } from 'node:crypto';
 import { serializeSnapshot } from '@onbridge/shared';
 import type { ActionResult } from '@onbridge/shared';
-import { errorRetry, isTrustedError } from '../bridge.js';
+import { errorRetry, isTrustedError, notConnectedText } from '../bridge.js';
 import type { Bridge } from '../bridge.js';
 
 type Content = { type: 'text'; text: string };
@@ -320,12 +320,12 @@ export function error(err: unknown) {
   };
 }
 
-export function notConnected() {
+export function notConnected(bridge: Bridge) {
   return {
     content: [
       {
         type: 'text' as const,
-        text: 'Extension not connected. Enable control mode in the onbridge browser extension.',
+        text: notConnectedText(bridge.getConnectionCode()),
       },
     ],
     isError: true,

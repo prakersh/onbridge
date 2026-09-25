@@ -13,6 +13,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
+import { WS_PORT_RANGE } from '@onbridge/shared';
 import { join } from 'node:path';
 import {
   claimPairing,
@@ -23,6 +25,9 @@ import {
   pairingEvidence,
   peerRefusalHelp,
   savePeer,
+  serverPortRange,
+  makeOriginCheck,
+  OFFICIAL_EXTENSION_ID,
   touchPeer,
 } from '../src/identity.js';
 
@@ -210,3 +215,115 @@ describe('recovery guidance', () => {
     );
   });
 });
+
+describe('the port range a server binds', () => {
+  const saved = process.env.ONBRIDGE_PORT_BASE;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.ONBRIDGE_PORT_BASE;
+    else process.env.ONBRIDGE_PORT_BASE = saved;
+  });
+
+  it('is the range the extension scans when nothing moves it', () => {
+    delete process.env.ONBRIDGE_PORT_BASE;
+    expect(serverPortRange()).toEqual(WS_PORT_RANGE);
+  });
+
+  // The test suites rely on this: their servers must be unreachable from a contributor's real browser.
+  it('moves the whole range, same size, clear of the one the extension scans', () => {
+    process.env.ONBRIDGE_PORT_BASE = '19876';
+    const range = serverPortRange();
+    expect(range).toHaveLength(WS_PORT_RANGE.length);
+    expect(range[0]).toBe(19876);
+    expect(range.some((p) => WS_PORT_RANGE.includes(p))).toBe(false);
+  });
+
+  it('ignores a value that is not a usable port', () => {
+    for (const bad of ['abc', '80', '65530', '9876.5']) {
+      process.env.ONBRIDGE_PORT_BASE = bad;
+      expect(serverPortRange()).toEqual(WS_PORT_RANGE);
+    }
+  });
+
+  it('is what the test suites run with', () => {
+    expect(saved).toBe('19876');
+  });
+});
+
+describe('which extensions may connect', () => {
+  const keys = ['ONBRIDGE_ALLOW_ANY_EXTENSION', 'ONBRIDGE_EXTENSION_ID', 'ONBRIDGE_DEV_EXTENSION_IDS'] as const;
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  const official = `chrome-extension://${OFFICIAL_EXTENSION_ID}`;
+  const other = 'chrome-extension://someotherextension';
+  const logs: string[] = [];
+  const check = () => makeOriginCheck((m) => logs.push(m));
+
+  beforeEach(() => {
+    for (const k of keys) delete process.env[k];
+    logs.length = 0;
+  });
+  afterEach(() => {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  // A user who copies the shortest config must still be protected: with no list, whichever extension connects first is pinned.
+  it('accepts only the official extension when nothing is configured', () => {
+    const allowed = check();
+    expect(allowed(official)).toBe(true);
+    expect(allowed(other)).toBe(false);
+    expect(allowed('https://example.com')).toBe(false);
+    expect(checkPeerIdentity('someotherextension', other)).toBeNull(); // the id list decides, not pinning
+  });
+
+  it('accepts a different id instead when ONBRIDGE_EXTENSION_ID names one', () => {
+    process.env.ONBRIDGE_EXTENSION_ID = 'someotherextension';
+    const allowed = check();
+    expect(allowed(other)).toBe(true);
+    expect(allowed(official)).toBe(false);
+  });
+
+  it('accepts any extension, never a web page, in development mode, and says so', () => {
+    process.env.ONBRIDGE_ALLOW_ANY_EXTENSION = '1';
+    const allowed = check();
+    expect(allowed(official)).toBe(true);
+    expect(allowed(other)).toBe(true);
+    expect(allowed('https://example.com')).toBe(false);
+    expect(allowed(undefined)).toBe(false);
+    expect(logs.join('\n')).toMatch(/ONBRIDGE_ALLOW_ANY_EXTENSION/);
+  });
+
+  it('does not treat a value other than 1 as development mode', () => {
+    process.env.ONBRIDGE_ALLOW_ANY_EXTENSION = 'true';
+    expect(check()(other)).toBe(false);
+  });
+});
+
+describe('the peer store on disk', () => {
+  // Other servers read it without taking the lock. A write that truncated the file first let one of them read it empty, conclude it had no pairing, and prompt for one it had.
+  it('is never seen half-written by a reader in another process', async () => {
+    const file = join(home, 'peers.json');
+    savePeer(EXT, SRV_A, 'YQ==');
+    const reader = spawn(process.execPath, [
+      '-e',
+      `const fs = require('fs'); let bad = 0, n = 0; const end = Date.now() + 1500;
+       while (Date.now() < end) { try { JSON.parse(fs.readFileSync(${JSON.stringify(file)}, 'utf8')); n++; } catch (e) { if (e.code !== 'ENOENT') bad++; } }
+       process.stdout.write(JSON.stringify({ bad, n }));`,
+    ]);
+    let out = '';
+    reader.stdout.on('data', (d) => (out += d));
+    const done = new Promise((r) => reader.on('close', r));
+    const end = Date.now() + 1400;
+    let i = 0;
+    while (Date.now() < end) {
+      savePeer(EXT, `${SRV_A}-${i++ % 50}`, 'YQ==');
+      await new Promise((r) => setImmediate(r));
+    }
+    await done;
+    const { bad, n } = JSON.parse(out);
+    expect(n).toBeGreaterThan(100);
+    expect(bad).toBe(0);
+  });
+});
+

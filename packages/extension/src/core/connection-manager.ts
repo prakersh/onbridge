@@ -125,7 +125,37 @@ export interface ManagerHooks {
   onCommand: (session: AgentSession, msg: ServerMessage) => void;
   /** Anything the panel should redraw for. */
   onChange: () => void;
+  /** A session got its territory back on reconnect, without the user pressing anything. The server has to hear about it the same way as a fresh grant. */
+  onGranted?: (id: string) => void;
+  /** A session finished its handshake and is authenticated, held or restored. */
+  onConnected?: (session: AgentSession) => void;
   log: (msg: string) => void;
+}
+
+/**
+ * Where a test harness moves the scanned range: set from the extension's own pages, which nothing outside the extension can write to. Test servers listen elsewhere too (`ONBRIDGE_PORT_BASE`), so a test browser never reaches a user's real agents and a user's browser never reaches a test's. Test browsers share the published extension id, so without this a test profile probed every real agent on the machine.
+ */
+export const PORT_BASE_KEY = 'onbridge_port_base';
+
+async function scannedPorts(): Promise<readonly number[]> {
+  const raw: unknown = (await chrome.storage.local.get(PORT_BASE_KEY))[PORT_BASE_KEY];
+  const base = typeof raw === 'number' ? raw : NaN;
+  if (!Number.isInteger(base) || base < 1024 || base + WS_PORT_RANGE.length - 1 > 65535) return WS_PORT_RANGE;
+  return WS_PORT_RANGE.map((_, i) => base + i);
+}
+
+/**
+ * Whether anything is listening on a loopback port, found out without a WebSocket.
+ *
+ * Chrome logs every failed WebSocket connection as an error the extension cannot catch, and with most of the ten ports empty, dialling each one every sweep filled chrome://extensions with "ERR_CONNECTION_REFUSED". A failed plain request logs nothing. Any onbridge server, old or new, answers it with 426 Upgrade Required, so any response at all means it is worth dialling.
+ */
+async function somethingListens(port: number): Promise<boolean> {
+  try {
+    await fetch(`http://127.0.0.1:${port}/`, { method: 'HEAD', cache: 'no-store', signal: AbortSignal.timeout(1500) });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** How often we look for agents that started after we did. */
@@ -164,7 +194,8 @@ export class ConnectionManager {
     // so an agent started on a quiet browser is still discovered. One minute is
     // the floor Chrome enforces for alarms; the interval keeps discovery brisk
     // while the worker happens to be alive.
-    chrome.alarms?.create(SWEEP_ALARM, { periodInMinutes: 1 });
+    // 30s, the shortest period Chrome allows. It is the only sweep that runs while the worker is suspended, which is the state a browser is in when no agent is connected, and an agent's first tool call is waiting on it.
+    chrome.alarms?.create(SWEEP_ALARM, { periodInMinutes: 0.5 });
     chrome.alarms?.onAlarm.addListener(this.onAlarm);
   }
 
@@ -221,15 +252,24 @@ export class ConnectionManager {
   private async sweep(): Promise<void> {
     if (!this.running) return;
     const now = Date.now();
+    const ports = await scannedPorts();
 
     await Promise.all(
-      WS_PORT_RANGE.map(async (port) => {
+      ports.map(async (port) => {
         const existing = this.entries.get(port);
         if (existing) {
           if (existing.busy) return;
           // A live or user-visible session owns this port; leave it be.
           if (existing.session.status !== 'failed') return;
           if (now < existing.retryAfter) return;
+        }
+        if (!(await somethingListens(port))) {
+          // The agent that was here has gone; a failed entry for it is history, not state.
+          if (existing) {
+            this.entries.delete(port);
+            this.hooks.onChange();
+          }
+          return;
         }
         await this.dial(port);
       }),
@@ -279,6 +319,11 @@ export class ConnectionManager {
         // Territory is checked here, at the door. A session on hold is fully
         // authenticated but owns nothing, so it must not execute anything.
         if (session.status !== 'active' || !session.scope) {
+          // bridge_status is how an agent finds out it has no control yet, and it reads nothing from any page, so an authenticated agent may ask it before a grant.
+          if (msg.type === 'command' && msg.action === 'bridge_status' && session.status === 'on_hold') {
+            this.hooks.onCommand(session, msg);
+            return;
+          }
           if (msg.type === 'command') this.refuse(client, session, msg);
           return;
         }
@@ -306,6 +351,7 @@ export class ConnectionManager {
         session.scope = priorScope;
         session.status = 'active';
         session.detail = '';
+        this.hooks.onGranted?.(session.id);
       } else {
         session.status = 'on_hold';
         session.detail = verdict.reason;
@@ -313,6 +359,7 @@ export class ConnectionManager {
       this.hooks.log(
         `agent on :${port} ${session.status} — ${session.identity?.name ?? 'unidentified'}`,
       );
+      this.hooks.onConnected?.(session);
     } catch (err) {
       entry.busy = false;
       // Retire the dead client so a late callback cannot resurrect this entry.
@@ -320,7 +367,8 @@ export class ConnectionManager {
       // A prompt awaiting the user is now unanswerable — dismiss it.
       if (session.status === 'pending_approval') this.hooks.onPairObsolete?.(port);
       const why = (err as Error).message;
-      const denied = /pairing denied/i.test(why);
+      // Paired in another browser is the user's choice made elsewhere: treated like a denial, so this browser does not re-prompt for it; "Accept new agents" (arm_pairing) clears it.
+      const denied = /pairing denied|paired in another browser/i.test(why);
       session.status = 'failed';
       session.detail = why;
       session.failure = client.getFailure() ?? { reason: why };
@@ -330,7 +378,9 @@ export class ConnectionManager {
       // ordinary probe churn (see the refusal filter), so a lingering failed
       // entry is invisible; it exists only so the sweep can reconnect if a
       // server reappears on this port.
-      entry.retryAfter = Date.now() + (denied ? DENY_BACKOFF_MS : RETRY_BACKOFF_MS);
+      // Nothing listening is not backed off: the next sweep simply looks again. Servers now start listening on their agent's first tool call, and that call is waiting for the browser, so a port found empty moments earlier must be retried on the next sweep rather than 20s later. Probing a closed loopback port costs nothing.
+      const nothingThere = /^(no onbridge server on this port|closed|socket error)$/i.test(why);
+      entry.retryAfter = nothingThere ? 0 : Date.now() + (denied ? DENY_BACKOFF_MS : RETRY_BACKOFF_MS);
       // Nothing listening is the overwhelmingly common case across ten ports;
       // logging it every sweep would bury everything else.
       if (!/no onbridge server|closed|socket error/i.test(why)) {
@@ -367,18 +417,22 @@ export class ConnectionManager {
 
   private refuse(client: SecureClient, session: AgentSession, msg: ServerMessage): void {
     if (msg.type !== 'command') return;
+    const code = session.identity?.code;
+    const which = code ? ` on the card showing connection code ${code}` : '';
     const why =
       session.status === 'pending_approval'
-        ? 'Waiting for the user to approve this agent in the onbridge side panel.'
+        ? `Waiting for the user to approve this agent in the onbridge side panel${code ? ` (the request showing connection code ${code})` : ''}.`
         : 'This agent is connected but has not been given control of a tab or window. ' +
           'Ask the user to open the onbridge side panel in the window they want you to ' +
-          'drive and press "Give this agent control".';
+          `drive and press "Give this agent control"${which}.`;
     void client.send({
       type: 'result',
       id: msg.id,
       success: false,
       data: null,
       error: why,
+      // Composed here, not by any page: the agent is told it is onbridge speaking, instead of seeing it fenced as page text.
+      errorKind: 'trusted',
       timing: 0,
     });
   }

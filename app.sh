@@ -11,7 +11,7 @@
 #   ./app.sh --version        Print current version
 #   ./app.sh --bump <part>    Bump version (major|minor|patch)
 #   ./app.sh --package        Package artifacts for distribution
-#   ./app.sh --release [part] Bump, verify, package, tag, push, publish to the Web Store
+#   ./app.sh --release        Verify, package and tag the version in VERSION, then publish
 #   ./app.sh --store <cmd>    Web Store: auth | status | upload | publish | release
 #   ./app.sh --help           Show this help message
 #
@@ -216,7 +216,7 @@ cmd_package() {
 
   # devDependencies are stripped from the shipped manifest. They reference
   # @onbridge/shared as "workspace:*", and `npm install` inside the extracted
-  # tarball — which install.sh runs — fails with EUNSUPPORTEDPROTOCOL on that,
+  # tarball from a GitHub Release fails with EUNSUPPORTEDPROTOCOL on that,
   # even under --production. Nothing in devDependencies is needed at runtime.
   node -e "
     const fs = require('fs');
@@ -306,21 +306,26 @@ cmd_store() {
   esac
 }
 
-# Cuts a release from this machine: bump, verify, package, commit, tag, push,
-# then upload and publish to the Chrome Web Store. The GitHub release itself is
-# created by .github/workflows/release.yml when the tag lands; that workflow
-# holds no store credentials and never talks to the store.
+# Releases the version already in VERSION, the way onWatch and 4DPocket do: the
+# version is set in a normal commit or PR (./app.sh --bump), and a release only
+# tags that commit. Nothing is bumped or committed here, so running it on main
+# after a merge releases exactly what was merged. Verifies, packages, and pushes
+# the v<VERSION> tag; .github/workflows/release.yml then builds the GitHub
+# release and publishes the npm package from that tag. The Chrome Web Store
+# upload runs from here only when this machine holds store credentials.
 cmd_release() {
-  local part="patch"
   local run_browser_tests=1
   local do_store=1
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      major|minor|patch) part="$1" ;;
       --skip-browser-tests) run_browser_tests=0 ;;
       --skip-store) do_store=0 ;;
+      major|minor|patch)
+        log_err "--release no longer bumps the version. Set it in a PR first: ./app.sh --bump $1"
+        exit 1
+        ;;
       *)
-        log_err "Usage: $0 --release [major|minor|patch] [--skip-browser-tests] [--skip-store]"
+        log_err "Usage: $0 --release [--skip-browser-tests] [--skip-store]"
         exit 1
         ;;
     esac
@@ -330,7 +335,11 @@ cmd_release() {
   check_pnpm
   command -v git >/dev/null || { log_err "git is required"; exit 1; }
 
-  log_step "Preflight"
+  local version tag
+  version="$(get_version)"
+  tag="v${version}"
+
+  log_step "Preflight for ${tag}"
   if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]]; then
     log_err "Working tree is not clean. Commit or stash first."
     git -C "$ROOT_DIR" status --short
@@ -342,23 +351,34 @@ cmd_release() {
     log_err "Releases are cut from main (currently on $branch)"
     exit 1
   fi
-  git -C "$ROOT_DIR" fetch origin main --quiet
+  git -C "$ROOT_DIR" fetch origin main --tags --quiet
   if [[ "$(git -C "$ROOT_DIR" rev-parse HEAD)" != "$(git -C "$ROOT_DIR" rev-parse origin/main)" ]]; then
     log_err "Local main differs from origin/main. Pull or push first."
     exit 1
   fi
+  if git -C "$ROOT_DIR" rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+    log_err "${tag} is already released. Bump VERSION in a PR first: ./app.sh --bump <major|minor|patch>"
+    exit 1
+  fi
+  # The release workflow refuses a tag whose package versions disagree with it; catch that here instead of after the push.
+  local pkg pkg_version
+  for pkg in packages/mcp-server packages/extension packages/shared; do
+    pkg_version="$(node -p "require('$ROOT_DIR/$pkg/package.json').version")"
+    if [[ "$pkg_version" != "$version" ]]; then
+      log_err "$pkg/package.json is $pkg_version but VERSION is $version. Run ./app.sh --bump or sync them in a PR."
+      exit 1
+    fi
+  done
   if [[ "$do_store" -eq 1 && ! -f "$CWS_ENV_FILE" ]]; then
     log_warn "No store credentials at $CWS_ENV_FILE."
-    log_warn "The tag will still be pushed; upload the zip by hand, or run: ./app.sh --store auth"
+    log_warn "The tag will still be pushed; upload the extension zip by hand, or run: ./app.sh --store auth"
     do_store=0
   fi
-  log_ok "clean tree on main, in sync with origin"
+  log_ok "clean main, in sync with origin, ${tag} not yet released, versions agree"
 
-  cmd_bump "$part"
-  local version
-  version="$(get_version)"
-
-  log_step "Verifying v${version}"
+  log_step "Verifying ${tag}"
+  # The browser suite loads the built extension, so build before testing it.
+  cmd_build
   pnpm typecheck
   pnpm test
   if [[ "$run_browser_tests" -eq 1 ]]; then
@@ -369,20 +389,17 @@ cmd_release() {
 
   cmd_package
 
-  log_step "Committing and tagging v${version}"
-  git -C "$ROOT_DIR" add VERSION packages/mcp-server/package.json packages/extension/package.json packages/shared/package.json
-  git -C "$ROOT_DIR" commit -q -m "chore(release): v${version}"
-  git -C "$ROOT_DIR" tag "v${version}"
-  git -C "$ROOT_DIR" push origin main
-  git -C "$ROOT_DIR" push origin "v${version}"
-  log_ok "pushed; GitHub Actions is building the GitHub release for v${version}"
+  log_step "Tagging ${tag}"
+  git -C "$ROOT_DIR" tag "${tag}"
+  git -C "$ROOT_DIR" push origin "${tag}"
+  log_ok "pushed ${tag}; GitHub Actions is building the GitHub release and publishing the npm package"
 
   if [[ "$do_store" -eq 1 ]]; then
     log_step "Chrome Web Store"
-    cmd_store release --zip "$ARTIFACTS_DIR/onbridge-extension-v${version}.zip"
+    cmd_store release --zip "$ARTIFACTS_DIR/onbridge-extension-${tag}.zip"
   fi
 
-  log_ok "Release v${version} done"
+  log_ok "Release ${tag} done. Extension zip: artifacts/onbridge-extension-${tag}.zip"
 }
 
 cmd_help() {
@@ -402,7 +419,7 @@ ${BOLD}Commands:${NC}
   ${CYAN}--version${NC}            Print current version from VERSION file
   ${CYAN}--bump <part>${NC}        Bump version (major|minor|patch) and sync to all package.json
   ${CYAN}--package${NC}            Build + package artifacts for distribution
-  ${CYAN}--release [part]${NC}     Bump, verify, package, tag, push, publish to the Web Store
+  ${CYAN}--release${NC}            Verify, package and tag the version in VERSION, then publish
   ${CYAN}--store <cmd>${NC}        Web Store: auth | status | upload | publish | release
   ${CYAN}--help${NC}               Show this help message
 
@@ -411,8 +428,8 @@ ${BOLD}Examples:${NC}
   ./app.sh --bump patch           # 0.1.0 → 0.1.1
   ./app.sh --bump minor           # 0.1.0 → 0.2.0
   ./app.sh --package              # Build + create distributable artifacts
-  ./app.sh --release              # Patch release, end to end, from this machine
-  ./app.sh --release minor --skip-browser-tests
+  ./app.sh --bump minor           # In a PR: set the next version
+  ./app.sh --release              # On main after merging: release exactly that version
   ./app.sh --store status         # What the store currently has
 
 ${BOLD}Releasing:${NC}

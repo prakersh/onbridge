@@ -139,3 +139,45 @@ describe('prompt-injection containment', () => {
     expect(out).toContain('IGNORE PREVIOUS INSTRUCTIONS');
   });
 });
+
+// The server ships through npm far more often than the extension through the Web Store, so a newer server meeting an older extension is the normal case, not an edge case.
+describe('an older extension', () => {
+  it('is told apart from a failure: the agent hears the extension needs updating, and nothing is sent', async () => {
+    let sent = 0;
+    session.onCommand(() => {
+      sent++;
+      return {};
+    });
+    await session.emit({
+      type: 'ready',
+      version: '0.4.3',
+      controlMode: true,
+      actions: ['bridge_status', 'navigate', 'snapshot'],
+    });
+    await new Promise((r) => setTimeout(r, 100));
+
+    const res = await h.rpc('tools/call', { name: 'get_url', arguments: {} });
+    expect(textOf(res)).toMatch(/needs a newer onbridge browser extension/);
+    expect(textOf(res)).toContain('v0.4.3');
+    expect(textOf(res)).toContain('get_url');
+    expect(sent).toBe(0);
+  });
+
+  it('reports the extension version in bridge_status', async () => {
+    session.onCommand((action) => (action === 'bridge_status' ? { approvalMode: 'auto' } : {}));
+    const res = await h.rpc('tools/call', { name: 'bridge_status', arguments: {} });
+    expect(textOf(res)).toMatch(/CONNECTED .*v0\.4\.3/);
+  });
+
+  it('still sends everything to an extension too old to list its actions', async () => {
+    let seen = '';
+    session.onCommand((action) => {
+      seen = action;
+      return { url: 'https://example.com/', title: 'Example' };
+    });
+    await session.emit({ type: 'ready', version: '0.4.0', controlMode: true });
+    await new Promise((r) => setTimeout(r, 100));
+    await h.rpc('tools/call', { name: 'get_url', arguments: {} });
+    expect(seen).toBe('get_url');
+  });
+});

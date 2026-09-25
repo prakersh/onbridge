@@ -22,7 +22,7 @@ export function registerGovernanceTools(server: McpServer, bridge: Bridge): void
       }),
     },
     async ({ question, options }) => {
-      if (!bridge.isConnected()) return notConnected();
+      if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const data = (await bridge.sendCommand(
           'ask_user',
@@ -58,9 +58,10 @@ export function registerGovernanceTools(server: McpServer, bridge: Bridge): void
           [
             'Extension: NOT CONNECTED',
             `Bridge listening on: 127.0.0.1:${bridge.getPort() || '(not bound)'}`,
+            `Connection code: ${bridge.getConnectionCode()}`,
             '',
             'The user needs to enable Control Mode in the onbridge extension.',
-            'On first connection they will also be asked to approve pairing once.',
+            `On first connection they will also be asked to approve pairing once: the request shows connection code ${bridge.getConnectionCode()}.`,
           ].join('\n'),
         );
       }
@@ -78,9 +79,12 @@ export function registerGovernanceTools(server: McpServer, bridge: Bridge): void
         return text(
           bridge,
           [
-            'Extension: CONNECTED (encrypted, paired)',
+            `Extension: CONNECTED (encrypted, paired)${bridge.getExtensionVersion() ? `, v${bridge.getExtensionVersion()}` : ''}`,
             `Bridge port: 127.0.0.1:${bridge.getPort()}`,
-            `Access scope: ${data.accessScope ?? 'unknown'}`,
+            `Connection code: ${bridge.getConnectionCode()}`,
+            data.scopeKind == null
+              ? `Access scope: nothing yet. Ask the user to press "Give this agent control" on the card showing connection code ${bridge.getConnectionCode()}, in the window they want you to use.`
+              : `Access scope: ${data.accessScope ?? 'unknown'}`,
             `Approval mode: ${mode} — ${modeNote[mode] ?? ''}`,
             allowlist.length ? `Allowed sites only: ${allowlist.join(', ')}` : 'Allowed sites: any',
             denylist.length ? `Blocked sites: ${denylist.join(', ')}` : '',

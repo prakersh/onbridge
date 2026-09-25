@@ -1,4 +1,5 @@
 import { defineBackground } from 'wxt/utils/define-background';
+import { ALL_COMMAND_ACTIONS } from '@onbridge/shared';
 import type {
   ServerMessage,
   ExtensionMessage,
@@ -39,6 +40,7 @@ import {
   consoleSince,
 } from '../core/cdp.js';
 import * as trusted from '../core/trusted-input.js';
+import { toolbarIconFor } from '../core/toolbar-icon.js';
 import {
   classify,
   evaluatePolicy,
@@ -68,6 +70,8 @@ const APPROVAL_TTL_MS = 25_000;
 
 export default defineBackground(() => {
   let controlMode = false;
+  /** The toolbar icon state last handed to Chrome, so the per-command badge updates do not re-send an unchanged icon. */
+  let shownIcon: boolean | undefined;
 
   /** Set when the user flips control mode on — gates the pairing prompt. */
   let controlEnabledAt = 0;
@@ -92,16 +96,18 @@ export default defineBackground(() => {
     });
   };
   refreshSecrets();
-  let pairRequest:
-    | {
-        agent: AgentIdentity;
-        port: number;
-        resolve: (ok: boolean) => void;
-        timer: ReturnType<typeof setTimeout>;
-        /** This server forgot a pairing we still hold — see `onPairRequest`. */
-        wasPaired: boolean;
-      }
-    | null = null;
+  interface PairRequest {
+    agent: AgentIdentity;
+    port: number;
+    resolve: (ok: boolean) => void;
+    timer: ReturnType<typeof setTimeout>;
+    /** This server forgot a pairing we still hold — see `onPairRequest`. */
+    wasPaired: boolean;
+  }
+  /**
+   * Every agent currently asking to pair, oldest first, one per port. The panel lists them all and the user answers each on its own. Holding a single request, and denying it when the next arrived, meant several agents asking at once (a fresh install, or Control Mode switched on with agents already running) denied each other before anyone could answer.
+   */
+  let pairRequests: PairRequest[] = [];
 
   /** The agent is blocked on this until the user answers in the side panel. */
   let askRequest:
@@ -175,6 +181,7 @@ export default defineBackground(() => {
         controlEnabledAt = typeof result.controlEnabledAt === 'number' ? result.controlEnabledAt : 0;
         pairBlocked = (result.pairBlocked as typeof pairBlocked) ?? null;
         manager.start();
+        syncToolbarIcon();
       }
     },
   );
@@ -275,26 +282,67 @@ export default defineBackground(() => {
       updateBadge('pair');
       return Promise.resolve(false);
     }
-    if (pairRequest) pairRequest.resolve(false);
+    // A newer request from the same port replaces its own older one; other agents' requests are left waiting.
+    const previous = pairRequests.find((r) => r.port === port);
+    if (previous) {
+      clearTimeout(previous.timer);
+      pairRequests = pairRequests.filter((r) => r !== previous);
+      previous.resolve(false);
+    }
 
     return new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => {
-        if (pairRequest?.resolve === resolve) pairRequest = null;
+        pairRequests = pairRequests.filter((r) => r.resolve !== resolve);
         resolve(false);
       }, PAIR_PROMPT_TTL_MS);
 
-      pairRequest = { agent, port, resolve, timer, wasPaired: opts.wasPaired };
+      pairRequests.push({ agent, port, resolve, timer, wasPaired: opts.wasPaired });
       updateBadge('pair');
     });
   }
 
-  function resolvePairing(allow: boolean): void {
-    if (!pairRequest) return;
-    clearTimeout(pairRequest.timer);
-    const { resolve } = pairRequest;
-    pairRequest = null;
-    resolve(allow);
+  /** Answers the request from `port`, or the oldest when no port is named. */
+  function resolvePairing(allow: boolean, port?: number): void {
+    const req = port == null ? pairRequests[0] : pairRequests.find((r) => r.port === port);
+    if (!req) return;
+    clearTimeout(req.timer);
+    pairRequests = pairRequests.filter((r) => r !== req);
+    req.resolve(allow);
   }
+
+  /**
+   * Allow on a first-time pairing prompt also grants control, of the window the panel was in and at the Grant on approval reach, so first contact is one click instead of Allow and then Give this agent control. Remembered per port until that agent's handshake finishes, which is when a grant becomes possible.
+   */
+  const pendingGrants = new Map<number, { windowId: number; scope: ScopeKind }>();
+
+  function grantOnConnect(session: AgentSession): void {
+    const pending = pendingGrants.get(session.port);
+    if (!pending) return;
+    pendingGrants.delete(session.port);
+    if (session.status !== 'on_hold') return;
+    void buildScope(pending.scope, pending.windowId).then((scope) => {
+      // An overlap with another agent's grant is refused as usual; the agent then simply waits on hold.
+      if (manager.activate(session.id, scope).ok) sendReady(session.id);
+    });
+  }
+
+  function resolveAllPairing(allow: boolean): void {
+    for (const req of [...pairRequests]) resolvePairing(allow, req.port);
+  }
+
+  const pairRequestView = (r: PairRequest) => ({
+    port: r.port,
+    wasPaired: r.wasPaired,
+    agent: {
+      name: r.agent.name,
+      version: r.agent.version,
+      source: r.agent.source,
+      pid: r.agent.pid,
+      cwd: r.agent.cwd,
+      serverVersion: r.agent.serverVersion,
+      code: r.agent.code,
+    },
+  });
 
   /**
    * Tabs Chrome opened recently, so a command can be asked what it spawned.
@@ -363,14 +411,36 @@ export default defineBackground(() => {
 
   const refusal = (msg: string): TrustedError => new TrustedError(msg);
 
+  /**
+   * Tells an agent's server that this browser has given it control, on a fresh grant and on one restored after a reconnect. A server can be connected to several browsers, and it sends its commands to the one that granted control most recently.
+   */
+  function sendReady(id: string): void {
+    void manager.send(id, {
+      type: 'ready',
+      version: chrome.runtime.getManifest().version,
+      controlMode: true,
+      actions: [...ALL_COMMAND_ACTIONS],
+    });
+  }
+
+  /**
+   * A command this extension does not implement, which is what a newer MCP server sends to an older extension. Refused before policy runs, so it can never raise an approval prompt for something that cannot happen, and carried as a code so the server can tell the agent to update the extension rather than showing an opaque failure.
+   */
+  class UnsupportedActionError extends TrustedError {
+    readonly code = 'unsupported-action' as const;
+  }
+  const SUPPORTED_ACTIONS: ReadonlySet<string> = new Set(ALL_COMMAND_ACTIONS);
+
   const manager = new ConnectionManager({
     onPairRequest: requestPairing,
     onPairObsolete: (port) => {
       // The peer this prompt belongs to has gone; stop showing an Allow/Deny for
       // a dead socket. Resolving false denies, which is the safe direction.
-      if (pairRequest?.port === port) resolvePairing(false);
+      resolvePairing(false, port);
     },
     onCommand: (session, msg) => void onServerMessage(session, msg),
+    onGranted: (id) => sendReady(id),
+    onConnected: (session) => grantOnConnect(session),
     onChange: () => {
       updateBadge(manager.hasActive() ? 'on' : controlMode ? 'off' : 'disabled');
     },
@@ -380,6 +450,11 @@ export default defineBackground(() => {
   async function onServerMessage(session: AgentSession, msg: ServerMessage): Promise<void> {
     if (msg.type === 'ping') {
       await manager.send(session.id, { type: 'pong' });
+      return;
+    }
+    if (msg.type === 'control_moved') {
+      // Granted in another browser. Held here without sending `released`: the server already knows.
+      manager.hold(session.id);
       return;
     }
     if (msg.type !== 'command') return;
@@ -432,6 +507,7 @@ export default defineBackground(() => {
         // A code is a claim about provenance as much as about kind, so it only
         // ever rides on an error onbridge composed. RetryableError extends
         // TrustedError, so the two always travel together.
+        ...(err instanceof UnsupportedActionError ? { errorCode: err.code } : {}),
         ...(err instanceof RetryableError
           ? { errorCode: err.code, retryAfterMs: err.retryAfterMs }
           : {}),
@@ -453,7 +529,7 @@ export default defineBackground(() => {
   }
 
   function disconnect() {
-    resolvePairing(false);
+    resolveAllPairing(false);
     resolveAsk(null); // never leave the agent blocked on a dead channel
     manager.stop();
     // Release the debugger so Chrome drops the "onbridge is debugging this
@@ -504,7 +580,7 @@ export default defineBackground(() => {
     try {
       await chrome.notifications.create({
         type: 'basic',
-        iconUrl: chrome.runtime.getURL('icon.svg'),
+        iconUrl: chrome.runtime.getURL('icon/128.png'),
         title: 'onbridge — the agent needs you',
         message: 'Open the onbridge side panel to answer.',
         priority: 2,
@@ -519,6 +595,9 @@ export default defineBackground(() => {
     msg: ServerMessage & { type: 'command' },
   ): Promise<unknown> {
     const { action, params: rawParams } = msg;
+    if (!SUPPORTED_ACTIONS.has(action)) {
+      throw new UnsupportedActionError(`This version of the onbridge extension does not support "${action}". Update the extension to use it.`);
+    }
     let params = rawParams;
 
     // Any command is activity, including the meta ones below. Counting only
@@ -767,6 +846,12 @@ export default defineBackground(() => {
         return handleDownloadFile(params as { url?: string; ref?: number });
       case 'list_downloads':
         return handleListDownloads(params as { limit?: number });
+      case 'get_url': {
+        // From Chrome's tab list rather than the page: that works on chrome:// pages, the New Tab page and the Web Store, where Chrome forbids an extension from reading the page itself.
+        if (!tabId) throw new Error('No active tab found');
+        const tab = await chrome.tabs.get(tabId);
+        return { url: tab.url || tab.pendingUrl || '', title: tab.title ?? '' };
+      }
       case 'activity_log':
         // This session's own history only. One agent reading another's actions
         // would leak what a different project is doing into its context.
@@ -2180,7 +2265,7 @@ export default defineBackground(() => {
     const colors: Record<string, string> = {
       disabled: '#666',
       off: '#666',
-      on: '#00d4aa',
+      on: '#10b981', // emerald-500, the side panel's "on" colour
       active: '#3b82f6',
       pair: '#f59e0b',
       ask: '#f59e0b',
@@ -2199,6 +2284,16 @@ export default defineBackground(() => {
     };
     chrome.action.setBadgeBackgroundColor({ color: colors[state] });
     chrome.action.setBadgeText({ text: labels[state] });
+    syncToolbarIcon();
+  }
+
+  /** Grey while Control Mode is off, emerald while it is on. Every path that turns it off ends in updateBadge; the two that turn it on call this directly. */
+  function syncToolbarIcon() {
+    if (shownIcon === controlMode) return;
+    shownIcon = controlMode;
+    chrome.action.setIcon({ path: toolbarIconFor(controlMode) }).catch(() => {
+      shownIcon = undefined; // try again on the next update
+    });
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -2236,6 +2331,7 @@ export default defineBackground(() => {
               pid: s.identity.pid,
               cwd: s.identity.cwd,
               serverVersion: s.identity.serverVersion,
+              code: s.identity.code,
             }
           : null,
       });
@@ -2270,20 +2366,9 @@ export default defineBackground(() => {
         // Once this closes, a new agent cannot get in without a deliberate
         // gesture, which is worth being able to see rather than infer.
         pairWindowOpen: controlMode && Date.now() - controlEnabledAt <= PAIR_WINDOW_MS,
-        pairRequest: pairRequest
-          ? {
-              port: pairRequest.port,
-              wasPaired: pairRequest.wasPaired,
-              agent: {
-                name: pairRequest.agent.name,
-                version: pairRequest.agent.version,
-                source: pairRequest.agent.source,
-                pid: pairRequest.agent.pid,
-                cwd: pairRequest.agent.cwd,
-                serverVersion: pairRequest.agent.serverVersion,
-              },
-            }
-          : null,
+        // The oldest, for callers written before requests queued; the panel reads the whole list.
+        pairRequest: pairRequests[0] ? pairRequestView(pairRequests[0]) : null,
+        pairRequests: pairRequests.map(pairRequestView),
         askRequest: askRequest
           ? { question: askRequest.question, options: askRequest.options, askedAt: askRequest.askedAt }
           : null,
@@ -2302,13 +2387,7 @@ export default defineBackground(() => {
       const kind = (message.scope as ScopeKind) ?? preferredScope;
       buildScope(kind, message.windowId as number | undefined).then((scope) => {
         const res = manager.activate(String(message.id), scope);
-        if (res.ok) {
-          void manager.send(String(message.id), {
-            type: 'ready',
-            version: chrome.runtime.getManifest().version,
-            controlMode: true,
-          });
-        }
+        if (res.ok) sendReady(String(message.id));
         sendResponse(res);
       });
       return true;
@@ -2316,6 +2395,8 @@ export default defineBackground(() => {
 
     if (message?.type === 'hold_session') {
       manager.hold(String(message.id));
+      // The agent's server may be connected to other browsers too; tell it this one has let go.
+      void manager.send(String(message.id), { type: 'released' });
       sendResponse({ ok: true });
       return true;
     }
@@ -2370,7 +2451,7 @@ export default defineBackground(() => {
           void chrome.notifications
             ?.create({
               type: 'basic',
-              iconUrl: chrome.runtime.getURL('icon.svg'),
+              iconUrl: chrome.runtime.getURL('icon/128.png'),
               title: 'onbridge — approvals re-enabled',
               message: `Bypass mode expired after ${YOLO_TIMEOUT_MINUTES} minutes.`,
               priority: 1,
@@ -2444,7 +2525,11 @@ export default defineBackground(() => {
     }
 
     if (message?.type === 'resolve_pairing') {
-      resolvePairing(Boolean(message.allow));
+      const port = typeof message.port === 'number' ? message.port : undefined;
+      if (message.allow && port != null && typeof message.windowId === 'number') {
+        pendingGrants.set(port, { windowId: message.windowId, scope: (message.scope as ScopeKind) ?? preferredScope });
+      }
+      resolvePairing(Boolean(message.allow), port);
       sendResponse({ ok: true });
       return true;
     }
@@ -2528,6 +2613,7 @@ export default defineBackground(() => {
         pairBlocked = null;
         rememberPairingWindow();
         manager.start();
+        syncToolbarIcon();
       } else {
         controlEnabledAt = 0;
         pairBlocked = null;
@@ -2607,7 +2693,7 @@ export default defineBackground(() => {
     void chrome.notifications
       ?.create({
         type: 'basic',
-        iconUrl: chrome.runtime.getURL('icon.svg'),
+        iconUrl: chrome.runtime.getURL('icon/128.png'),
         title: 'onbridge — control mode turned off',
         message: `No agent activity for ${policy.idleRevokeMinutes} minutes.`,
         priority: 1,
