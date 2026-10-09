@@ -112,9 +112,21 @@ interface Entry {
   retryAfter: number;
 }
 
+/**
+ * A grant kept across the worker's own restarts.
+ *
+ * MV3 suspends and restarts this worker whenever it pleases, and every grant lived in memory: after a restart the extension reconnected and authenticated fine, but `dial()` had no prior session to restore from, so the agent landed on hold and the user had to press Give this agent control again, in the middle of a task, for no reason they could see. Remembered per port with the server id it was granted to, and restored under exactly the rules a reconnect uses: same server, nothing overlapping. Kept in `chrome.storage.session`, which Chrome clears when the browser closes, so a grant never outlives the browser session it was made in.
+ */
+export interface RememberedGrant {
+  scope: SessionScope;
+  serverId?: string;
+}
+
 export interface ManagerHooks {
   /** Ask the user to approve first contact with this agent. */
   onPairRequest: (agent: AgentIdentity, port: number, opts: { wasPaired: boolean }) => Promise<boolean>;
+  /** The set of remembered grants changed; persist it. Keyed by port. */
+  onGrantsChanged?: (grants: Record<string, RememberedGrant>) => void;
   /**
    * A pairing prompt for this port is no longer answerable — its session died
    * before the user responded. Lets the panel dismiss a prompt for a peer that
@@ -175,6 +187,8 @@ export class ConnectionManager {
   private entries = new Map<number, Entry>();
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  /** Grants that survive this worker being restarted. See `RememberedGrant`. */
+  private remembered = new Map<number, RememberedGrant>();
 
   /** Bound once so it can be removed again in `stop()`. */
   private onAlarm = (alarm: chrome.alarms.Alarm): void => {
@@ -199,7 +213,10 @@ export class ConnectionManager {
     chrome.alarms?.onAlarm.addListener(this.onAlarm);
   }
 
-  stop(): void {
+  /**
+   * Stops looking and hangs up on every agent. `reason` goes to each server in the close frame, so the agent hears "Control Mode was turned off" rather than a bare disconnect. Every grant is forgotten: this is the user ending things, not the worker restarting.
+   */
+  stop(reason?: string): void {
     this.running = false;
     if (this.sweepTimer) {
       clearInterval(this.sweepTimer);
@@ -207,9 +224,26 @@ export class ConnectionManager {
     }
     chrome.alarms?.clear(SWEEP_ALARM);
     chrome.alarms?.onAlarm.removeListener(this.onAlarm);
-    for (const e of this.entries.values()) e.client.disconnect();
+    for (const e of this.entries.values()) e.client.disconnect(reason);
     this.entries.clear();
+    if (this.remembered.size) {
+      this.remembered.clear();
+      this.hooks.onGrantsChanged?.({});
+    }
     this.hooks.onChange();
+  }
+
+  /** Loads the grants a previous run of this worker remembered. Call before `start()`, so the first sweep can restore them. */
+  seedGrants(grants: Record<string, RememberedGrant> | undefined): void {
+    for (const [port, grant] of Object.entries(grants ?? {})) {
+      if (grant?.scope && Number.isInteger(Number(port))) this.remembered.set(Number(port), grant);
+    }
+  }
+
+  private remember(port: number, grant: RememberedGrant | null): void {
+    if (grant) this.remembered.set(port, grant);
+    else if (!this.remembered.delete(port)) return;
+    this.hooks.onGrantsChanged?.(Object.fromEntries(this.remembered));
   }
 
   isRunning(): boolean {
@@ -280,8 +314,12 @@ export class ConnectionManager {
     const prior = this.entries.get(port);
     prior?.client.disconnect();
 
-    const priorScope = prior?.session.scope ?? null;
-    const priorServerId = prior?.session.serverId;
+    // A session this worker held, or one a previous run of it remembered.
+    const remembered = prior?.session.scope
+      ? { scope: prior.session.scope, serverId: prior.session.serverId }
+      : this.remembered.get(port);
+    const priorScope = remembered?.scope ?? null;
+    const priorServerId = remembered?.serverId;
 
     const session: AgentSession = {
       id: `port:${port}`,
@@ -351,10 +389,13 @@ export class ConnectionManager {
         session.scope = priorScope;
         session.status = 'active';
         session.detail = '';
+        this.remember(port, { scope: priorScope!, serverId });
         this.hooks.onGranted?.(session.id);
       } else {
         session.status = 'on_hold';
         session.detail = verdict.reason;
+        // Refused now, refused later: a remembered grant that no longer applies must not come back on the next restart either.
+        this.remember(port, null);
       }
       this.hooks.log(
         `agent on :${port} ${session.status} — ${session.identity?.name ?? 'unidentified'}`,
@@ -469,6 +510,7 @@ export class ConnectionManager {
 
     entry.session.scope = scope;
     entry.session.status = 'active';
+    this.remember(entry.session.port, { scope, serverId: entry.session.serverId });
     this.hooks.onChange();
     return { ok: true };
   }
@@ -479,6 +521,7 @@ export class ConnectionManager {
     if (!entry) return;
     entry.session.scope = null;
     if (entry.session.status === 'active') entry.session.status = 'on_hold';
+    this.remember(entry.session.port, null);
     this.hooks.onChange();
   }
 
@@ -506,7 +549,8 @@ export class ConnectionManager {
     }
 
     const removed = await forgetStoredPairing(serverId);
-    entry.client.disconnect();
+    entry.client.disconnect('the user forgot this pairing in the OnBridge panel; it will ask to pair again');
+    this.remember(entry.session.port, null);
     entry.session.status = 'failed';
     entry.session.detail = removed
       ? 'Pairing forgotten. Reconnecting — approve it when it asks.'
@@ -524,8 +568,9 @@ export class ConnectionManager {
     const found = [...this.entries.entries()].find(([, e]) => e.session.id === id);
     if (!found) return;
     const [port, entry] = found;
-    entry.client.disconnect();
+    entry.client.disconnect('the user disconnected this agent in the OnBridge panel');
     this.entries.delete(port);
+    this.remember(port, null);
     this.hooks.onChange();
   }
 

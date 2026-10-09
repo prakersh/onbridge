@@ -1,7 +1,20 @@
 import type { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Bridge } from '../bridge.js';
+import { commandError } from '../bridge.js';
 import { text, pageText, image, error, notConnected } from './reply.js';
+import { tabIdParam, waitSpecSchema, performWait, DEFAULT_WAIT_MS } from './common.js';
+
+/** One row of a `dom_query` list. `fields` is filled by a current extension when asked for. */
+interface QueryRow {
+  index: number;
+  ref?: number;
+  tag: string;
+  text: string;
+  id?: string;
+  href?: string;
+  fields?: Record<string, string | null>;
+}
 
 export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
@@ -12,16 +25,17 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       inputSchema: z.object({
         script: z.string().describe('JavaScript code to execute'),
         ref: z.number().optional().describe('Element ref — available as "element" in the script'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ script, ref }) => {
+    async ({ script, ref, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = (await bridge.sendCommand('evaluate', { script, ref })) as { result: unknown };
+        const data = (await bridge.sendCommand('evaluate', { script, ref }, tabId)) as { result: unknown };
         const formatted = typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
         return pageText(bridge, formatted, 'Result of evaluating your script in the page:');
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -30,26 +44,38 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
     'wait',
     {
       description:
-        'Wait for a condition: text to appear, text to disappear, or a CSS selector to match an element. Default timeout 10 seconds.',
-      inputSchema: z.object({
-        text: z.string().optional().describe('Wait for this text to appear on the page'),
-        textGone: z.string().optional().describe('Wait for this text to disappear from the page'),
-        selector: z.string().optional().describe('Wait for an element matching this CSS selector'),
-        timeout: z.number().optional().describe('Max wait time in milliseconds (default 10000)'),
-      }),
+        'Wait for the page. With a condition: text to appear, text to disappear, or a CSS selector to match an element. ' +
+        'With no condition: wait for the page to finish loading and its content to stop changing, which is the right call after a navigation or click on a page that fills in late ("Hang on, loading…"). ' +
+        `Default timeout ${DEFAULT_WAIT_MS / 1000} seconds. Nothing on the page is changed either way. ` +
+        'The same conditions can be passed as waitFor to navigate, click and click_by_text.',
+      inputSchema: waitSpecSchema.extend({ tabId: tabIdParam }),
     },
-    async ({ text: waitText, textGone, selector, timeout }) => {
+    async ({ text: waitText, textGone, selector, timeout, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
+      const spec = { text: waitText, textGone, selector, timeout };
+      const conditional = Boolean(waitText || textGone || selector);
       try {
-        const data = (await bridge.sendCommand('wait', {
-          text: waitText,
-          textGone,
-          selector,
-          timeout,
-        })) as { success: boolean; elapsed: number };
-        return text(bridge, `Condition met after ${data.elapsed}ms.`);
+        const { met, elapsed } = await performWait(bridge, spec, tabId);
+        if (met) {
+          return text(
+            bridge,
+            conditional ? `Condition met after ${elapsed}ms.` : `The page finished loading and settled after ${elapsed}ms.`,
+          );
+        }
+        if (!conditional) {
+          // Not an error: "it was still changing" is a true answer to "wait for it to settle", and the agent can read the page as it is.
+          return text(
+            bridge,
+            `Waited ${elapsed}ms and the page was still changing when the time ran out. It may be loading slowly or animating; ` +
+              'read it as it is, or wait for something specific with text, textGone or selector.',
+          );
+        }
+        return error(
+          commandError(`The condition was not met within ${timeout ?? DEFAULT_WAIT_MS}ms.`, true, { code: 'wait-timeout' }),
+          bridge,
+        );
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -66,12 +92,13 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
           .boolean()
           .optional()
           .describe('Request the actual values. Requires explicit user approval.'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ domain, includeValues }) => {
+    async ({ domain, includeValues, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = (await bridge.sendCommand('get_cookies', { domain, includeValues })) as {
+        const data = (await bridge.sendCommand('get_cookies', { domain, includeValues }, tabId)) as {
           cookies: Array<Record<string, unknown>>;
           redacted: boolean;
           note?: string;
@@ -89,7 +116,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         if (data.note) lines.push('', data.note);
         return pageText(bridge, lines.join('\n'), 'Cookies for this page. Names and domains are set by the site:');
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -110,7 +137,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         await bridge.sendCommand('set_cookie', { name, value, domain });
         return text(bridge, `Cookie "${name}" set for ${domain}.`);
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -121,19 +148,20 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
       description: 'Get browser console messages, optionally filtered by severity level.',
       inputSchema: z.object({
         level: z.enum(['error', 'warning', 'info', 'debug']).optional().describe('Minimum log level to include'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ level }) => {
+    async ({ level, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const raw = (await bridge.sendCommand('console_logs', { level })) as { logs: Array<{ level: string; text: string; timestamp: number }> } | Array<{ level: string; text: string; timestamp: number }>;
+        const raw = (await bridge.sendCommand('console_logs', { level }, tabId)) as { logs: Array<{ level: string; text: string; timestamp: number }> } | Array<{ level: string; text: string; timestamp: number }>;
         const data = Array.isArray(raw) ? raw : (raw.logs ?? []);
         if (data.length === 0) return text(bridge, 'No console messages.');
         const lines = data.slice(0, 50).map((m) => `[${m.level}] ${m.text}`);
         if (data.length > 50) lines.push(`... and ${data.length - 50} more`);
         return pageText(bridge, lines.join('\n'), 'Console output. Any page can write whatever it likes here:');
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -150,18 +178,23 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         status: z.number().optional().describe('Only responses with this HTTP status code'),
         limit: z.number().optional().describe('Max entries to return (default 50)'),
         failedOnly: z.boolean().optional().describe('Only requests that failed'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ urlFilter, method, status, limit, failedOnly }) => {
+    async ({ urlFilter, method, status, limit, failedOnly, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = (await bridge.sendCommand('network_requests', {
-          urlFilter,
-          method,
-          status,
-          limit,
-          failedOnly,
-        })) as {
+        const data = (await bridge.sendCommand(
+          'network_requests',
+          {
+            urlFilter,
+            method,
+            status,
+            limit,
+            failedOnly,
+          },
+          tabId,
+        )) as {
           entries: Array<{
             requestId: string;
             url: string;
@@ -209,7 +242,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
           'Network activity. URLs, headers and status text are chosen by pages and servers:',
         );
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -222,12 +255,13 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         'bodies can contain credentials and personal data, so retrieving one is gated at a higher risk level than browsing the request list.',
       inputSchema: z.object({
         requestId: z.string().describe('The requestId reported by network_requests'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ requestId }) => {
+    async ({ requestId, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = (await bridge.sendCommand('network_request_body', { requestId })) as {
+        const data = (await bridge.sendCommand('network_request_body', { requestId }, tabId)) as {
           body?: string;
           base64Encoded?: boolean;
           mimeType?: string;
@@ -250,7 +284,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
           .join(', ');
         return pageText(bridge, shown, `Response body${facts ? ` (${facts})` : ''}:`);
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -262,7 +296,9 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         'Query the DOM using a CSS selector (read-only, CSP-safe, no eval). Actions: "list" returns matching elements ' +
         '(with the absolute href for links), "text" returns the full text of the nth match, "attr" returns one ' +
         'attribute across every match — use it to read hrefs from a result list and navigate to them directly, which ' +
-        'avoids clicking through. To click a match, use the "click" tool with a ref from a snapshot, or "click_by_text".',
+        'avoids clicking through. With "list", pass fields to read several values from each match in one call, for example ' +
+        'selector "[data-asin]" with fields {id: "@data-asin", title: "h2", price: ".a-price .a-offscreen"} returns the id, title and price of every product card. ' +
+        'To click a match, use the "click" tool with a ref from a snapshot, or "click_by_text".',
       inputSchema: z.object({
         selector: z.string().describe('CSS selector (e.g., "#add-to-cart-button", ".price", "button[type=submit]")'),
         action: z
@@ -274,12 +310,21 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
           .optional()
           .describe('Attribute to read for "attr" (default: href). href and src come back absolute.'),
         index: z.number().optional().describe('Which match to read for "text" (default: 0 = first)'),
+        fields: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe(
+            'For "list": values to read from each match, as name → where. A sub-selector relative to the match ("h2", ".price") gives that descendant\'s text; ' +
+              '"@attr" gives an attribute of the match itself ("@data-asin"); "sub@attr" gives an attribute of a descendant ("a@href"). href and src come back absolute.',
+          ),
+        limit: z.number().optional().describe('For "list": how many matches to return (default 20, max 100)'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ selector, action, attr, index }) => {
+    async ({ selector, action, attr, index, fields, limit, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = await bridge.sendCommand('dom_query', { selector, action, attr, index });
+        const data = await bridge.sendCommand('dom_query', { selector, action, attr, index, fields, limit }, tabId);
         if (action === 'text') {
           return pageText(bridge, (data as any).text ?? '');
         }
@@ -295,17 +340,26 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
           }
           return pageText(bridge, lines.join('\n'));
         }
-        const result = data as { matches: number; results: Array<{ index: number; ref?: number; tag: string; text: string; id?: string; href?: string }> };
+        const result = data as { matches: number; results: QueryRow[] };
+        let note: string | undefined;
+        if (fields && Object.keys(fields).length && result.results.length && !result.results.some((r) => r.fields)) {
+          note = await fieldsFromOlderExtension(bridge, selector, fields, result.results, tabId);
+        }
         const lines = [`${result.matches} match${result.matches === 1 ? '' : 'es'}:`];
         for (const r of result.results) {
           lines.push(
             `  [${r.index}] <${r.tag}>${r.ref ? ` ref:${r.ref}` : ''}${r.id ? ` #${r.id}` : ''} "${r.text}"` +
               (r.href ? ` → ${r.href}` : ''),
           );
+          if (fields && r.fields) {
+            for (const name of Object.keys(fields)) {
+              lines.push(`      ${name}: ${r.fields[name] ?? '(none)'}`);
+            }
+          }
         }
-        return pageText(bridge, lines.join('\n'));
+        return pageText(bridge, lines.join('\n'), note);
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -325,7 +379,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         const data = (await bridge.sendCommand('download_file', { url, ref })) as { filename: string; path: string };
         return pageText(bridge, `${data.filename}\n${data.path}`, 'Downloaded. Filename and path come from the remote server:');
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -354,7 +408,7 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         );
         return pageText(bridge, lines.join('\n'), 'Downloads. Filenames come from the remote servers:');
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -381,9 +435,49 @@ export function registerAdvancedTools(server: McpServer, bridge: Bridge): void {
         }
         return pageText(bridge, lines.join('\n'), 'Recent commands. Element labels in it are page text:');
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
 }
 
+/**
+ * Fills in what it can of a `fields` request against an extension that does not read fields.
+ *
+ * An attribute of the match itself (`@data-asin`) can be read with the existing `attr` action, whose rows come from the same selector in the same order, so they line up with the list by index. A descendant's text or attribute cannot be read without the extension's help and is marked as needing a newer one. Rows are filled in place; returns the note for the reply.
+ */
+async function fieldsFromOlderExtension(
+  bridge: Bridge,
+  selector: string,
+  fields: Record<string, string>,
+  rows: QueryRow[],
+  tabId?: number,
+): Promise<string> {
+  const unreadable: string[] = [];
+  for (const row of rows) row.fields = {};
+  for (const [name, where] of Object.entries(fields)) {
+    const own = /^@([^@]+)$/.exec(where.trim());
+    if (!own) {
+      unreadable.push(name);
+      for (const row of rows) row.fields![name] = '(needs a newer extension)';
+      continue;
+    }
+    try {
+      const res = (await bridge.sendCommand('dom_query', { selector, action: 'attr', attr: own[1] }, tabId)) as {
+        values?: Array<{ index: number; value: string | null }>;
+      };
+      const byIndex = new Map((res.values ?? []).map((v) => [v.index, v.value]));
+      for (const row of rows) row.fields![name] = byIndex.get(row.index) ?? null;
+    } catch {
+      for (const row of rows) row.fields![name] = '(could not be read)';
+    }
+  }
+  const version = bridge.getExtensionVersion() ? ` (v${bridge.getExtensionVersion()})` : '';
+  return (
+    `This browser extension${version} does not read fields in one call; updating it adds that. ` +
+    (unreadable.length
+      ? `Attributes of each match were read separately, but ${unreadable.join(', ')} need${unreadable.length === 1 ? 's' : ''} a newer extension. `
+      : 'Attributes of each match were read separately. ') +
+    'Meanwhile, use dom_query with a narrower selector for each value.'
+  );
+}

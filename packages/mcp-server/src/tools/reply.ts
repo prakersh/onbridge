@@ -16,9 +16,10 @@
 import { randomBytes } from 'node:crypto';
 import { serializeSnapshot } from '@onbridge/shared';
 import type { ActionResult } from '@onbridge/shared';
-import { errorRetry, isTrustedError, notConnectedText } from '../bridge.js';
+import { errorRetry, isTrustedError } from '../bridge.js';
 import type { Bridge } from '../bridge.js';
 import { diffLines, renderDiff } from './page-diff.js';
+import { redact } from './redact.js';
 
 type Content = { type: 'text'; text: string };
 
@@ -143,7 +144,7 @@ function withConsoleDelta(bridge: Bridge, content: Content[]): Content[] {
     lines.push(`… and ${entries.length - kept.length} more — console_logs has the rest`);
   }
 
-  const { text, id } = fence('console-output', lines.join('\n'));
+  const { text, id } = fence('console-output', redact(lines.join('\n'), bridge.redactions()));
   return [
     ...content,
     {
@@ -172,7 +173,8 @@ export function text(bridge: Bridge, t: string) {
  * fence: putting it inside would let a page forge it.
  */
 export function pageText(bridge: Bridge, t: string, note?: string) {
-  const { text, id } = fence('untrusted-page-content', t);
+  // Redacted before fencing, and only here and on the other page-derived channels: the server's own framing never carries page data, and the user's notes are theirs to word.
+  const { text, id } = fence('untrusted-page-content', redact(t, bridge.redactions()));
   return {
     content: withUserMessages(
       bridge,
@@ -329,22 +331,29 @@ export function image(bridge: Bridge, base64: string, mimeType = 'image/jpeg') {
  * would have its own text presented to the agent as an authoritative refusal.
  * Unmarked means page-derived, which is the safe default.
  */
-export function error(err: unknown) {
+export function error(err: unknown, bridge?: Bridge) {
   const msg = err instanceof Error ? err.message : String(err);
 
   if (isTrustedError(err)) {
     const retry = errorRetry(err);
-    // A transient condition says so in a form the agent can act on. Without
-    // this, "the page was navigating" is just another sentence in an error, and
-    // an agent that cannot tell a retry from a refusal either abandons a
-    // working page or re-issues an action that already happened.
-    const suffix = retry
-      ? `\n[retryable: ${retry.code}${retry.retryAfterMs ? `, retry after ${retry.retryAfterMs}ms` : ''}] ` +
-        'Nothing was changed by this call — making it again is safe.'
-      : '';
+    // A condition with a code says, in a form the agent can act on, what its next move is. Without this, "the page was navigating" is just another sentence in an error, and an agent that cannot tell a retry from a refusal either abandons a working page or re-issues an action that already happened. The codes mean different things, so they are not all "try again": a stale ref fails the same way every time until the agent takes a fresh snapshot.
+    let suffix = '';
+    if (retry?.code === 'ref-not-found') {
+      suffix =
+        '\n[stale-ref] Nothing was changed. The element this ref named is no longer on the page, or the ref was never issued: ' +
+        'take a fresh snapshot or find and use the ref it returns. Retrying with this ref will fail the same way.';
+    } else if (retry?.code === 'unsupported-action') {
+      suffix = '\n[unsupported-action] Nothing was changed. This needs a newer browser extension.';
+    } else if (retry?.code === 'wait-timeout') {
+      suffix = '\n[wait-timeout] Nothing was changed. The condition was not met in time; the page may still be loading, or the text may be worded differently.';
+    } else if (retry) {
+      suffix =
+        `\n[retryable: ${retry.code}${retry.retryAfterMs ? `, retry after ${retry.retryAfterMs}ms` : ''}] ` +
+        'Nothing was changed by this call — making it again is safe.';
+    }
     return { content: [{ type: 'text' as const, text: `Error: ${msg}${suffix}` }], isError: true };
   }
-  const { text, id } = fence('untrusted-page-content', msg);
+  const { text, id } = fence('untrusted-page-content', bridge ? redact(msg, bridge.redactions()) : msg);
   return {
     content: [
       {
@@ -366,7 +375,7 @@ export function notConnected(bridge: Bridge) {
     content: [
       {
         type: 'text' as const,
-        text: notConnectedText(bridge.getConnectionCode()),
+        text: bridge.notConnectedMessage(),
       },
     ],
     isError: true,

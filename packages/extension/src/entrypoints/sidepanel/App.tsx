@@ -104,6 +104,8 @@ interface Status {
     allowlist: string[];
     denylist: string[];
     idleRevokeMinutes: number;
+    /** Kinds of personal data the agent's server blanks out of page text. Absent on older backgrounds. */
+    redact?: string[];
   };
   yoloExpiresAt: number;
   approvalRequest: {
@@ -721,6 +723,30 @@ export default function App() {
             <p className="mt-1 text-[10px] text-neutral-600">
               Leave empty to allow any site. Subdomains are included. Enforced in every approval
               mode, including Bypass.
+            </p>
+          </div>
+
+          {/* ── Personal data ── */}
+          <div>
+            <div className="mb-1.5 text-xs font-medium uppercase tracking-wide text-neutral-400">
+              Personal data
+            </div>
+            <label className="flex cursor-pointer items-start gap-2 text-xs text-neutral-300">
+              <input
+                type="checkbox"
+                checked={(status.policy.redact?.length ?? 0) > 0}
+                onChange={(e) =>
+                  send({
+                    type: 'set_policy',
+                    policy: { redact: e.target.checked ? ['phone', 'email', 'card'] : [] },
+                  }).then(refresh)
+                }
+                className="mt-0.5 accent-emerald-500"
+              />
+              <span>Hide phone numbers, email addresses and card numbers from agents</span>
+            </label>
+            <p className="mt-1 text-[10px] text-neutral-600">
+              Blanked out of everything an agent reads from a page, by the agent's own OnBridge server (0.6.0 or newer). Postal addresses cannot be recognised reliably and are not hidden. Order and reference numbers that look like phone numbers may be hidden too.
             </p>
           </div>
 

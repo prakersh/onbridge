@@ -615,7 +615,9 @@ async function main() {
     await send({ type: 'set_approval_mode', mode: 'strict' });
 
     // ── strict mode gates an ordinary write ─────────────────────────
-    const strictClick = call('click', { ref: Number(btnRef) });
+    // A fresh ref: the page was reloaded above, and a ref from the earlier document is refused as stale before policy runs, which is the point of stable refs.
+    const strictBtnRef = /\[button:(\d+)\]/.exec(textOf(await call('snapshot', {})))?.[1] ?? btnRef;
+    const strictClick = call('click', { ref: Number(strictBtnRef) });
     await page.waitForTimeout(700);
     const strictGate = await send({ type: 'get_status' });
     strictGate?.approvalRequest?.risk === 'write'
@@ -730,8 +732,9 @@ async function main() {
       bad('empty container has a ref', emptyFind.slice(0, 160));
     }
 
+    // A ref nobody issued is refused by the background as stale, in its own words, before the page is asked; an older background let the content script answer `ref-not-found`.
     const goneText = textOf(await call('extract_text', { ref: 999999 }));
-    /no element with ref/i.test(goneText)
+    /no element with ref|\[stale-ref\]/i.test(goneText)
       ? ok('a ref that resolves to nothing is reported, not answered with ""')
       : bad('dead ref reported', goneText.slice(0, 200));
 

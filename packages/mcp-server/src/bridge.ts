@@ -21,13 +21,17 @@ import {
   verifyProof,
   ReplayGuard,
 } from '@onbridge/shared';
+import { REDACTION_KINDS } from '@onbridge/shared';
 import type {
   ServerMessage,
   ExtensionMessage,
   CommandAction,
   ConsoleDeltaEntry,
   HandshakeFrame,
+  ExtensionFeature,
+  RedactionKind,
 } from '@onbridge/shared';
+import { RefLedger, staleRefText } from './refs.js';
 import {
   buildAgentIdentity,
   checkPeerIdentity,
@@ -50,12 +54,26 @@ import {
 import type { AgentIdentity } from '@onbridge/shared';
 
 type PendingCommand = {
+  action: string;
   resolve: (data: unknown) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
   /** The browser it was sent to. Only that browser disconnecting fails it. */
   session: Session;
 };
+
+/**
+ * How the last live session ended, kept so the next tool call can say so.
+ *
+ * One "not connected" message for every cause sent an agent, and the user, down the same path each time: approve the pairing again, grant control again. The cause is usually knowable here. A deliberate close from the extension carries its reason; a socket that simply vanished (1006) is what a suspended extension worker, a sleeping machine or a crashed browser looks like, and those reconnect on their own.
+ */
+export interface Disconnect {
+  at: number;
+  code: number;
+  reason: string;
+  /** The browser had granted this agent control when it went. */
+  granted: boolean;
+}
 
 /**
  * Sockets open at once, handshaking or live. One per browser install is the real need, since each browser profile holds one connection to each agent; the cap only stops a local process from opening sockets without end.
@@ -82,11 +100,39 @@ function listenAtStartup(): boolean {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** What the agent hears when the browser has not connected. Worded as the next step, since the agent's only move is to ask the user, and carrying the connection code so the user can tell which request in the panel is this one. */
-export function notConnectedText(code: string): string {
+export function notConnectedText(code: string, last?: Disconnect): string {
+  const ask =
+    'Ask the user to open the OnBridge side panel in Chrome and turn on Control Mode, ' +
+    `and to approve the request showing connection code ${code}, then try again.`;
+  if (!last) return `The browser is not connected to this agent. ${ask}`;
+
+  const ago = Math.max(1, Math.round((Date.now() - last.at) / 1000));
+  const held = last.granted ? ' It had given this agent control.' : '';
+  if (last.reason) {
+    // The extension said why. It closed on purpose, so waiting will not bring it back; the user has to act.
+    return (
+      `The browser disconnected from this agent ${ago}s ago on purpose: ${last.reason}.${held} ` +
+      `It will not reconnect by itself. ${ask}`
+    );
+  }
   return (
-    'The browser is not connected to this agent. Ask the user to open the OnBridge side panel in Chrome and turn on Control Mode, ' +
-    `and to approve the request showing connection code ${code}, then try again.`
+    `The browser was connected to this agent until ${ago}s ago and then the connection was lost without a reason ` +
+    `(close code ${last.code}).${held} That is what a suspended or restarted extension worker, a sleeping machine or a ` +
+    'closed browser looks like, not a decision by the user. The extension reconnects on its own within about 30s while ' +
+    'Control Mode is on, and restores the control it had; this call already waited for that. If it stays disconnected: ' +
+    ask
   );
+}
+
+/** `ONBRIDGE_REDACT`: `1`, `true` or `all` for every kind, or a comma-separated list of kinds. Read per call, never captured at import. */
+export function envRedactions(): RedactionKind[] {
+  const raw = process.env.ONBRIDGE_REDACT?.trim().toLowerCase();
+  if (!raw) return [];
+  if (raw === '1' || raw === 'true' || raw === 'all') return [...REDACTION_KINDS];
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s): s is RedactionKind => (REDACTION_KINDS as readonly string[]).includes(s));
 }
 
 /**
@@ -171,6 +217,12 @@ interface Session {
   extensionVersion?: string;
   /** The actions the extension implements. Undefined means unknown, never "none". */
   extensionActions?: ReadonlySet<string>;
+  /** From `ready.features`. Absent or empty means none: every feature has a fallback. */
+  extensionFeatures: ReadonlySet<string>;
+  /** Kinds of personal data the user asked, in the panel, to have blanked out of page text. */
+  redact: RedactionKind[];
+  /** Which refs may still be used, for an extension without `stable-refs`. */
+  refs: RefLedger;
   /**
    * Set when a peer asked to re-pair. The old record is only dropped once a new
    * pairing actually completes, so a peer that asks and then vanishes cannot
@@ -250,6 +302,8 @@ export class Bridge {
 
   /** Settles once `listen()` has bound a port or given up. Created on first need, and only once. */
   private listening?: Promise<void>;
+  /** How the most recent live session ended. Cleared when one is established again. */
+  private lastDisconnect?: Disconnect;
 
   constructor(serverVersion?: string) {
     if (serverVersion) this.serverVersion = serverVersion;
@@ -272,6 +326,8 @@ export class Bridge {
     const start = Date.now();
     while (!this.isConnected()) {
       const handshaking = [...this.sessions.values()].some((x) => x.state !== 'ready');
+      // A browser that hung up on purpose (Control Mode off, a pairing forgotten) is not coming back on its own; waiting the full budget before saying so only delays the user's next step. A lost connection is waited out as before, since that one reconnects by itself.
+      if (!handshaking && this.lastDisconnect?.reason) return;
       const budget = handshaking ? HANDSHAKE_TIMEOUT_MS : ON_DEMAND_WAIT_MS;
       if (Date.now() - start >= budget) return;
       await sleep(250);
@@ -511,8 +567,13 @@ export class Bridge {
               replay: new ReplayGuard(),
               sendChain: Promise.resolve(),
               timer: setTimeout(() => fail('handshake timed out'), HANDSHAKE_TIMEOUT_MS),
+              extensionFeatures: new Set(),
+              redact: [],
+              refs: new RefLedger(),
             };
             this.sessions.set(ws, session);
+            // A browser is back: whatever the last one's reason for leaving, the agent's next call should wait for this handshake rather than repeat it.
+            this.lastDisconnect = undefined;
 
             this.sendPlain(ws, {
               t: 'hello_ack',
@@ -586,7 +647,7 @@ export class Bridge {
     });
 
     // Releases the install's slot and the connection count too, so a peer that connects and drops before `hello` cannot lock anyone out.
-    ws.on('close', () => this.teardown(ws));
+    ws.on('close', (code, reason) => this.teardown(ws, code, reason.toString()));
     ws.on('error', (err) => this.log(`socket error: ${err.message}`));
   }
 
@@ -748,6 +809,7 @@ export class Bridge {
     s.state = 'ready';
     s.txCounter = 0;
     s.replay = new ReplayGuard();
+    this.lastDisconnect = undefined;
     this.log('secure channel established');
     this.startHeartbeat();
   }
@@ -794,7 +856,7 @@ export class Bridge {
     return s.sendChain;
   }
 
-  private teardown(ws: WebSocket): void {
+  private teardown(ws: WebSocket, code = 0, reason = ''): void {
     this.sockets.delete(ws);
     for (const [key, holder] of this.reserved) if (holder === ws) this.reserved.delete(key);
     const s = this.sessions.get(ws);
@@ -805,10 +867,22 @@ export class Bridge {
     s.releasePairing?.();
     this.sessions.delete(ws);
     if (this.sessions.size === 0) this.stopHeartbeat();
-    this.log('extension disconnected');
+    // The reason is the extension's own words, which is as trusted as anything else it sends; a peer that got this far has authenticated. Bounded by the wire anyway (a close reason is at most 123 bytes).
+    const why = reason.slice(0, 200);
+    this.log(`extension disconnected${code ? ` (${code}${why ? `: ${why}` : ''})` : ''}`);
+    if (s.state === 'ready') {
+      this.lastDisconnect = { at: Date.now(), code, reason: why, granted: s.grantedAt != null };
+    }
     for (const [id, cmd] of this.pending) {
       if (cmd.session !== s) continue;
-      cmd.reject(commandError('Extension disconnected', true));
+      // Said plainly, because the agent's next move depends on it: a click that was in flight may have landed.
+      cmd.reject(
+        commandError(
+          `Extension disconnected while "${cmd.action}" was running${why ? ` (${why})` : ''}. ` +
+            'The command may or may not have run; check the page before repeating it.',
+          true,
+        ),
+      );
       clearTimeout(cmd.timer);
       this.pending.delete(id);
     }
@@ -829,6 +903,21 @@ export class Bridge {
 
   isConnected(): boolean {
     return this.readySessions().length > 0;
+  }
+
+  /** The not-connected message, with what is known about how the last connection ended. */
+  notConnectedMessage(): string {
+    return notConnectedText(this.code, this.lastDisconnect);
+  }
+
+  /** Whether the browser commands currently go to announced this behaviour. False when nothing is connected. */
+  hasFeature(feature: ExtensionFeature): boolean {
+    return this.target()?.extensionFeatures.has(feature) ?? false;
+  }
+
+  /** Kinds of personal data to blank out of page text: the environment's choice plus the user's in the panel. */
+  redactions(): RedactionKind[] {
+    return [...new Set([...envRedactions(), ...(this.target()?.redact ?? [])])];
   }
 
   getPort(): number {
@@ -870,7 +959,7 @@ export class Bridge {
     timeoutMs: number = COMMAND_TIMEOUT_MS,
   ): Promise<unknown> {
     const target = this.target();
-    if (!target) throw commandError(notConnectedText(this.code), true);
+    if (!target) throw commandError(this.notConnectedMessage(), true);
 
     // The server ships through npm far more often than the extension through the store, so a newer server meeting an older extension is the normal case. Say so plainly rather than send a command it cannot run.
     const supported = target.extensionActions;
@@ -883,19 +972,29 @@ export class Bridge {
       );
     }
 
+    // An extension that renumbers refs on every capture cannot tell an outdated ref from a current one, so the server refuses on its behalf. See `RefLedger`.
+    if (!target.extensionFeatures.has('stable-refs')) {
+      const stale = target.refs.stale(RefLedger.refsIn(params));
+      if (stale.length) {
+        throw commandError(staleRefText(stale, target.extensionVersion), true, { code: 'ref-not-found' });
+      }
+    }
+
     const id = `cmd_${++this.cmdCounter}`;
     const msg: ServerMessage = { type: 'command', id, action, params };
     if (tabId != null) msg.tabId = tabId;
 
-    return new Promise((resolve, reject) => {
+    const data = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(commandError(`Command '${action}' timed out after ${timeoutMs}ms`, true));
       }, timeoutMs);
 
-      this.pending.set(id, { resolve, reject, timer, session: target });
+      this.pending.set(id, { action, resolve, reject, timer, session: target });
       void this.sendSealed(target, target.sessionKey!, msg);
     });
+    target.refs.observe(action, data);
+    return data;
   }
 
   /** The connected extension's version, once it has said. */
@@ -910,6 +1009,7 @@ export class Bridge {
         s.extensionVersion = msg.version;
         // Replaced, never merged: each `ready` describes the extension as it is now.
         s.extensionActions = Array.isArray(msg.actions) ? new Set(msg.actions) : undefined;
+        s.extensionFeatures = new Set(Array.isArray(msg.features) ? msg.features.filter((f) => typeof f === 'string') : []);
         // Control is in one browser at a time. The one that had it is told, so its panel stops showing the agent as its own.
         for (const other of this.readySessions()) {
           if (other !== s && other.grantedAt != null) {
@@ -922,6 +1022,14 @@ export class Bridge {
 
       case 'released':
         s.grantedAt = undefined;
+        break;
+
+      case 'preferences':
+        // Only names from the fixed list: anything else is ignored rather than becoming a pattern we never defined.
+        s.redact = (Array.isArray(msg.redact) ? msg.redact : []).filter((k): k is RedactionKind =>
+          (REDACTION_KINDS as readonly string[]).includes(k),
+        );
+        this.log(`preferences: redact ${s.redact.length ? s.redact.join(', ') : 'nothing'}`);
         break;
 
       case 'result': {

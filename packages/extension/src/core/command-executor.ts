@@ -1,4 +1,5 @@
-import { getElementByRef, captureSnapshot, getRefMap, absoluteHref } from './dom-capture.js';
+import { getElementByRef, captureSnapshot, getRefMap, absoluteHref, stringProp } from './dom-capture.js';
+import { RefNotFoundError, WaitTimeoutError } from './errors.js';
 import type { ExtractTextResult } from '@onbridge/shared';
 
 /**
@@ -341,6 +342,12 @@ export class CommandExecutor {
     const selector = params.selector as string;
     const action = (params.action as string) ?? 'list';
     const index = (params.index as number) ?? 0;
+    // How many rows a list returns. The old fixed 20 was too few for a results page, and reading four values per card took four calls lined up by index; `fields` reads them in one.
+    const limit = Math.min(100, Math.max(1, Math.floor(Number(params.limit)) || 20));
+    const fieldSpecs =
+      params.fields && typeof params.fields === 'object' && !Array.isArray(params.fields)
+        ? (params.fields as Record<string, unknown>)
+        : undefined;
 
     const elements = Array.from(document.querySelectorAll(selector));
     if (elements.length === 0) {
@@ -395,7 +402,7 @@ export class CommandExecutor {
 
     // action === 'list'
     const map = getRefMap();
-    const results = elements.slice(0, 20).map((el, i) => {
+    const results = elements.slice(0, limit).map((el, i) => {
       let ref: number | undefined;
       for (const [r, mapped] of map) {
         if (mapped === el) { ref = r; break; }
@@ -407,10 +414,48 @@ export class CommandExecutor {
         text: (el.textContent?.trim() ?? '').slice(0, 80),
         id: el.id || undefined,
         href: absoluteHref(el),
+        ...(fieldSpecs ? { fields: this.readFields(el, fieldSpecs) } : {}),
       };
     });
 
     return { matches: elements.length, results };
+  }
+
+  /**
+   * Several values from one match, each named by where to find it: a sub-selector relative to the match for a descendant's text, `@attr` for an attribute of the match itself, or `sub@attr` for a descendant's attribute. Missing is `null`, never an omitted key, so the rows line up.
+   */
+  private readFields(el: Element, specs: Record<string, unknown>): Record<string, string | null> {
+    const out: Record<string, string | null> = {};
+    for (const [name, raw] of Object.entries(specs)) {
+      const where = String(raw ?? '').trim();
+      const at = where.lastIndexOf('@');
+      const sub = at >= 0 ? where.slice(0, at).trim() : where;
+      const attr = at >= 0 ? where.slice(at + 1).trim() : '';
+      let target: Element | null = el;
+      if (sub) {
+        try {
+          target = el.querySelector(sub);
+        } catch {
+          target = null;
+        }
+      }
+      if (!target) {
+        out[name] = null;
+        continue;
+      }
+      if (attr) {
+        // Resolved like `attr` does, so a relative href read here can be handed to `navigate` as it is.
+        out[name] =
+          attr === 'href' && (target.tagName === 'A' || target.tagName === 'AREA')
+            ? (absoluteHref(target) ?? null)
+            : attr === 'src' && 'src' in target
+              ? ((target as HTMLImageElement).src || target.getAttribute('src') || null)
+              : target.getAttribute(attr);
+      } else {
+        out[name] = (target.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+      }
+    }
+    return out;
   }
 
   private async dismissModal(params: Record<string, unknown>): Promise<ActionAck> {
@@ -562,7 +607,7 @@ export class CommandExecutor {
     return { success: true, trusted: false };
   }
 
-  private async typeText(params: Record<string, unknown>): Promise<{ success: boolean }> {
+  private async typeText(params: Record<string, unknown>): Promise<{ success: boolean; value?: string }> {
     const el = this.getEl(params.ref as number) as HTMLInputElement;
     el.focus();
 
@@ -572,7 +617,7 @@ export class CommandExecutor {
       el.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
-    const text = params.text as string;
+    const text = String(params.text ?? '');
     for (const char of text) {
       el.dispatchEvent(new KeyboardEvent('keydown', { key: char, bubbles: true }));
       el.value += char;
@@ -580,6 +625,7 @@ export class CommandExecutor {
       el.dispatchEvent(new KeyboardEvent('keyup', { key: char, bubbles: true }));
     }
     el.dispatchEvent(new Event('change', { bubbles: true }));
+    const value = stringProp(el, 'value');
 
     if (params.submit) {
       const form = el.closest('form');
@@ -598,16 +644,22 @@ export class CommandExecutor {
       }
     }
 
-    return { success: true };
+    // What the field holds, read before any submit tears the page down. Masked for a password, as the snapshot masks it.
+    return { success: true, value: el.type === 'password' ? `[${value.length} chars hidden]` : value.slice(0, 500) };
   }
 
-  private async fillForm(params: Record<string, unknown>): Promise<{ filled: number }> {
+  private async fillForm(params: Record<string, unknown>): Promise<{ filled: number; missing?: number[] }> {
     const fields = params.fields as Array<{ ref: number; value: string }>;
     let filled = 0;
+    // Said, not skipped. "Filled 1 field" for a request of two left the agent believing a form was complete.
+    const missing: number[] = [];
 
     for (const field of fields) {
       const el = getElementByRef(field.ref) as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | undefined;
-      if (!el) continue;
+      if (!el) {
+        missing.push(field.ref);
+        continue;
+      }
 
       el.focus();
 
@@ -634,7 +686,7 @@ export class CommandExecutor {
       }
     }
 
-    return { filled };
+    return { filled, ...(missing.length ? { missing } : {}) };
   }
 
   private selectOption(params: Record<string, unknown>): { success: boolean } {
@@ -790,7 +842,8 @@ export class CommandExecutor {
         }
 
         if (elapsed >= timeout) {
-          reject(new Error(`Wait timed out after ${timeout}ms`));
+          // Its own class, so the background can mark it as a timeout by what it is rather than what it says.
+          reject(new WaitTimeoutError(`Wait timed out after ${timeout}ms`));
           return;
         }
 
@@ -807,7 +860,7 @@ export class CommandExecutor {
 
   private getEl(ref: number): Element {
     const el = getElementByRef(ref);
-    if (!el) throw new Error(`Element ref ${ref} not found. Page may have changed — try running snapshot first.`);
+    if (!el) throw new RefNotFoundError(`Element ref ${ref} not found. Page may have changed — try running snapshot first.`);
     return el;
   }
 

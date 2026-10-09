@@ -7,6 +7,7 @@
  */
 
 import { attach, send, mainWorlds, hasWorld, type World } from './cdp.js';
+import { RefNotFoundError } from './errors.js';
 
 /** CDP modifier bitmask. */
 const MOD = { Alt: 1, Ctrl: 2, Control: 2, Meta: 4, Command: 4, Shift: 8 } as const;
@@ -108,7 +109,8 @@ async function targetForFrame(tabId: number, frameId: number): Promise<World> {
     }
   }
 
-  throw new Error(
+  // The ref's frame is gone, so the ref names nothing: the same answer as a missing element, and the same next step.
+  throw new RefNotFoundError(
     `Frame ${frameId} is no longer reachable. It may have navigated or been removed — run snapshot again.`,
   );
 }
@@ -125,11 +127,42 @@ async function resolveHandle(tabId: number, ref: number, world: World): Promise<
     world.sessionId,
   );
   if (!result?.objectId) {
-    throw new Error(
+    throw new RefNotFoundError(
       `Element ref ${ref} not found. The page may have changed — run snapshot again.`,
     );
   }
   return result.objectId as string;
+}
+
+/**
+ * What a field holds, as the page holds it: the only evidence that typing took.
+ *
+ * `Input.insertText` reports nothing, and a page is free to reject or reset what was inserted (a validator, a controlled input that did not pick up the event, a focus that landed beside the field). "Typed successfully" with the field still empty is how an agent came to click Apply on an empty pincode box. Passwords are masked as the snapshot masks them. Returns undefined when the element has no value to read.
+ */
+export async function fieldValue(tabId: number, ref: number, frameId = 0, known?: World): Promise<string | undefined> {
+  await attach(tabId);
+  const world = known ?? (await targetForFrame(tabId, frameId));
+  const objectId = await resolveHandle(tabId, ref, world);
+  try {
+    const { result } = await send(
+      tabId,
+      'Runtime.callFunctionOn',
+      {
+        objectId,
+        functionDeclaration: `function() {
+          const v = 'value' in this ? this.value : this.isContentEditable ? this.textContent : null;
+          if (v == null) return null;
+          const s = String(v);
+          return this.type === 'password' ? '[' + s.length + ' chars hidden]' : s.slice(0, 500);
+        }`,
+        returnByValue: true,
+      },
+      world.sessionId,
+    );
+    return typeof result?.value === 'string' ? result.value : undefined;
+  } finally {
+    release(tabId, objectId, world);
+  }
 }
 
 function release(tabId: number, objectId: string, world: World): void {
@@ -273,7 +306,7 @@ export async function typeText(
   text: string,
   opts: { clear?: boolean; submit?: boolean } = {},
   frameId = 0,
-): Promise<void> {
+): Promise<{ value?: string; world: World }> {
   await attach(tabId);
 
   // Focus by clicking, exactly as a user would: this fires the focus/blur
@@ -300,7 +333,11 @@ export async function typeText(
   // fighting React's reconciliation and ignoring cursor position entirely.
   if (text) await send(tabId, 'Input.insertText', { text }, world.sessionId);
 
+  // Read before Enter: a submit may replace the document, and the value is wanted as it was when submitted.
+  const value = await fieldValue(tabId, ref, frameId, world).catch(() => undefined);
+
   if (opts.submit) await pressKey(tabId, 'Enter', [], world);
+  return { value, world };
 }
 
 export async function evaluate(

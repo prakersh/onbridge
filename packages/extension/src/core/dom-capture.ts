@@ -1,5 +1,19 @@
 import type { DomNode, PageSnapshot, FindResult, ScrollState } from '@onbridge/shared';
 
+/**
+ * A property of an element read as text, whatever the element makes of it.
+ *
+ * `value` is a string on an input and a *number* on `<li>`, `<meter>` and `<progress>`, and `??` does not catch 0. So `(el.value ?? '').toLowerCase()` threw on the first clickable list item, which on a shop's results page is every product card, and `find` by text alone failed outright. A custom element can make the getter return anything, or throw. This reads it as a string or not at all.
+ */
+export function stringProp(el: Element, prop: 'value' | 'placeholder'): string {
+  try {
+    const v = (el as unknown as Record<string, unknown>)[prop];
+    return typeof v === 'string' ? v : v == null ? '' : String(v);
+  } catch {
+    return '';
+  }
+}
+
 const INTERACTIVE_TAGS = new Set([
   'A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'DETAILS', 'SUMMARY',
 ]);
@@ -431,8 +445,8 @@ export function findElements(query: string, role?: string, selector?: string): F
 
     const name = getAccessibleName(el);
     const text = (el.textContent ?? '').toLowerCase();
-    const value = ((el as HTMLInputElement).value ?? '').toLowerCase();
-    const placeholder = ((el as HTMLInputElement).placeholder ?? '').toLowerCase();
+    const value = stringProp(el, 'value').toLowerCase();
+    const placeholder = stringProp(el, 'placeholder').toLowerCase();
 
     const matches = name.toLowerCase().includes(lowerQuery) ||
       text.includes(lowerQuery) ||
@@ -503,11 +517,20 @@ interface Locator {
 
 const locators = new Map<number, Locator>();
 
+/**
+ * What identifies an element for recovery: its accessible name, or for a field with none, its placeholder or id.
+ *
+ * An input with a placeholder has no accessible name here (the snapshot shows the placeholder separately), so a pincode box and a search box both recorded as "textbox, no name" and a stale ref to one was recovered as the other: that is how typing into a replaced pincode field cleared a different field instead of failing. The placeholder tells them apart.
+ */
+function locatorName(el: Element): string {
+  return getAccessibleName(el) || stringProp(el, 'placeholder') || el.id || '';
+}
+
 function recordLocator(ref: number, el: Element): void {
   const role = getRole(el) ?? 'generic';
-  const name = getAccessibleName(el);
+  const name = locatorName(el);
   const peers = Array.from(deepQueryAll(el.tagName.toLowerCase())).filter(
-    (c) => (getRole(c) ?? 'generic') === role && getAccessibleName(c) === name,
+    (c) => (getRole(c) ?? 'generic') === role && locatorName(c) === name,
   );
   locators.set(ref, { role, name, tag: el.tagName.toLowerCase(), nth: Math.max(0, peers.indexOf(el)) });
 }
@@ -515,14 +538,14 @@ function recordLocator(ref: number, el: Element): void {
 /**
  * Re-finds an element whose ref went stale, by matching the recorded locator.
  * Returns undefined rather than guessing when nothing matches convincingly —
- * clicking the wrong element is far worse than reporting a miss.
+ * clicking the wrong element is far worse than reporting a miss. An element with no name of any kind is never recovered: "the third unnamed button" is a guess, and the agent is better served by a stale-ref error and a fresh snapshot.
  */
 export function recoverRef(ref: number): Element | undefined {
   const loc = locators.get(ref);
-  if (!loc) return undefined;
+  if (!loc || !loc.name) return undefined;
 
   const candidates = deepQueryAll(loc.tag).filter(
-    (el) => (getRole(el) ?? 'generic') === loc.role && getAccessibleName(el) === loc.name,
+    (el) => (getRole(el) ?? 'generic') === loc.role && locatorName(el) === loc.name,
   );
   if (candidates.length === 0) return undefined;
 

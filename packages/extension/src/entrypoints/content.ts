@@ -1,5 +1,6 @@
 import { defineContentScript } from 'wxt/utils/define-content-script';
 import { CommandExecutor } from '../core/command-executor.js';
+import { errorCodeOf } from '../core/errors.js';
 
 export default defineContentScript({
   matches: ['<all_urls>'],
@@ -31,12 +32,15 @@ export default defineContentScript({
           });
         })
         .catch((err: Error) => {
+          // The code is set from the error's class, never from its text, so a page that throws words of its own choosing from a getter cannot present its failure as one of ours.
+          const errorCode = errorCodeOf(err);
           sendResponse({
             type: 'result',
             id,
             success: false,
             data: null,
-            error: err.message,
+            error: err?.message ?? String(err),
+            ...(errorCode ? { errorCode } : {}),
             timing: Math.round(performance.now() - start),
           });
         });

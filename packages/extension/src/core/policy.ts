@@ -97,6 +97,10 @@ export interface Policy {
   denylist: string[];
   /** Minutes of inactivity after which control mode revokes itself. 0 = never. */
   idleRevokeMinutes: number;
+  /**
+   * Kinds of personal data to blank out of page text before it reaches the agent (`REDACTION_KINDS`). Applied by the MCP server at its untrusted fence, which is the one place every tool's page text passes through; the extension only carries the choice. Absent on policies saved before the field, which means none.
+   */
+  redact?: string[];
 }
 
 export const DEFAULT_POLICY: Policy = {
@@ -104,6 +108,7 @@ export const DEFAULT_POLICY: Policy = {
   allowlist: [],
   denylist: [],
   idleRevokeMinutes: 30,
+  redact: [],
 };
 
 /** Minutes before yolo drops back to auto on its own. */

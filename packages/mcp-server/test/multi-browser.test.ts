@@ -54,8 +54,8 @@ describe('two browsers, one agent', () => {
   let b: Session;
 
   it('pairs both, each under its own record, and keeps both connected', async () => {
-    a = await openSession({ installId: A });
-    b = await openSession({ installId: B });
+    a = await openSession({ installId: A, announce: false });
+    b = await openSession({ installId: B, announce: false });
     open.push(a, b);
     a.onCommand(() => ({ url: 'https://browser-a.example/', title: 'A' }));
     b.onCommand(() => ({ url: 'https://browser-b.example/', title: 'B' }));
@@ -151,8 +151,8 @@ describe('the browser the user picks', () => {
 
   it('tells the browser that had control when the user gives it to another', async () => {
     const heard: string[] = [];
-    const first = await openSession({ installId: '3'.repeat(32), onServerMessage: (m) => heard.push(m.type) });
-    const second = await openSession({ installId: '4'.repeat(32) });
+    const first = await openSession({ installId: '3'.repeat(32), onServerMessage: (m) => heard.push(m.type), announce: false });
+    const second = await openSession({ installId: '4'.repeat(32), announce: false });
     open.push(first, second);
     await first.emit({ type: 'ready', version: '0.5.0', controlMode: true });
     await sleep(100);

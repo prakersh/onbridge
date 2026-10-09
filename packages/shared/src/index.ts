@@ -11,9 +11,14 @@ export type {
   ExtensionMessage,
   CommandAction,
   ConsoleDeltaEntry,
+  ExtensionFeature,
+  RedactionKind,
 } from './protocol.js';
 export {
   ALL_COMMAND_ACTIONS,
+  EXTENSION_FEATURES,
+  REDACTION_KINDS,
+  CLOSE_BY_EXTENSION,
   WS_PORT,
   WS_PORT_RANGE,
   HEARTBEAT_INTERVAL_MS,
