@@ -1,5 +1,6 @@
 import { defineBackground } from 'wxt/utils/define-background';
-import { ALL_COMMAND_ACTIONS } from '@onbridge/shared';
+import { ALL_COMMAND_ACTIONS, EXTENSION_FEATURES } from '@onbridge/shared';
+import { RefNotFoundError, WaitTimeoutError, errorFromCode } from '../core/errors.js';
 import type {
   ServerMessage,
   ExtensionMessage,
@@ -24,6 +25,7 @@ import {
   describeScope,
   type AgentSession,
   type SessionScope,
+  type RememberedGrant,
 } from '../core/connection-manager.js';
 import {
   CdpUnavailable,
@@ -158,9 +160,12 @@ export default defineBackground(() => {
   type ScopeKind = 'tab' | 'window' | 'all';
   let preferredScope: ScopeKind = 'window';
 
+  /** Where grants wait out a worker restart. Session storage: cleared when the browser closes, never written to disk. */
+  const GRANTS_KEY = 'onbridge_grants';
+
   chrome.storage.local.get(
     ['controlMode', 'preferredScope', 'policy', 'controlEnabledAt', 'pairBlocked', 'lastCommandAt'],
-    (result) => {
+    async (result) => {
       if (result.preferredScope) preferredScope = result.preferredScope as ScopeKind;
       if (typeof result.lastCommandAt === 'number') lastCommandAt = result.lastCommandAt;
       if (result.policy) {
@@ -180,6 +185,13 @@ export default defineBackground(() => {
         // actually enabled control mode.
         controlEnabledAt = typeof result.controlEnabledAt === 'number' ? result.controlEnabledAt : 0;
         pairBlocked = (result.pairBlocked as typeof pairBlocked) ?? null;
+        // Grants made before this worker was restarted, so the agent gets its window back without the user pressing anything. Loaded before the first sweep, which is what restores them.
+        try {
+          const stored = await chrome.storage.session?.get(GRANTS_KEY);
+          manager.seedGrants(stored?.[GRANTS_KEY] as Record<string, RememberedGrant> | undefined);
+        } catch {
+          /* no session storage: grants last as long as the worker, as before */
+        }
         manager.start();
         syncToolbarIcon();
       }
@@ -221,7 +233,12 @@ export default defineBackground(() => {
     try {
       windowId = (await chrome.tabs.get(tabId)).windowId;
     } catch {
-      throw new Error(`Tab ${tabId} no longer exists.`);
+      // Ours to say, not the page's: a closed tab is a fact the agent should hear plainly, with its next step.
+      throw refusal(
+        scope.kind === 'tab' && scope.tabId === tabId
+          ? `Tab ${tabId}, the one this agent was given, has been closed. Ask the user to give this agent control again, of a tab or a window.`
+          : `Tab ${tabId} no longer exists. Call list_tabs for the tabs that do.`,
+      );
     }
 
     if (!scopeAllows(scope, tabId, windowId!)) {
@@ -420,7 +437,18 @@ export default defineBackground(() => {
       version: chrome.runtime.getManifest().version,
       controlMode: true,
       actions: [...ALL_COMMAND_ACTIONS],
+      features: [...EXTENSION_FEATURES],
     });
+    sendPreferences(id);
+  }
+
+  /**
+   * Tells a server, or every connected one, what the user chose in the panel for it to apply. Its own message rather than another `ready`: `ready` also means "this browser granted control", and repeating it for a settings change would move control around.
+   */
+  function sendPreferences(id?: string): void {
+    const msg = { type: 'preferences' as const, redact: policy.redact ?? [] };
+    const targets = id ? [id] : manager.list().filter((s) => s.status === 'active' || s.status === 'on_hold').map((s) => s.id);
+    for (const target of targets) void manager.send(target, msg);
   }
 
   /**
@@ -441,6 +469,9 @@ export default defineBackground(() => {
     onCommand: (session, msg) => void onServerMessage(session, msg),
     onGranted: (id) => sendReady(id),
     onConnected: (session) => grantOnConnect(session),
+    onGrantsChanged: (grants) => {
+      void chrome.storage.session?.set({ [GRANTS_KEY]: grants }).catch(() => {});
+    },
     onChange: () => {
       updateBadge(manager.hasActive() ? 'on' : controlMode ? 'off' : 'disabled');
     },
@@ -502,12 +533,15 @@ export default defineBackground(() => {
         success: false,
         data: null,
         error: errorMsg,
-        // Anything not deliberately marked is assumed to carry page text.
-        ...(err instanceof TrustedError ? { errorKind: 'trusted' as const } : {}),
+        // Anything not deliberately marked is assumed to carry page text. A stale ref and a wait timeout are ours too: recognised by class, which the content script carried as a code, never by wording.
+        ...(err instanceof TrustedError || err instanceof RefNotFoundError || err instanceof WaitTimeoutError
+          ? { errorKind: 'trusted' as const }
+          : {}),
         // A code is a claim about provenance as much as about kind, so it only
         // ever rides on an error onbridge composed. RetryableError extends
         // TrustedError, so the two always travel together.
         ...(err instanceof UnsupportedActionError ? { errorCode: err.code } : {}),
+        ...(err instanceof RefNotFoundError || err instanceof WaitTimeoutError ? { errorCode: err.code } : {}),
         ...(err instanceof RetryableError
           ? { errorCode: err.code, retryAfterMs: err.retryAfterMs }
           : {}),
@@ -528,10 +562,11 @@ export default defineBackground(() => {
     updateBadge('on');
   }
 
-  function disconnect() {
+  /** Ends every connection. `reason` reaches each agent's server in the close frame, so the agent is told why rather than seeing a bare disconnect. */
+  function disconnect(reason: string) {
     resolveAllPairing(false);
     resolveAsk(null); // never leave the agent blocked on a dead channel
-    manager.stop();
+    manager.stop(reason);
     // Release the debugger so Chrome drops the "onbridge is debugging this
     // browser" banner the moment control mode ends.
     detachAll();
@@ -661,42 +696,68 @@ export default defineBackground(() => {
     // ref space.
     const targetTabId = tabId;
     let frameId = 0;
-    if (targetTabId) {
-      const localised = localiseRefs(params, targetTabId);
-      params = localised.params;
-      frameId = localised.frameId;
-    }
-
-    await enforcePolicy(action, params, tabId, frameId);
-
-    // Substitute {{secret:…}} placeholders last, after policy and after the
-    // activity log has already recorded the command. The agent wrote the
-    // placeholder, the panel and the log show the placeholder, and only the
-    // value that goes on the wire to the page is real — so the secret exists in
-    // exactly one place it has to and nowhere else. Bound to the page's origin:
-    // a placeholder on the wrong site does not resolve.
-    params = await substituteSecrets(action, params, targetTabId);
-
-    // Where the tab sat before this command ran.
-    //
-    // Checking the destination the agent *named* covers `navigate` and friends,
-    // and misses the commonest ways a browser actually moves: clicking a link,
-    // pressing Enter in a form, `evaluate` assigning `location`. The domain
-    // lists have to hold however the browser got somewhere, so the outcome is
-    // checked too — see `guardNavigationOutcome`.
-    const urlBefore = targetTabId
-      ? ((await chrome.tabs.get(targetTabId).catch(() => null))?.url ?? '')
-      : '';
-    const startedAt = Date.now();
-
     try {
-      return await dispatchCommand(session, action, params, tabId, frameId);
-    } finally {
-      // Deliberately in `finally`: an action that navigated somewhere blocked
-      // and then failed for its own reasons still left the browser there, and a
-      // refusal is the more important of the two outcomes to report.
-      await guardNavigationOutcome(targetTabId, urlBefore, action, startedAt);
+      if (targetTabId) {
+        const localised = localiseRefs(params, targetTabId);
+        params = localised.params;
+        frameId = localised.frameId;
+      }
+
+      await enforcePolicy(action, params, tabId, frameId);
+
+      // Substitute {{secret:…}} placeholders last, after policy and after the
+      // activity log has already recorded the command. The agent wrote the
+      // placeholder, the panel and the log show the placeholder, and only the
+      // value that goes on the wire to the page is real — so the secret exists in
+      // exactly one place it has to and nowhere else. Bound to the page's origin:
+      // a placeholder on the wrong site does not resolve.
+      params = await substituteSecrets(action, params, targetTabId);
+
+      // Where the tab sat before this command ran.
+      //
+      // Checking the destination the agent *named* covers `navigate` and friends,
+      // and misses the commonest ways a browser actually moves: clicking a link,
+      // pressing Enter in a form, `evaluate` assigning `location`. The domain
+      // lists have to hold however the browser got somewhere, so the outcome is
+      // checked too — see `guardNavigationOutcome`.
+      const urlBefore = targetTabId
+        ? ((await chrome.tabs.get(targetTabId).catch(() => null))?.url ?? '')
+        : '';
+      const startedAt = Date.now();
+
+      try {
+        return await dispatchCommand(session, action, params, tabId, frameId);
+      } finally {
+        // Deliberately in `finally`: an action that navigated somewhere blocked
+        // and then failed for its own reasons still left the browser there, and a
+        // refusal is the more important of the two outcomes to report.
+        await guardNavigationOutcome(targetTabId, urlBefore, action, startedAt);
+      }
+    } catch (err) {
+      // A stale ref is reported by the number the agent knows. Below this point refs are frame-local, and a content script or CDP names those; the agent has never seen them.
+      if (err instanceof RefNotFoundError && !/^Refs? \d/.test(err.message)) {
+        const named = refsNamedBy(rawParams);
+        if (named.length) {
+          throw new RefNotFoundError(
+            `Ref${named.length === 1 ? '' : 's'} ${named.join(', ')} no longer name${named.length === 1 ? 's' : ''} anything on the page: ` +
+              'the element was replaced or removed since the ref was issued. Nothing was done. Take a fresh snapshot or find and use the refs it returns.',
+          );
+        }
+      }
+      throw err;
     }
+  }
+
+  /** Every ref a command names, as the agent wrote them. */
+  function refsNamedBy(params: Record<string, unknown>): number[] {
+    const out: number[] = [];
+    for (const key of ['ref', 'fromRef', 'toRef', 'target']) {
+      if (typeof params[key] === 'number') out.push(params[key] as number);
+    }
+    if (Array.isArray(params.fields)) {
+      for (const f of params.fields as Array<{ ref?: unknown }>) if (typeof f?.ref === 'number') out.push(f.ref);
+    }
+    return out;
   }
 
   /**
@@ -897,9 +958,29 @@ export default defineBackground(() => {
       case 'drag':
       case 'evaluate':
         return handleTrustedAction(action, params, tabId, frameId);
+      // A wait with something to wait for runs in the page. A wait with nothing to wait for means "until the page has loaded", which only this side can judge: the content script is torn down with the old document and cannot see the tab's load state.
+      case 'wait':
+        if (params.text || params.textGone || params.selector) return routeToContentScript(action, params, tabId, frameId);
+        return handleWaitForLoad(params as { timeout?: number }, tabId);
       default:
         return routeToContentScript(action, params, tabId, frameId);
     }
+  }
+
+  /**
+   * Waits for the tab to finish loading and for its DOM to stop changing, within the budget. Never fails on timeout: "still changing" is reported as `loaded: false`, and the agent reads the page as it is.
+   */
+  async function handleWaitForLoad(
+    params: { timeout?: number },
+    tabId?: number,
+  ): Promise<{ success: true; elapsed: number; loaded: boolean }> {
+    if (!tabId) throw new Error('No active tab found');
+    const budget = Math.max(0, Number(params.timeout) || 10_000);
+    const start = Date.now();
+    await waitForTabQuiet(tabId, budget);
+    const complete = (await chrome.tabs.get(tabId).catch(() => null))?.status === 'complete';
+    const settled = complete && (await settleDom(tabId, Math.max(0, budget - (Date.now() - start))));
+    return { success: true, elapsed: Date.now() - start, loaded: settled };
   }
 
   /**
@@ -928,9 +1009,46 @@ export default defineBackground(() => {
   const reverseRefsByTab = new Map<number, Map<string, number>>();
   let globalRefCounter = 0;
 
+  /**
+   * The frame and local number behind a ref the agent holds, or a stale-ref refusal.
+   *
+   * There is no guessing here any more. The old fallback, "top frame, same number", was taken whenever a ref was unknown, which is exactly the case of a ref from before a navigation or from another tab: it resolved to whatever element had that number in the current document, and the agent acted on it with no error anywhere. A ref from another tab is named as such, because the agent most likely meant to pass `tabId`.
+   */
   function resolveRef(tabId: number, ref: number): FrameRef {
-    return frameRefsByTab.get(tabId)?.get(ref) ?? { frameId: 0, localRef: ref };
+    const hit = frameRefsByTab.get(tabId)?.get(ref);
+    if (hit) return hit;
+    for (const [otherTab, map] of frameRefsByTab) {
+      if (otherTab !== tabId && map.has(ref)) {
+        throw new RefNotFoundError(
+          `Ref ${ref} belongs to tab ${otherTab}, not tab ${tabId}. Pass tabId: ${otherTab} to act there, or take a snapshot of tab ${tabId} and use its refs.`,
+        );
+      }
+    }
+    throw new RefNotFoundError(
+      `Ref ${ref} is not on tab ${tabId} any more: the tab has loaded a new document since it was issued, or it was never issued. Take a fresh snapshot or find and use the refs it returns.`,
+    );
   }
+
+  // A new document numbers its refs from 1 again, so the old document's mappings would make an old ref resolve to the new document's element of the same number. Dropped as the navigation commits; a frame that navigates on its own drops only its own.
+  chrome.webNavigation.onCommitted.addListener((d) => {
+    if (d.frameId === 0) {
+      frameRefsByTab.delete(d.tabId);
+      reverseRefsByTab.delete(d.tabId);
+      return;
+    }
+    const forward = frameRefsByTab.get(d.tabId);
+    const reverse = reverseRefsByTab.get(d.tabId);
+    if (!forward || !reverse) return;
+    for (const [global, fr] of forward) {
+      if (fr.frameId !== d.frameId) continue;
+      forward.delete(global);
+      reverse.delete(`${fr.frameId}:${fr.localRef}`);
+    }
+  });
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    frameRefsByTab.delete(tabId);
+    reverseRefsByTab.delete(tabId);
+  });
 
   /** The global ref for a frame-local one, minting a new one if needed. */
   function globalRefFor(tabId: number, frameId: number, localRef: number): number {
@@ -1010,21 +1128,15 @@ export default defineBackground(() => {
     return { params: out, frameId: frames.values().next().value ?? 0 };
   }
 
-  /** Rewrites a captured subtree's refs into the global namespace. */
-  function remapTree(
-    nodes: DomNode[],
-    frameId: number,
-    map: Map<number, FrameRef>,
-    reverse: Map<string, number>,
-  ): void {
+  /**
+   * Rewrites a captured subtree's refs into the global namespace.
+   *
+   * Through `globalRefFor`, so an element keeps its number from one capture to the next. Minting afresh on every capture, as this used to, renumbered the whole page each time: a ref from the previous snapshot then named whatever element had its number now, and the agent typed into the wrong field without any error to tell it so. The content script already keeps local numbers stable for elements that survive; this keeps the global ones stable with them.
+   */
+  function remapTree(nodes: DomNode[], frameId: number, tabId: number): void {
     for (const node of nodes) {
-      if (node.ref != null) {
-        globalRefCounter++;
-        map.set(globalRefCounter, { frameId, localRef: node.ref });
-        reverse.set(`${frameId}:${node.ref}`, globalRefCounter);
-        node.ref = globalRefCounter;
-      }
-      if (node.children) remapTree(node.children, frameId, map, reverse);
+      if (node.ref != null) node.ref = globalRefFor(tabId, frameId, node.ref);
+      if (node.children) remapTree(node.children, frameId, tabId);
     }
   }
 
@@ -1046,10 +1158,7 @@ export default defineBackground(() => {
       targetTabId,
       0,
     )) as PageSnapshot;
-    const map = new Map<number, FrameRef>();
-    const reverse = new Map<string, number>();
-    globalRefCounter = 0;
-    remapTree(snap.tree, 0, map, reverse);
+    remapTree(snap.tree, 0, targetTabId);
 
     let frames: chrome.webNavigation.GetAllFrameResultDetails[] = [];
     try {
@@ -1076,7 +1185,7 @@ export default defineBackground(() => {
           frame.frameId,
         )) as PageSnapshot;
         if (!sub?.tree?.length) continue;
-        remapTree(sub.tree, frame.frameId, map, reverse);
+        remapTree(sub.tree, frame.frameId, targetTabId);
         snap.tree.push({ role: 'iframe', name: sub.title || frame.url, children: sub.tree });
       } catch {
         // A frame with no injected script (cross-origin restrictions, sandboxed)
@@ -1084,8 +1193,6 @@ export default defineBackground(() => {
       }
     }
 
-    frameRefsByTab.set(targetTabId, map);
-    reverseRefsByTab.set(targetTabId, reverse);
     return snap;
   }
 
@@ -1296,15 +1403,32 @@ export default defineBackground(() => {
 
     try {
       switch (action) {
-        case 'type':
-          await trusted.typeText(
+        case 'type': {
+          const wanted = String(params.text ?? '');
+          // Enter is pressed below, after the field has been checked, so a submit never goes out on an empty field.
+          const typed = await trusted.typeText(
             targetTabId,
             params.ref as number,
-            String(params.text ?? ''),
-            { clear: Boolean(params.clear), submit: Boolean(params.submit) },
+            wanted,
+            { clear: Boolean(params.clear), submit: false },
             frameId,
           );
-          return await withNav({ success: true, trusted: true });
+          let value = typed.value;
+          let fallback = false;
+          // Real keystrokes that left the field empty: the page rejected them, or the click to focus landed beside the field. Setting the value directly, as fill_form does, is the other way in; an empty field is the one case where trying it cannot double up what is there.
+          if (value === '' && wanted) {
+            await routeToContentScript('type', { ...params, submit: false }, targetTabId, frameId);
+            fallback = true;
+            value = (await trusted.fieldValue(targetTabId, params.ref as number, frameId).catch(() => undefined)) ?? value;
+          }
+          if (params.submit) await trusted.pressKey(targetTabId, 'Enter', [], typed.world);
+          return await withNav({
+            success: true,
+            trusted: !fallback,
+            ...(value != null ? { value } : {}),
+            ...(fallback ? { fallback: true } : {}),
+          });
+        }
 
         case 'hover':
           await trusted.hover(targetTabId, params.ref as number, frameId);
@@ -1480,16 +1604,18 @@ export default defineBackground(() => {
    * read at all — no content script, a restricted page — spending the budget
    * buys nothing.
    */
-  async function settleDom(tabId: number): Promise<void> {
-    const deadline = Date.now() + DOM_QUIET_BUDGET_MS;
+  async function settleDom(tabId: number, budgetMs = DOM_QUIET_BUDGET_MS): Promise<boolean> {
+    const deadline = Date.now() + budgetMs;
     let previous = await domSignature(tabId);
-    if (previous == null) return;
+    if (previous == null) return false;
     while (Date.now() < deadline) {
       await sleep(DOM_QUIET_SAMPLE_MS);
       const current = await domSignature(tabId);
-      if (current == null || current === previous) return;
+      if (current == null) return false;
+      if (current === previous) return true;
       previous = current;
     }
+    return false;
   }
 
   /**
@@ -1838,7 +1964,8 @@ export default defineBackground(() => {
           if (response.success) {
             resolve(response.data);
           } else {
-            reject(new Error(response.error ?? 'Command failed'));
+            // The code, set by the content script from the error's class, is what makes a stale ref or a wait timeout ours to report; the text alone never does.
+            reject(errorFromCode(response.errorCode, response.error ?? 'Command failed'));
           }
         },
       );
@@ -2420,6 +2547,8 @@ export default defineBackground(() => {
       // cannot be reached by a subresource request the navigation guards never
       // see (`fetch` inside `evaluate`).
       setBlockedUrlPatterns(blockedUrlPatterns(policy));
+      // The redaction choice is applied by each agent's server; tell them all.
+      sendPreferences();
       sendResponse({ ok: true, policy });
       return true;
     }
@@ -2588,7 +2717,7 @@ export default defineBackground(() => {
 
     if (message?.type === 'clear_pairings') {
       clearPairings().then(() => {
-        disconnect();
+        disconnect('the user cleared every pairing in the OnBridge panel; it will ask to pair again');
         // `disconnect()` stops the sweep, so without restarting it the panel
         // would sit on "Looking for agents…" with nothing actually looking.
         // Re-arm discovery if control mode is still on; agents will have to be
@@ -2618,7 +2747,7 @@ export default defineBackground(() => {
         controlEnabledAt = 0;
         pairBlocked = null;
         rememberPairingWindow();
-        disconnect();
+        disconnect('the user turned Control Mode off in the OnBridge panel');
       }
       sendResponse({ ok: true });
       return true;
@@ -2689,7 +2818,7 @@ export default defineBackground(() => {
     controlEnabledAt = 0;
     pairBlocked = null;
     rememberPairingWindow();
-    disconnect();
+    disconnect(`Control Mode turned itself off after ${policy.idleRevokeMinutes} minutes without agent activity`);
     void chrome.notifications
       ?.create({
         type: 'basic',

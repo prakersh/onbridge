@@ -31,6 +31,7 @@ import {
   toB64,
   verifyProof,
   ReplayGuard,
+  CLOSE_BY_EXTENSION,
 } from '@onbridge/shared';
 import type {
   AgentIdentity,
@@ -505,7 +506,7 @@ export class SecureClient {
    * Closes the socket and permanently retires this client. `disposed` is what
    * stops a late callback from a client the manager already replaced.
    */
-  disconnect(): void {
+  disconnect(reason?: string): void {
     this.disposed = true;
     // Close whichever socket exists — the ready one, or one still mid-handshake.
     // Leaving a handshake socket open holds the server's single-client slot and
@@ -521,7 +522,9 @@ export class SecureClient {
     this.state = 'idle';
     for (const ws of sockets) {
       try {
-        ws?.close();
+        // A deliberate close says why, so the server can tell the agent "the user turned Control Mode off" instead of the same "not connected" it gives for a crash. A reason is capped at 123 bytes by the protocol.
+        if (reason) ws?.close(CLOSE_BY_EXTENSION, reason.slice(0, 120));
+        else ws?.close();
       } catch {
         /* already closed */
       }

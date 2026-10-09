@@ -11,6 +11,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  ALL_COMMAND_ACTIONS,
+  EXTENSION_FEATURES,
   HANDSHAKE_VERSION,
   PROOF_PAIR,
   PROOF_AUTH_EXT,
@@ -156,8 +158,8 @@ export function connect(origin?: string): Promise<WebSocket> {
 /** A paired, encrypted channel with the command loop running. */
 export interface Session {
   ws: WebSocket;
-  /** Registers the handler invoked for each command the server sends. */
-  onCommand(fn: (action: string, params: any) => unknown | Promise<unknown>): void;
+  /** Registers the handler invoked for each command the server sends. `tabId` is the tab the command names, when it names one. */
+  onCommand(fn: (action: string, params: any, tabId?: number) => unknown | Promise<unknown>): void;
   /** Pushes an unsolicited extension->server event. */
   emit(msg: ExtensionMessage): Promise<void>;
   close(): Promise<void>;
@@ -169,6 +171,7 @@ export interface Session {
 /**
  * `installId` plays one browser profile's copy of the extension; omitted, the peer is an extension too old to send one. Stored pairings are kept per install, as each profile keeps its own.
  * `approve` plays the user at the pairing prompt: the pairing is confirmed when it resolves (immediately when omitted). `onSocket` hands over the socket before the handshake finishes, and `onServerMessage` sees every non-command message the server sends once connected.
+ * `announce` (default true) sends the `ready` a current extension sends on a grant, with its action list and features, as soon as the channel is up. Without it the server takes the peer for an extension from before those fields: in particular it then refuses refs issued before the latest capture on the extension's behalf, so a test that passes refs it never obtained has to announce. Tests that exercise `ready` itself, or play an older extension, pass false.
  */
 export async function openSession(
   opts: {
@@ -176,6 +179,7 @@ export async function openSession(
     approve?: Promise<unknown>;
     onSocket?: (ws: WebSocket) => void;
     onServerMessage?: (msg: ServerMessage) => void;
+    announce?: boolean;
   } = {},
 ): Promise<Session> {
   const slot = (serverId: string) => `${opts.installId ?? ''}|${serverId}`;
@@ -184,7 +188,7 @@ export async function openSession(
   const kp = await generateEphemeralKeyPair();
   const eNonce = toB64(randomBytes(16));
   let tx = 0;
-  let handler: ((action: string, params: any) => unknown | Promise<unknown>) | null = null;
+  let handler: ((action: string, params: any, tabId?: number) => unknown | Promise<unknown>) | null = null;
 
   const st: Record<string, any> = {};
   let ready!: () => void;
@@ -268,7 +272,7 @@ export async function openSession(
       if (msg.type === 'command') {
         const start = Date.now();
         try {
-          const data = await handler?.(msg.action, msg.params);
+          const data = await handler?.(msg.action, msg.params, msg.tabId);
           await sendSealed(st.sessionKey, {
             type: 'result',
             id: msg.id,
@@ -312,6 +316,16 @@ export async function openSession(
   );
 
   await readyPromise;
+
+  if (opts.announce !== false) {
+    await sendSealed(st.sessionKey, {
+      type: 'ready',
+      version: '0.0.0-test',
+      controlMode: true,
+      actions: [...ALL_COMMAND_ACTIONS],
+      features: [...EXTENSION_FEATURES],
+    });
+  }
 
   return {
     ws,

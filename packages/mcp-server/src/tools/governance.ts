@@ -39,7 +39,7 @@ export function registerGovernanceTools(server: McpServer, bridge: Bridge): void
         }
         return text(bridge, `The user answered: ${data.answer}`);
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -90,13 +90,18 @@ export function registerGovernanceTools(server: McpServer, bridge: Bridge): void
             denylist.length ? `Blocked sites: ${denylist.join(', ')}` : '',
             `Automation: ${data.paused ? 'PAUSED by the user' : 'active'}`,
             data.degraded ? `Input fidelity: DEGRADED (${data.degraded})` : '',
+            // Which of the agent-facing improvements this extension carries. The server fills in for each one it lacks, but an agent that keeps hitting the fallbacks should be able to tell the user why.
+            bridge.hasFeature('stable-refs')
+              ? 'Refs: stable across snapshots; an outdated ref is refused as [stale-ref].'
+              : 'Refs: renumbered by this extension on every page capture, so only refs from the latest page view are accepted. Updating the extension makes them stable.',
+            bridge.redactions().length ? `Redacted from page text: ${bridge.redactions().join(', ')}` : '',
             `Commands this session: ${data.commandCount ?? 0}`,
           ]
             .filter(Boolean)
             .join('\n'),
         );
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );

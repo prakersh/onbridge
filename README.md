@@ -362,6 +362,7 @@ Key properties:
 | `ONBRIDGE_CONNECT` | Set to `startup` to connect to the browser as soon as the agent starts, instead of on its first use of OnBridge. |
 | `ONBRIDGE_AGENT_NAME` | The name shown in the pairing prompt, if you want something other than the one your agent reports. |
 | `ONBRIDGE_HOME` | Where pairing records are kept, instead of `~/.onbridge`. |
+| `ONBRIDGE_REDACT` | Blank personal data out of page text before the agent sees it: `1` for phone numbers, email addresses and card numbers, or a comma-separated list of `phone`, `email`, `card`. The same can be turned on in the extension's panel. |
 
 <details>
 <summary><b>Installing the extension from source</b></summary>

@@ -3,7 +3,17 @@ import { z } from 'zod';
 import { serializeSnapshot, serializeFindResults } from '@onbridge/shared';
 import type { PageSnapshot, FindResult, ExtractTextResult } from '@onbridge/shared';
 import type { Bridge } from '../bridge.js';
+import { isTrustedError } from '../bridge.js';
 import { text, pageText, image, error, notConnected, recordView } from './reply.js';
+import { tabIdParam } from './common.js';
+
+/**
+ * The crash an older extension's `find` has on a text-only search.
+ *
+ * It lower-cases every ref'd element's `value`, and for `<li>`, `<meter>` and `<progress>` that is a number, so the first clickable list item on the page throws `toLowerCase is not a function` and the whole search fails. A role or selector filter skips those elements before the crash, which is why those variants worked. Matching the wording here grants nothing: it only decides to retry a read-only search with a selector that leaves those elements out, and the retry's results are fenced like any other page text.
+ */
+const OLD_FIND_CRASH = /toLowerCase is not a function/i;
+const FIND_WITHOUT_NUMERIC_VALUES = '*:not(li):not(meter):not(progress)';
 
 export function registerObservationTools(server: McpServer, bridge: Bridge): void {
   server.registerTool(
@@ -20,18 +30,19 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
         target: z.number().optional().describe('Ref number to scope snapshot to a subtree'),
         depth: z.number().optional().describe('Max nesting depth to capture'),
         compact: z.boolean().optional().describe('Compact mode: skip nav/footer/ads, show only main content. Reduces snapshot size by ~70% on e-commerce sites.'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ target, depth, compact }) => {
+    async ({ target, depth, compact, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = (await bridge.sendCommand('snapshot', { target, depth, compact })) as PageSnapshot;
+        const data = (await bridge.sendCommand('snapshot', { target, depth, compact }, tabId)) as PageSnapshot;
         const page = serializeSnapshot(data);
         // A scoped snapshot is not the whole page, so later changes are never described against it.
         if (target != null) return pageText(bridge, page);
         return pageText(bridge, page, `This is page view ${recordView(bridge, data?.url ?? '', page)}.`);
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -47,15 +58,34 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
         text: z.string().optional().describe('Text to search for (case-insensitive substring match)'),
         role: z.string().optional().describe('Filter by element role (button, link, textbox, etc)'),
         selector: z.string().optional().describe('CSS selector to match elements'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ text: searchText, role, selector }) => {
+    async ({ text: searchText, role, selector, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = (await bridge.sendCommand('find', { text: searchText, role, selector })) as FindResult[];
+        const data = (await bridge.sendCommand('find', { text: searchText, role, selector }, tabId)) as FindResult[];
         return pageText(bridge, serializeFindResults(data));
       } catch (err) {
-        return error(err);
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isTrustedError(err) || !OLD_FIND_CRASH.test(msg) || role || selector) return error(err, bridge);
+        // Once more without the elements that crash it. List items are the price; the agent is told.
+        try {
+          const data = (await bridge.sendCommand(
+            'find',
+            { text: searchText, selector: FIND_WITHOUT_NUMERIC_VALUES },
+            tabId,
+          )) as FindResult[];
+          return pageText(
+            bridge,
+            serializeFindResults(data),
+            `This browser extension${bridge.getExtensionVersion() ? ` (v${bridge.getExtensionVersion()})` : ''} cannot ` +
+              'search list items by text, so they were left out of this search; everything else was searched. ' +
+              'Updating the extension fixes it. Use dom_query with a selector to reach list items meanwhile.',
+          );
+        } catch (again) {
+          return error(again, bridge);
+        }
       }
     },
   );
@@ -67,15 +97,16 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       inputSchema: z.object({
         fullPage: z.boolean().optional().describe('Capture the full scrollable page'),
         quality: z.number().optional().describe('JPEG quality 0-100 (default 60)'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ fullPage, quality }) => {
+    async ({ fullPage, quality, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = (await bridge.sendCommand('screenshot', { fullPage, quality })) as { base64: string };
+        const data = (await bridge.sendCommand('screenshot', { fullPage, quality }, tabId)) as { base64: string };
         return image(bridge, data.base64);
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -86,15 +117,16 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       description: 'Get the full, untruncated text content of an element by its ref number.',
       inputSchema: z.object({
         ref: z.number().describe('Element ref number from snapshot or find'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ ref }) => {
+    async ({ ref, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = (await bridge.sendCommand('get_text', { ref })) as { text: string };
+        const data = (await bridge.sendCommand('get_text', { ref }, tabId)) as { text: string };
         return pageText(bridge, data.text);
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -110,15 +142,16 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
         ref: z.number().optional().describe('Read only this element and its descendants'),
         offset: z.number().optional().describe('Start at this character, to continue where an earlier reply stopped'),
         maxChars: z.number().optional().describe('Characters in one reply (default 20000)'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ ref, offset, maxChars }) => {
+    async ({ ref, offset, maxChars, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
         const start = Math.max(0, Math.floor(offset ?? 0));
         const limit = Math.max(1, Math.floor(maxChars ?? 20_000));
         // The extension reads from the start, so asking it for start + limit and slicing here pages the text with no extension change.
-        const data = (await bridge.sendCommand('extract_text', { ref, maxChars: start + limit })) as ExtractTextResult;
+        const data = (await bridge.sendCommand('extract_text', { ref, maxChars: start + limit }, tabId)) as ExtractTextResult;
 
         // A bare "" used to cover three different answers — the element has no
         // text, the ref names nothing, and the reader failed — and an agent
@@ -166,7 +199,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
             : undefined;
         return pageText(bridge, part, note);
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -177,12 +210,12 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       description:
         'List just the interactive elements on the page — buttons, links, inputs — with their refs, without the surrounding tree. ' +
         'Use it to answer "what can I do here?" when you do not need full page structure. Much smaller than a snapshot.',
-      inputSchema: z.object({}),
+      inputSchema: z.object({ tabId: tabIdParam }),
     },
-    async () => {
+    async ({ tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = (await bridge.sendCommand('list_actions')) as {
+        const data = (await bridge.sendCommand('list_actions', {}, tabId)) as {
           actions: Array<Record<string, unknown>>;
         };
         if (!data.actions?.length) return pageText(bridge, 'No interactive elements found.');
@@ -198,7 +231,7 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
         });
         return pageText(bridge, lines.join('\n'));
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -211,15 +244,16 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
       inputSchema: z.object({
         ref: z.number().describe('Element ref to outline'),
         durationMs: z.number().optional().describe('How long to show it (default 2000)'),
+        tabId: tabIdParam,
       }),
     },
-    async ({ ref, durationMs }) => {
+    async ({ ref, durationMs, tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        await bridge.sendCommand('highlight', { ref, durationMs });
+        await bridge.sendCommand('highlight', { ref, durationMs }, tabId);
         return text(bridge, `Highlighted element ${ref}.`);
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
@@ -228,17 +262,16 @@ export function registerObservationTools(server: McpServer, bridge: Bridge): voi
     'get_url',
     {
       description: 'Get the current page URL and title.',
-      inputSchema: z.object({}),
+      inputSchema: z.object({ tabId: tabIdParam }),
     },
-    async () => {
+    async ({ tabId }) => {
       if (!bridge.isConnected()) return notConnected(bridge);
       try {
-        const data = (await bridge.sendCommand('get_url')) as { url: string; title: string };
+        const data = (await bridge.sendCommand('get_url', {}, tabId)) as { url: string; title: string };
         return pageText(bridge, `${data.title}\n${data.url}`, 'Page-reported title and URL:');
       } catch (err) {
-        return error(err);
+        return error(err, bridge);
       }
     },
   );
 }
-

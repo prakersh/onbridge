@@ -61,6 +61,23 @@ export const ALL_COMMAND_ACTIONS = [
 
 export type CommandAction = (typeof ALL_COMMAND_ACTIONS)[number];
 
+/**
+ * Behaviours an extension announces in `ready.features`, beyond the action list.
+ *
+ * The action list says *which* commands exist; this says how they behave when the difference matters to the server. Each is an optional capability: a server that does not know a name ignores it, and an extension that sends none is treated as having none. Never remove a name once shipped.
+ *
+ * - `stable-refs`: a ref keeps its number across snapshots for as long as its element exists, and an unknown or outdated ref is refused with `ref-not-found` instead of resolving to whatever element has that number now. Without it, every snapshot renumbers from 1, so the server refuses refs issued before the latest snapshot on the extension's behalf.
+ * - `wait-load`: `wait` with no condition waits for the page to finish loading and its DOM to go quiet. Without it the server approximates the same thing by polling.
+ */
+export const EXTENSION_FEATURES = ['stable-refs', 'wait-load'] as const;
+export type ExtensionFeature = (typeof EXTENSION_FEATURES)[number];
+
+/**
+ * What the server can blank out of page text before it reaches the agent, when the user asks (`ONBRIDGE_REDACT`, or the extension's `preferences`). Applied at the untrusted fence, so it covers every tool that returns page text.
+ */
+export const REDACTION_KINDS = ['phone', 'email', 'card'] as const;
+export type RedactionKind = (typeof REDACTION_KINDS)[number];
+
 // MCP Server → Extension
 export type ServerMessage =
   | { type: 'command'; id: string; action: CommandAction; params: Record<string, unknown>; tabId?: number }
@@ -95,11 +112,23 @@ export type ExtensionMessage =
        * The command actions this extension implements. Lets a newer server tell the agent "this needs a newer extension" up front instead of sending a command the extension cannot run. Absent from extensions older than the field, which the server treats as "unknown", never as "none".
        */
       actions?: string[];
+      /**
+       * Behaviours this extension has, from `EXTENSION_FEATURES`. Absent from extensions older than the field, which the server treats as "none of them": every feature has a server-side fallback or a plain refusal, never a silent difference.
+       */
+      features?: string[];
     }
   /**
    * The user took this agent's control back (the panel's hold) but kept the connection. Tells the server to stop preferring this browser for its commands. Optional: an older server ignores it.
    */
   | { type: 'released' }
+  /**
+   * Settings the user chose in the side panel that the server applies to what it sends the agent. Sent after `ready` and whenever they change, as its own message rather than on `ready`, because `ready` also means "this browser granted control" and must not be repeated for a settings change. An older server ignores it.
+   */
+  | {
+      type: 'preferences';
+      /** Kinds of personal data to blank out of page text, from `REDACTION_KINDS`. Empty or absent means none. */
+      redact?: string[];
+    }
   | {
       type: 'result';
       id: string;
@@ -131,7 +160,7 @@ export type ExtensionMessage =
        * provenance, and a page-derived error must not be able to present itself
        * as a well-known onbridge condition.
        */
-      errorCode?: 'navigating' | 'no-content-script' | 'ref-not-found' | 'unsupported-action';
+      errorCode?: 'navigating' | 'no-content-script' | 'ref-not-found' | 'unsupported-action' | 'wait-timeout';
       /** How long to wait before retrying, for a retryable `errorCode`. */
       retryAfterMs?: number;
       /**
@@ -162,6 +191,11 @@ export type ExtensionMessage =
       data: unknown;
     }
   | { type: 'pong' };
+
+/**
+ * The close code the extension uses when it hangs up on purpose (Control Mode turned off, idle revoke, a pairing forgotten, the user disconnecting one agent), with the reason in the close frame. Lets the server tell the agent why the browser went, instead of one message for every cause. An unexpected loss (a suspended worker, a sleeping machine) arrives as 1006 with no reason, which is itself the diagnosis. An older server ignores the code.
+ */
+export const CLOSE_BY_EXTENSION = 4100;
 
 export const WS_PORT = 9876;
 /** Scanned in order so several agents can run concurrently, each on its own port. */
